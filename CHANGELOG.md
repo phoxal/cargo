@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.1](https://github.com/phoxal/cargo/compare/cargo-phoxal-v0.1.0...cargo-phoxal-v0.1.1) - 2026-10-04
+
+### Fixed
+
+- *(cli)* reject incomplete simulation shutdown reports
+
+### Other
+
+- *(release)* update package versions ([#1](https://github.com/phoxal/cargo/pull/1))
+
 ## [0.1.0](https://github.com/phoxal/cargo/releases/tag/cargo-phoxal-v0.1.0) - 2026-10-04
 
 ### Added
