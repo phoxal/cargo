@@ -10,25 +10,19 @@
 //! provenance only; different robots may select different releases
 //! concurrently.
 //!
-//! Registry and Git selections reuse the participant acquisition store
+//! Git selections reuse the participant acquisition store
 //! layout and Cargo invocation semantics. Local path selections build
 //! incrementally from the resolved source so implementation edits are
 //! always compiled and their embedded contract re-inspected before use.
-
-use std::path::{Path, PathBuf};
-use std::process::Command;
-
 use crate::project::cargo::CargoOptions;
 use crate::project::{Error, phoxal_home};
 use phoxal::artifact::application::{
     BUNDLE_CONTRACT, EXECUTION_PROTOCOL_CONTRACT, SIMULATION_PROTOCOL_CONTRACT,
     SUPERVISOR_LAUNCH_CONTRACT,
 };
-use phoxal::artifact::document::{GitSourceSelection, PackageSourceSelection, Source};
-
-/// The registry a default-registry supervisor selection acquires from.
-const DEFAULT_REGISTRY: &str = "phoxal";
-
+use phoxal::artifact::document::{GitSourceSelection, Source};
+use std::path::{Path, PathBuf};
+use std::process::Command;
 /// One validated supervisor executable selection.
 #[derive(Clone, Debug)]
 pub(crate) struct SupervisorSelection {
@@ -39,7 +33,6 @@ pub(crate) struct SupervisorSelection {
     /// Keeps the selected installation stable until its bundle copy exists.
     _guard: Option<std::sync::Arc<super::file_lock::ExclusiveFileLock>>,
 }
-
 /// The supervisor selection authored in the robot document.
 #[derive(Clone, Debug)]
 pub(crate) struct AuthoredSupervisor {
@@ -48,7 +41,6 @@ pub(crate) struct AuthoredSupervisor {
     /// The optional explicit binary target.
     binary: Option<String>,
 }
-
 impl AuthoredSupervisor {
     /// Captures the authored selection from the robot document.
     pub(crate) fn capture(
@@ -60,20 +52,13 @@ impl AuthoredSupervisor {
             binary: supervisor.binary.clone(),
         })
     }
-
     /// The complete resolved selection identity.
     ///
     /// Local paths are resolved canonically against the robot root so
     /// two unrelated roots sharing a relative path never share a cache.
-    /// Registry selections include the effective registry index; Git
-    /// selections include the full URL, revision, and package path. Build
+    /// Git selections include the full URL, revision, and package path. Build
     /// policy (target, profile, features) completes the identity.
-    fn identity(
-        &self,
-        root: &Path,
-        options: &CargoOptions,
-        registry_index: &str,
-    ) -> Result<String, Error> {
+    fn identity(&self, root: &Path, options: &CargoOptions) -> Result<String, Error> {
         use std::fmt::Write as _;
         let mut identity = String::new();
         match &self.source {
@@ -86,17 +71,6 @@ impl AuthoredSupervisor {
                             source,
                         })?;
                 let _ = write!(identity, "path\x1f{}", resolved.display());
-            }
-            Source::Package(PackageSourceSelection {
-                name,
-                version,
-                registry: _,
-            }) => {
-                let _ = write!(
-                    identity,
-                    "registry\x1f{}\x1f{}\x1f{}",
-                    registry_index, name, version
-                );
             }
             Source::Git(GitSourceSelection {
                 name,
@@ -127,7 +101,6 @@ impl AuthoredSupervisor {
         let _ = write!(identity, "\x1fbuild\x1f{build}");
         Ok(identity)
     }
-
     /// The canonical store for one complete resolved selection.
     fn store(&self, home: &Path, identity: &str) -> PathBuf {
         use sha2::Digest as _;
@@ -138,17 +111,15 @@ impl AuthoredSupervisor {
         home.join("applications/supervisor").join(slug)
     }
 }
-
 /// The deployment target triple from the effective selection.
 fn effective_target(options: &CargoOptions) -> String {
     crate::project::cargo::effective_target(options)
 }
-
 /// Selects the supervisor executable for one bundle assembly.
 ///
 /// Local path selections build incrementally from the resolved source and
 /// always re-inspect the current embedded contract, so implementation and
-/// interface edits are visible. Registry and Git selections reuse the
+/// interface edits are visible. Git selections reuse the
 /// cached installation for the complete resolved selection and acquire
 /// otherwise through the ordinary Cargo install path.
 pub(crate) fn select(
@@ -157,17 +128,7 @@ pub(crate) fn select(
     options: &CargoOptions,
     requires_simulation: bool,
 ) -> Result<SupervisorSelection, Error> {
-    let registry_index = if let Source::Package(package) = &authored.source {
-        let registry = package.registry.as_deref().unwrap_or(DEFAULT_REGISTRY);
-        crate::project::cargo::registry_index(root, registry).ok_or_else(|| {
-            Error::InvalidOptions {
-                message: format!("registry `{registry}` has no configured index"),
-            }
-        })?
-    } else {
-        String::new()
-    };
-    let identity = authored.identity(root, options, &registry_index)?;
+    let identity = authored.identity(root, options)?;
     let home = phoxal_home()?;
     let store = authored.store(&home, &identity);
     std::fs::create_dir_all(&store).map_err(|source| Error::ArtifactFile {
@@ -191,12 +152,10 @@ pub(crate) fn select(
             source,
         }
     })?;
-
     let mut selection = select_guarded(root, authored, options, &store, requires_simulation)?;
     selection._guard = Some(std::sync::Arc::new(guard));
     Ok(selection)
 }
-
 fn select_guarded(
     root: &Path,
     authored: &AuthoredSupervisor,
@@ -238,7 +197,6 @@ fn select_guarded(
     }
     acquire_locked(root, authored, options, store, requires_simulation)
 }
-
 /// Builds a local path selection incrementally, always inspecting the
 /// current embedded contract.
 ///
@@ -263,10 +221,6 @@ fn select_local(
         })?;
     let package = local_package_name(&resolved)?;
     let binary_name = authored.binary.clone().unwrap_or(package);
-
-    // Build incrementally in the source workspace; Cargo's cache makes
-    // no-change invocations fast. Offline/frozen is honored: a local
-    // source can still have registry dependencies.
     let cargo = options.cargo_program();
     let mut command = Command::new(&cargo);
     command
@@ -275,9 +229,6 @@ fn select_local(
         .arg(resolved.join("Cargo.toml"))
         .args(["--bin", &binary_name, "--message-format", "json"]);
     crate::project::cargo::BuildSelection::for_source(options).apply(&mut command);
-    if let Some(config) = crate::project::cargo::registry_config(root) {
-        command.args(["--config", &config]);
-    }
     command.args(options.lock.flags());
     if options.offline {
         command.arg("--offline");
@@ -307,11 +258,7 @@ fn select_local(
             message: format!("Cargo reported no executable for supervisor binary `{binary_name}`"),
         })?;
     ensure_regular_executable(&built)?;
-
-    // Always re-inspect the current embedded contract; incompatible
-    // interface changes refuse here, preserving previous good bundles.
     validate_embedded_contract(&built, &effective_target(options), requires_simulation)?;
-
     let staging = tempfile::Builder::new()
         .prefix(".phoxal-supervisor-build-")
         .tempdir_in(store.parent().unwrap_or_else(|| Path::new(".")))
@@ -337,7 +284,6 @@ fn select_local(
         _guard: None,
     })
 }
-
 fn acquire_locked(
     root: &Path,
     authored: &AuthoredSupervisor,
@@ -345,8 +291,6 @@ fn acquire_locked(
     store: &Path,
     requires_simulation: bool,
 ) -> Result<SupervisorSelection, Error> {
-    // A concurrent acquirer may have installed this exact selection while
-    // this process waited for the lock.
     let binary_name = authored
         .binary
         .clone()
@@ -413,7 +357,6 @@ fn acquire_locked(
         _guard: None,
     })
 }
-
 /// Publishes a validated application and its provenance together under the store lock.
 fn publish_candidate(store: &Path, staging: tempfile::TempDir) -> Result<(), Error> {
     let product = store.join("product");
@@ -450,7 +393,6 @@ fn publish_candidate(store: &Path, staging: tempfile::TempDir) -> Result<(), Err
     }
     Ok(())
 }
-
 /// Reads the Cargo `[package].name` from one local crate manifest.
 fn local_package_name(source_root: &Path) -> Result<String, Error> {
     let manifest_path = source_root.join("Cargo.toml");
@@ -474,16 +416,13 @@ fn local_package_name(source_root: &Path) -> Result<String, Error> {
             ),
         })
 }
-
-/// The Cargo package name for a registry or Git selection.
+/// The Cargo package name for a Git selection.
 fn package_name(authored: &AuthoredSupervisor) -> String {
     match &authored.source {
         Source::Path(_) => unreachable!("local selections resolve their package name"),
-        Source::Package(package) => package.name.clone(),
         Source::Git(git) => git.name.clone(),
     }
 }
-
 /// Writes the selection provenance record.
 fn write_provenance(store: &Path, text: &str) -> Result<(), Error> {
     let staged = store.join("provenance");
@@ -492,22 +431,14 @@ fn write_provenance(store: &Path, text: &str) -> Result<(), Error> {
         source,
     })
 }
-
 /// Writes the provenance for an authored selection.
 fn write_authored_provenance(store: &Path, authored: &AuthoredSupervisor) -> Result<(), Error> {
     let text = match &authored.source {
         Source::Path(path) => format!("local {path}"),
-        Source::Package(package) => format!(
-            "registry {} {}{}",
-            package.registry.as_deref().unwrap_or(DEFAULT_REGISTRY),
-            package.name,
-            package.version
-        ),
         Source::Git(git) => format!("git {} @{}", git.url, git.rev),
     };
     write_provenance(store, &text)
 }
-
 /// Reads the cached selection's provenance line.
 fn read_provenance(store: &Path) -> Result<String, Error> {
     let path = store.join("provenance");
@@ -515,7 +446,6 @@ fn read_provenance(store: &Path) -> Result<String, Error> {
         .map(|content| content.trim().to_owned())
         .map_err(|source| Error::ArtifactFile { path, source })
 }
-
 /// Marks a file executable.
 fn make_executable(path: &Path) -> Result<(), Error> {
     use std::os::unix::fs::PermissionsExt;
@@ -530,7 +460,6 @@ fn make_executable(path: &Path) -> Result<(), Error> {
         source,
     })
 }
-
 /// Checks one path is a regular executable file.
 fn ensure_regular_executable(path: &Path) -> Result<(), Error> {
     let metadata = std::fs::symlink_metadata(path).map_err(|source| Error::ArtifactFile {
@@ -553,7 +482,6 @@ fn ensure_regular_executable(path: &Path) -> Result<(), Error> {
     }
     Ok(())
 }
-
 /// Reads one executable's embedded application contract from its link
 /// section, without executing it.
 /// Validates the embedded contract of one supervisor executable for one
@@ -577,11 +505,9 @@ fn validate_embedded_contract(
             message: format!("supervisor executable {}: {error}", path.display()),
         })
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
     #[test]
     fn path_identities_are_canonically_resolved() {
         let options = CargoOptions::default();
@@ -593,57 +519,32 @@ mod tests {
             source: Source::Path("supervisor".to_owned()),
             binary: None,
         };
-        // Same relative path from the SAME root: same identity.
         let root_a = tempfile::tempdir().expect("root A");
         std::fs::create_dir(root_a.path().join("supervisor")).expect("source A");
-        let id_a = first
-            .identity(root_a.path(), &options, "sparse+https://test/")
-            .expect("identity A");
+        let id_a = first.identity(root_a.path(), &options).expect("identity A");
         let id_b = second
-            .identity(root_a.path(), &options, "sparse+https://test/")
+            .identity(root_a.path(), &options)
             .expect("identity B");
         assert_eq!(id_a, id_b, "same root and path share identity");
-        // Same relative path from a DIFFERENT root: different identity.
         let root_b = tempfile::tempdir().expect("root B");
         std::fs::create_dir(root_b.path().join("supervisor")).expect("source B");
         let id_c = second
-            .identity(root_b.path(), &options, "sparse+https://test/")
+            .identity(root_b.path(), &options)
             .expect("identity C");
         assert_ne!(
             id_a, id_c,
             "different roots with same relative path must not share"
         );
     }
-
-    #[test]
-    fn registry_identities_include_the_effective_index() {
-        let options = CargoOptions::default();
-        let selection = AuthoredSupervisor {
-            source: Source::Package(PackageSourceSelection {
-                name: "phoxal-supervisor".to_owned(),
-                version: "1.0.0".to_owned(),
-                registry: None,
-            }),
-            binary: None,
-        };
-        let root = tempfile::tempdir().expect("root");
-        let first = selection
-            .identity(root.path(), &options, "sparse+https://a.test/")
-            .expect("identity A");
-        let second = selection
-            .identity(root.path(), &options, "sparse+https://b.test/")
-            .expect("identity B");
-        assert_ne!(first, second, "different registry indexes must not share");
-    }
-
     #[test]
     fn build_policy_distinguishes_identities() {
         let root = tempfile::tempdir().expect("root");
         let selection = AuthoredSupervisor {
-            source: Source::Package(PackageSourceSelection {
+            source: Source::Git(GitSourceSelection {
                 name: "phoxal-supervisor".to_owned(),
-                version: "1.0.0".to_owned(),
-                registry: None,
+                url: "https://example.org/supervisor".to_owned(),
+                rev: "a".repeat(40),
+                path: None,
             }),
             binary: None,
         };
@@ -656,14 +557,10 @@ mod tests {
             features: vec!["extra".to_owned()],
             ..base.clone()
         };
-        let id_base = selection
-            .identity(root.path(), &base, "sparse+https://t/")
-            .expect("base");
-        let id_release = selection
-            .identity(root.path(), &release, "sparse+https://t/")
-            .expect("release");
+        let id_base = selection.identity(root.path(), &base).expect("base");
+        let id_release = selection.identity(root.path(), &release).expect("release");
         let id_features = selection
-            .identity(root.path(), &features, "sparse+https://t/")
+            .identity(root.path(), &features)
             .expect("features");
         assert_ne!(id_base, id_release, "profile distinguishes");
         assert_eq!(

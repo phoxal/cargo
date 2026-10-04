@@ -136,14 +136,6 @@ pub(crate) fn validate_prepared_connections(
 pub(crate) fn selection_identity(source: &Source) -> phoxal_build::PreparedSelection {
     match source {
         Source::Path(path) => phoxal_build::PreparedSelection::Path { path: path.clone() },
-        Source::Package(package) => phoxal_build::PreparedSelection::Registry {
-            registry: package
-                .registry
-                .clone()
-                .unwrap_or_else(|| "phoxal".to_owned()),
-            name: package.name.clone(),
-            version: package.version.clone(),
-        },
         Source::Git(git) => phoxal_build::PreparedSelection::Git {
             name: git.name.clone(),
             revision: git.rev.clone(),

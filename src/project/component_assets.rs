@@ -1,5 +1,5 @@
 //! The explicit package-relative resource inventory shared by acquisition,
-//! bundle staging, and publication. Native model interpretation stays native-owned.
+//! bundle staging. Native model interpretation stays native-owned.
 
 use std::collections::BTreeSet;
 use std::fs;
@@ -7,8 +7,8 @@ use std::path::{Component, Path, PathBuf};
 
 use phoxal::artifact::document::ComponentDocument;
 
+use super::Error;
 use super::document::ValidateComponentDocument as _;
-use super::{Error, PublicationError};
 
 pub(crate) fn read(root: &Path) -> Result<BTreeSet<PathBuf>, Error> {
     let definition = root.join("component.yaml");
@@ -50,11 +50,10 @@ pub(crate) fn files(root: &Path, document: &ComponentDocument) -> Result<BTreeSe
 }
 
 fn invalid(path: &Path, message: String) -> Error {
-    PublicationError::InvalidComponentDefinition {
+    Error::ArtifactInvalid {
         path: path.to_owned(),
         message,
     }
-    .into()
 }
 
 fn collect(
@@ -64,26 +63,29 @@ fn collect(
     model: bool,
     files: &mut BTreeSet<PathBuf>,
 ) -> Result<(), Error> {
-    let unsafe_path = || PublicationError::UnsafeAssetPath {
-        reference: reference.display().to_string(),
-        definition: definition.to_owned(),
-        root: root.to_owned(),
+    let unsafe_path = || Error::ArtifactInvalid {
+        path: definition.to_owned(),
+        message: format!(
+            "asset {} is unsafe or escapes {}",
+            reference.display(),
+            root.display()
+        ),
     };
     if reference.as_os_str().is_empty() || reference.to_string_lossy().contains('\\') {
-        return Err(unsafe_path().into());
+        return Err(unsafe_path());
     }
     let mut path = root.to_owned();
     for component in reference.components() {
         let Component::Normal(name) = component else {
-            return Err(unsafe_path().into());
+            return Err(unsafe_path());
         };
         path.push(name);
         let metadata = fs::symlink_metadata(&path).map_err(|source| {
             if source.kind() == std::io::ErrorKind::NotFound {
-                Error::Publication(PublicationError::MissingAsset {
-                    reference: reference.display().to_string(),
-                    definition: definition.to_owned(),
-                })
+                Error::ArtifactInvalid {
+                    path: definition.to_owned(),
+                    message: format!("asset {} does not exist", reference.display()),
+                }
             } else {
                 Error::ArtifactFile {
                     path: path.clone(),
@@ -92,7 +94,7 @@ fn collect(
             }
         })?;
         if metadata.file_type().is_symlink() {
-            return Err(unsafe_path().into());
+            return Err(unsafe_path());
         }
     }
     let metadata = fs::symlink_metadata(&path).map_err(|source| Error::ArtifactFile {
@@ -168,7 +170,7 @@ mod tests {
         fs::write(root.path().join("component.yaml"), "schema: phoxal/component/v0\nmodel: {file: real/resource, root_body: mount}\ncapabilities: {}\nassets: [alias/resource]\n").unwrap();
         assert!(matches!(
             read(root.path()),
-            Err(Error::Publication(PublicationError::UnsafeAssetPath { .. }))
+            Err(Error::ArtifactInvalid { .. })
         ));
         fs::write(root.path().join("component.yaml"), "schema: phoxal/component/v0\nmodel: {file: real, root_body: mount}\ncapabilities: {}\n").unwrap();
         assert!(

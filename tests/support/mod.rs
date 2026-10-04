@@ -39,9 +39,14 @@ pub fn stage(fixture: &str) -> (tempfile::TempDir, PathBuf) {
             "phoxal = {{ path = {:?}, default-features = false }}",
             sdk::sdk_root()
         );
-        fs::write(&supervisor, manifest.replace(
-            "phoxal = { version = \"=0.0.0-dev.8\", registry = \"phoxal\", default-features = false }", &dependency))
-            .unwrap_or_else(|error| panic!("selected SDK fixture dependency: {error}"));
+        fs::write(
+            &supervisor,
+            manifest.replace(
+                "phoxal = { version = \"0.69.0\", default-features = false }",
+                &dependency,
+            ),
+        )
+        .unwrap_or_else(|error| panic!("selected SDK fixture dependency: {error}"));
     }
     (destination, path)
 }

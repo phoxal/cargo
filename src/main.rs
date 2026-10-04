@@ -11,13 +11,27 @@ mod project;
 
 use project::{
     CargoOperation, CargoOptions, CargoSelection, LockMode, PreparedProject, Project,
-    PublicationKind, PublicationOptions, SelectedTarget, SimulationBound, SimulationPresentation,
-    SimulationRunOptions, SimulationRunReport, SubmissionResult, install_simulator,
-    prepare_publication, simulator_status, submit_publication, uninstall_simulator,
+    SelectedTarget,
 };
 
 fn main() -> ExitCode {
-    let cli = Cli::parse_from(cargo_arguments(std::env::args_os()));
+    let arguments = cargo_arguments(std::env::args_os());
+    if arguments
+        .get(1)
+        .is_some_and(|argument| argument == "simulation")
+    {
+        use std::os::unix::process::CommandExt as _;
+        let executable =
+            std::env::var_os("PHOXAL_SIMULATOR").unwrap_or_else(|| "phoxal-simulator".into());
+        let error = std::process::Command::new(executable)
+            .args(arguments.iter().skip(2))
+            .exec();
+        eprintln!(
+            "cannot start phoxal-simulator: {error}; install it with cargo install phoxal-simulator"
+        );
+        return ExitCode::FAILURE;
+    }
+    let cli = Cli::parse_from(arguments);
     let json_diagnostics = cli.json_diagnostics();
     match run(cli) {
         Ok(()) => ExitCode::SUCCESS,
@@ -43,7 +57,6 @@ fn cargo_arguments(arguments: impl IntoIterator<Item = OsString>) -> Vec<OsStrin
 fn run(cli: Cli) -> Result<(), crate::project::Error> {
     let command = cli.command;
     match command {
-        Command::Publish(arguments) => run_publication(arguments),
         Command::Prepare(arguments) => {
             let options = arguments.options.into_options(Vec::new(), Vec::new());
             let start = std::env::current_dir().map_err(|source| {
@@ -60,13 +73,6 @@ fn run(cli: Cli) -> Result<(), crate::project::Error> {
             }
             Ok(())
         }
-        Command::Simulation(arguments) => match arguments.command {
-            SimulationCommand::Install(arguments) => run_simulator_install(arguments, false),
-            SimulationCommand::Upgrade(arguments) => run_simulator_install(arguments, true),
-            SimulationCommand::Status(arguments) => run_simulator_status(arguments),
-            SimulationCommand::Uninstall => run_simulator_uninstall(),
-            SimulationCommand::Run(arguments) => run_simulation(*arguments),
-        },
         command => {
             let project = Project::discover(std::env::current_dir().map_err(|source| {
                 crate::project::Error::Discovery(crate::project::DiscoveryError::Resolve {
@@ -82,10 +88,15 @@ fn run(cli: Cli) -> Result<(), crate::project::Error> {
                 ),
                 Command::Build(arguments) => {
                     let output = arguments.output.clone();
+                    let simulation_scene = arguments.simulation_scene.clone();
                     let options = arguments.into_options();
-                    let prepared = project.prepare(&options)?;
-                    let output = output.unwrap_or_else(|| prepared.default_bundle_path());
-                    let bundle = prepared.build_bundle(&options, output)?;
+                    let bundle = if let Some(scene) = simulation_scene {
+                        project.build_simulation(&options, &scene, output)?
+                    } else {
+                        let prepared = project.prepare(&options)?;
+                        let output = output.unwrap_or_else(|| prepared.default_bundle_path());
+                        prepared.build_bundle(&options, output)?
+                    };
                     print_status(
                         &options,
                         &format!("compiled bundle: {}", bundle.root().display()),
@@ -93,6 +104,9 @@ fn run(cli: Cli) -> Result<(), crate::project::Error> {
                     Ok(())
                 }
                 Command::Run(arguments) => {
+                    if arguments.simulation_scene.is_some() {
+                        return Err(crate::project::Error::InvalidOptions { message: "use build --simulation-scene, then simulation run for native simulation".into() });
+                    }
                     let output = arguments.output.clone();
                     let options = arguments.into_options();
                     let prepared = project.prepare(&options)?;
@@ -106,254 +120,10 @@ fn run(cli: Cli) -> Result<(), crate::project::Error> {
                 }
                 Command::Test(arguments) => run_test(&project, arguments),
                 Command::Simulation(_) => unreachable!("simulation was handled above"),
-                Command::Publish(_) => unreachable!("publish was handled above"),
                 Command::Prepare(_) => unreachable!("prepare was handled above"),
             }
         }
     }
-}
-
-fn run_simulator_install(
-    arguments: SimulationInstallArgs,
-    replace: bool,
-) -> Result<(), crate::project::Error> {
-    let options = CargoOptions {
-        cargo_path: arguments.cargo,
-        offline: arguments.offline,
-        ..CargoOptions::default()
-    };
-    let status = install_simulator(
-        &options,
-        arguments.mujoco_distribution.as_deref(),
-        replace || arguments.force,
-        arguments.installer_version.as_deref(),
-        arguments.simulator_version.as_deref(),
-    )?;
-    println!("simulator: installed");
-    println!(
-        "version: {}",
-        status.simulator_version.as_deref().unwrap_or("unknown")
-    );
-    println!(
-        "mujoco: {}",
-        status.mujoco_version.as_deref().unwrap_or("unknown")
-    );
-    if let Some(executable) = status.executable {
-        println!("executable: {}", executable.display());
-    }
-    Ok(())
-}
-
-fn run_simulator_status(arguments: SimulationStatusArgs) -> Result<(), crate::project::Error> {
-    let status = simulator_status()?;
-    if arguments.json {
-        println!(
-            "{}",
-            serde_json::to_string(&status).map_err(|source| {
-                crate::project::Error::SimulationInvalid {
-                    message: format!("cannot encode simulator status: {source}"),
-                }
-            })?
-        );
-    } else if status.installed {
-        println!("simulator: installed");
-        println!("root: {}", status.root.display());
-        println!(
-            "version: {}",
-            status.simulator_version.as_deref().unwrap_or("unknown")
-        );
-        println!(
-            "mujoco: {}",
-            status.mujoco_version.as_deref().unwrap_or("unknown")
-        );
-        if let Some(executable) = status.executable {
-            println!("executable: {}", executable.display());
-        }
-    } else {
-        println!("simulator: not installed");
-        println!("root: {}", status.root.display());
-    }
-    Ok(())
-}
-
-fn run_simulator_uninstall() -> Result<(), crate::project::Error> {
-    let root = uninstall_simulator()?;
-    println!("simulator: uninstalled");
-    println!("root: {}", root.display());
-    Ok(())
-}
-
-fn run_simulation(arguments: SimulationRunArgs) -> Result<(), crate::project::Error> {
-    let SimulationRunArgs {
-        scene,
-        headless,
-        desktop: _,
-        steps,
-        duration,
-        simulator,
-        output,
-        scope,
-        supervisor_id,
-        run_id,
-        options,
-    } = arguments;
-    let presentation = if headless {
-        SimulationPresentation::Headless
-    } else {
-        SimulationPresentation::Desktop
-    };
-    let bound = match (steps, duration) {
-        (Some(steps), None) => SimulationBound::Steps(steps),
-        (None, Some(duration)) => SimulationBound::Duration(duration),
-        (None, None) => SimulationBound::Steps(1),
-        (Some(_), Some(_)) => {
-            return Err(crate::project::Error::SimulationInvalid {
-                message: "choose either --steps or --duration".to_owned(),
-            });
-        }
-    };
-    let mut request = SimulationRunOptions::new(scene, presentation, bound)?;
-    if let Some(path) = simulator {
-        request = request.with_simulator_executable(path);
-    }
-    if let Some(path) = output {
-        request = request.with_output(path);
-    }
-    if scope.is_some() || supervisor_id.is_some() || run_id.is_some() {
-        request = request.with_identity(
-            scope.unwrap_or_else(|| "local".to_owned()),
-            supervisor_id.unwrap_or_else(|| "local".to_owned()),
-            run_id.unwrap_or_else(|| "local-simulation".to_owned()),
-        );
-    }
-    let cargo_options = options.into_options(Vec::new(), Vec::new());
-    let project = Project::discover(std::env::current_dir().map_err(|source| {
-        crate::project::Error::Discovery(crate::project::DiscoveryError::Resolve {
-            path: ".".into(),
-            source,
-        })
-    })?)?;
-    let report = project.run_simulation(&cargo_options, &request)?;
-    let SimulationRunReport::V0 {
-        simulator_stdout, ..
-    } = &report;
-    if !simulator_stdout.trim().is_empty() {
-        print!("{}", simulator_stdout);
-        if !simulator_stdout.ends_with('\n') {
-            println!();
-        }
-    }
-    println!(
-        "{}",
-        serde_json::to_string(&report).map_err(|source| {
-            crate::project::Error::SimulationInvalid {
-                message: format!("cannot encode simulation terminal report: {source}"),
-            }
-        })?
-    );
-    let SimulationRunReport::V0 {
-        simulator: report_simulator,
-        bundle: report_bundle,
-        simulator_exit_code,
-        simulator_stderr,
-        provider_contract_verified,
-        supervisor_ready,
-        cleanup,
-        ..
-    } = &report;
-    if !simulator_stderr.is_empty() {
-        eprint!("{}", simulator_stderr);
-    }
-    eprintln!(
-        "simulation: simulator={} bundle={} provider_contract={} cleanup={}",
-        report_simulator.executable.display(),
-        report_bundle.display(),
-        if *provider_contract_verified {
-            "verified"
-        } else {
-            "unverified"
-        },
-        if cleanup.error.is_none() {
-            "complete"
-        } else {
-            "incomplete"
-        }
-    );
-    if report.success() {
-        Ok(())
-    } else {
-        Err(crate::project::Error::SimulationInvalid {
-            message: format!(
-                "simulation did not complete successfully (exit={}, supervisor_ready={}, provider_contract_verified={}, cleanup={})",
-                simulator_exit_code.map_or_else(|| "signal".to_owned(), |code| code.to_string()),
-                supervisor_ready,
-                provider_contract_verified,
-                if cleanup.error.is_none() {
-                    "complete"
-                } else {
-                    "incomplete"
-                }
-            ),
-        })
-    }
-}
-
-fn run_publication(arguments: PublishArgs) -> Result<(), crate::project::Error> {
-    let (kind, package) = match arguments.package {
-        PublishPackage::Component(package) => (PublicationKind::Component, package),
-        PublishPackage::Service(package) => (PublicationKind::Service, package),
-        PublishPackage::Library(package) => (PublicationKind::Library, package),
-        PublishPackage::ProcMacro(package) => (PublicationKind::ProcMacro, package),
-        PublishPackage::Simulator(package) => (PublicationKind::SimulatorApplication, package),
-        PublishPackage::Application(package) => (PublicationKind::Application, package),
-        PublishPackage::Tool(package) => (PublicationKind::Tool, package),
-    };
-    let dry_run = package.dry_run;
-    let result = prepare_publication(&PublicationOptions {
-        kind,
-        name: package.name,
-        path: package.path,
-        dry_run,
-    })?;
-    let result = if dry_run { result.retain() } else { result };
-    println!(
-        "publication: {}",
-        if dry_run { "dry-run" } else { "prepared" }
-    );
-    println!("kind: {}", result.kind());
-    println!("package: {}", result.package());
-    println!("version: {}", result.version());
-    println!("archive: {}", result.archive().display());
-    println!("sha256: {}", result.checksum());
-    println!("bytes: {}", result.bytes());
-    if !dry_run {
-        let submission = submit_publication(&result, |authorization| {
-            eprintln!(
-                "Authorize cargo-phoxal at {} with code {} (expires in {} seconds).",
-                authorization.verification_uri,
-                authorization.user_code,
-                authorization.expires_in.as_secs()
-            );
-            eprintln!(
-                "GitHub's public_repo scope covers every public repository accessible to this account."
-            );
-        })?;
-        match submission {
-            SubmissionResult::Available { archive_url } => {
-                println!("publication: available");
-                println!("archive-url: {archive_url}");
-            }
-            SubmissionResult::PendingReview {
-                pull_request_url,
-                branch,
-            } => {
-                println!("publication: pending-review");
-                println!("branch: {branch}");
-                println!("pull-request: {pull_request_url}");
-            }
-        }
-    }
-    Ok(())
 }
 
 fn run_cargo(
@@ -523,8 +293,7 @@ fn diagnostic_path(error: &crate::project::Error) -> Option<PathBuf> {
         | crate::project::Error::BundleBusy { .. }
         | crate::project::Error::BundleLock { .. }
         | crate::project::Error::BundlePublish { .. }
-        | crate::project::Error::BundleCleanup { .. }
-        | crate::project::Error::Publication(_) => None,
+        | crate::project::Error::BundleCleanup { .. } => None,
     }
 }
 
@@ -559,12 +328,7 @@ impl Cli {
                 json_common(&arguments.options, &arguments.cargo_args)
             }
             Command::Test(arguments) => json_common(&arguments.options, &[]),
-            Command::Simulation(arguments) => match &arguments.command {
-                SimulationCommand::Install(_) | SimulationCommand::Upgrade(_) => false,
-                SimulationCommand::Status(_) | SimulationCommand::Uninstall => false,
-                SimulationCommand::Run(arguments) => json_common(&arguments.options, &[]),
-            },
-            Command::Publish(_) => false,
+            Command::Simulation(_) => false,
             Command::Prepare(arguments) => json_common(&arguments.options, &[]),
         }
     }
@@ -582,10 +346,8 @@ enum Command {
     Run(BuildArgs),
     /// Prepare the project and run tests for the root robot package.
     Test(TestArgs),
-    /// Provision and run the independent native simulator application.
+    /// Forward arguments and process status to phoxal-simulator.
     Simulation(SimulationArgs),
-    /// Prepare an authored component or service package for registry review.
-    Publish(PublishArgs),
 }
 
 #[derive(Debug, Args)]
@@ -596,122 +358,8 @@ struct PrepareArgs {
 
 #[derive(Debug, Args)]
 struct SimulationArgs {
-    #[command(subcommand)]
-    command: SimulationCommand,
-}
-
-#[derive(Debug, Subcommand)]
-enum SimulationCommand {
-    /// Download MuJoCo and install the matching simulator from the Phoxal registry.
-    Install(SimulationInstallArgs),
-    /// Replace the managed MuJoCo and simulator installation with the current versions.
-    Upgrade(SimulationInstallArgs),
-    /// Inspect the managed simulator installation.
-    Status(SimulationStatusArgs),
-    /// Remove the managed simulator installation.
-    Uninstall,
-    /// Run one finite scene against the selected robot bundle.
-    Run(Box<SimulationRunArgs>),
-}
-
-#[derive(Debug, Args)]
-struct SimulationInstallArgs {
-    /// Select an exact simulator installer release independently of this tool.
-    #[arg(long)]
-    installer_version: Option<String>,
-    /// Select an exact native simulator application release independently of the installer.
-    #[arg(long)]
-    simulator_version: Option<String>,
-    /// Use an existing MuJoCo distribution instead of downloading the official release.
-    #[arg(long = "mujoco-distribution")]
-    mujoco_distribution: Option<PathBuf>,
-    /// Replace an existing managed installation.
-    #[arg(long)]
-    force: bool,
-    /// Cargo executable used to build the registry simulator package.
-    #[arg(long, env = "CARGO", hide_env_values = true)]
-    cargo: Option<PathBuf>,
-    /// Use only already cached Cargo packages and require an explicit MuJoCo distribution.
-    #[arg(long)]
-    offline: bool,
-}
-
-#[derive(Debug, Args)]
-struct SimulationStatusArgs {
-    /// Emit one machine-readable JSON record.
-    #[arg(long)]
-    json: bool,
-}
-
-#[derive(Debug, Args)]
-struct SimulationRunArgs {
-    /// Scene MJCF or MJZ archive.
-    scene: PathBuf,
-    /// Run without opening a presentation window.
-    #[arg(long, conflicts_with = "desktop")]
-    headless: bool,
-    /// Run with the simulator desktop presentation.
-    #[arg(long, conflicts_with = "headless")]
-    desktop: bool,
-    /// Advance exactly this many native quanta.
-    #[arg(long, conflicts_with = "duration")]
-    steps: Option<u64>,
-    /// Advance exactly this many seconds, requiring an integral quantum count.
-    #[arg(long, conflicts_with = "steps")]
-    duration: Option<f64>,
-    /// Explicit simulator executable injection or installed artifact path.
-    #[arg(long)]
-    simulator: Option<PathBuf>,
-    /// Compiled simulation bundle output path.
-    #[arg(long)]
-    output: Option<PathBuf>,
-    /// Router namespace for this local launch.
-    #[arg(long)]
-    scope: Option<String>,
-    /// Supervisor identity within the router namespace.
-    #[arg(long)]
-    supervisor_id: Option<String>,
-    /// Finite run identity passed to the simulator.
-    #[arg(long)]
-    run_id: Option<String>,
-    #[command(flatten)]
-    options: CommonArgs,
-}
-
-#[derive(Debug, Args)]
-struct PublishArgs {
-    #[command(subcommand)]
-    package: PublishPackage,
-}
-
-#[derive(Debug, Subcommand)]
-enum PublishPackage {
-    /// Prepare a component package, including a targetless passive carrier.
-    Component(PublishPackageArgs),
-    /// Prepare a runnable service implementation package.
-    Service(PublishPackageArgs),
-    /// Prepare a reusable library package.
-    Library(PublishPackageArgs),
-    /// Prepare a procedural macro package.
-    ProcMacro(PublishPackageArgs),
-    /// Prepare an independently built simulator application package.
-    Simulator(PublishPackageArgs),
-    /// Prepare an independently built non-simulator application package.
-    Application(PublishPackageArgs),
-    /// Prepare a standalone developer or operator tool package.
-    Tool(PublishPackageArgs),
-}
-
-#[derive(Debug, Args)]
-struct PublishPackageArgs {
-    /// Exact Cargo package name from the authored Cargo.toml.
-    name: String,
-    /// Source directory containing the authored Cargo.toml.
-    #[arg(long)]
-    path: Option<PathBuf>,
-    /// Prepare and verify locally without GitHub authentication or mutation.
-    #[arg(long)]
-    dry_run: bool,
+    #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+    args: Vec<OsString>,
 }
 
 #[derive(Debug, Args)]
@@ -731,6 +379,9 @@ impl CommandArgs {
 
 #[derive(Debug, Args)]
 struct BuildArgs {
+    /// Freeze and probe this scene to produce a simulation bundle.
+    #[arg(long)]
+    simulation_scene: Option<PathBuf>,
     #[command(flatten)]
     options: CommonArgs,
     /// Compiled bundle directory, defaulting below Cargo's target directory.
@@ -997,118 +648,6 @@ mod tests {
         assert_eq!(options.target.as_deref(), Some("aarch64-unknown-linux-gnu"));
         assert!(!options.release);
         assert_eq!(options.cargo_args, [OsString::from("--release")]);
-    }
-
-    #[test]
-    fn simulation_run_parses_scene_mode_bound_and_lock_policy() {
-        let parsed = Cli::try_parse_from([
-            "cargo-phoxal",
-            "simulation",
-            "run",
-            "scene.xml",
-            "--headless",
-            "--steps",
-            "4",
-            "--locked",
-            "--scope",
-            "workshop",
-            "--supervisor-id",
-            "rover-01",
-            "--run-id",
-            "run-1",
-        ])
-        .expect("simulation run parses");
-        let arguments = match parsed.command {
-            Command::Simulation(arguments) => match arguments.command {
-                SimulationCommand::Run(arguments) => arguments,
-                _ => panic!("simulation run parsed as a management command"),
-            },
-            _ => panic!("simulation command parsed as a different variant"),
-        };
-        assert_eq!(arguments.scene, PathBuf::from("scene.xml"));
-        assert!(arguments.headless);
-        assert!(!arguments.desktop);
-        assert_eq!(arguments.steps, Some(4));
-        assert_eq!(arguments.duration, None);
-        assert_eq!(arguments.scope.as_deref(), Some("workshop"));
-        assert_eq!(arguments.supervisor_id.as_deref(), Some("rover-01"));
-        assert_eq!(arguments.run_id.as_deref(), Some("run-1"));
-        assert_eq!(
-            arguments.options.into_options(Vec::new(), Vec::new()).lock,
-            LockMode::Locked
-        );
-    }
-
-    #[test]
-    fn simulation_run_rejects_conflicting_modes_and_bounds() {
-        assert!(
-            Cli::try_parse_from([
-                "cargo-phoxal",
-                "simulation",
-                "run",
-                "scene.xml",
-                "--headless",
-                "--desktop",
-            ])
-            .is_err()
-        );
-        assert!(
-            Cli::try_parse_from([
-                "cargo-phoxal",
-                "simulation",
-                "run",
-                "scene.xml",
-                "--steps",
-                "1",
-                "--duration",
-                "0.01",
-            ])
-            .is_err()
-        );
-    }
-
-    #[test]
-    fn publication_supports_normal_submission_and_explicit_dry_run() {
-        let parsed = Cli::try_parse_from([
-            "cargo-phoxal",
-            "publish",
-            "component",
-            "fixture-passive-caster",
-            "--dry-run",
-        ])
-        .expect("publication dry-run parses");
-        assert!(matches!(parsed.command, Command::Publish(_)));
-        let parsed = Cli::try_parse_from([
-            "cargo-phoxal",
-            "publish",
-            "component",
-            "fixture-passive-caster",
-        ])
-        .expect("normal publication parses");
-        assert!(matches!(parsed.command, Command::Publish(_)));
-    }
-
-    #[test]
-    fn publication_accepts_every_registry_package_role() {
-        for role in [
-            "component",
-            "service",
-            "library",
-            "proc-macro",
-            "simulator",
-            "application",
-            "tool",
-        ] {
-            let parsed = Cli::try_parse_from([
-                "cargo-phoxal",
-                "publish",
-                role,
-                "example-package",
-                "--dry-run",
-            ])
-            .unwrap_or_else(|error| panic!("{role} publication must parse: {error}"));
-            assert!(matches!(parsed.command, Command::Publish(_)));
-        }
     }
 
     #[test]

@@ -8,23 +8,14 @@
 //!
 //! Authored YAML parsing is owned here; tool callers use [`parse_and_validate`]
 //! to combine parsing and validation.
-
 #![deny(unsafe_code)]
-
-use std::collections::BTreeSet;
-use std::path::Path;
-
-use serde_json::Value;
-
 use crate::project::error::{ValidationError, ValidationErrors};
-
-// Re-exports from the framework artifact module. That module is the source of
-// truth for every inert record; this tool module keeps the
-// tool's validation logic and reads YAML.
 pub use phoxal::artifact::document::{
     BrainSelection, ComponentDocument, ConnectionSources, PortReference, RobotDocument, Source,
 };
-
+use serde_json::Value;
+use std::collections::BTreeSet;
+use std::path::Path;
 /// Parses and validates a `robot.yaml` document with its authored path
 /// attached to errors. The YAML parse and the validation belong
 /// together at this boundary because a malformed file must surface both
@@ -46,7 +37,6 @@ pub(crate) fn parse_and_validate(
         })?;
     Ok(document)
 }
-
 /// Validates source-language and composition rules for a `RobotDocument`.
 ///
 /// Validation remains tool-owned and is implemented as a trait over the inert
@@ -56,7 +46,6 @@ pub trait ValidateDocument {
     /// validation errors into a single `Vec`.
     fn validate(&self) -> Result<(), Vec<ValidationError>>;
 }
-
 impl ValidateDocument for RobotDocument {
     fn validate(&self) -> Result<(), Vec<ValidationError>> {
         let mut errors = Vec::new();
@@ -73,7 +62,6 @@ impl ValidateDocument for RobotDocument {
         }
     }
 }
-
 /// Validates a single `ComponentDocument` against the project-side
 /// rules the framework record module does not own.
 pub trait ValidateComponentDocument {
@@ -81,7 +69,6 @@ pub trait ValidateComponentDocument {
     /// joined string for the supervisor and publication tooling.
     fn validate(&self) -> Result<(), String>;
 }
-
 impl ValidateComponentDocument for ComponentDocument {
     fn validate(&self) -> Result<(), String> {
         let mut errors: Vec<String> = Vec::new();
@@ -94,14 +81,7 @@ impl ValidateComponentDocument for ComponentDocument {
         }
     }
 }
-
-fn validate_schema(_document: &RobotDocument, _errors: &mut Vec<ValidationError>) {
-    // Schema selection is enforced by serde's `#[serde(tag = "schema",
-    // deny_unknown_fields)]` on the enum variant. Unknown or missing
-    // `schema:` keys are rejected at parse time, so nothing remains to
-    // validate here.
-}
-
+fn validate_schema(_document: &RobotDocument, _errors: &mut Vec<ValidationError>) {}
 fn validate_robot(document: &RobotDocument, errors: &mut Vec<ValidationError>) {
     let RobotDocument::V0 {
         robot, services, ..
@@ -114,7 +94,6 @@ fn validate_robot(document: &RobotDocument, errors: &mut Vec<ValidationError>) {
             value: robot.id.clone(),
         });
     }
-
     for (instance, component) in &robot.components {
         push_identifier_error(&format!("robot.components.{instance}"), instance, errors);
         if instance.contains("__") {
@@ -175,7 +154,6 @@ fn validate_robot(document: &RobotDocument, errors: &mut Vec<ValidationError>) {
         }
     }
 }
-
 fn validate_brain(document: &RobotDocument, errors: &mut Vec<ValidationError>) {
     let RobotDocument::V0 { brain, .. } = document;
     if let Some(brain) = brain
@@ -188,7 +166,6 @@ fn validate_brain(document: &RobotDocument, errors: &mut Vec<ValidationError>) {
         });
     }
 }
-
 /// Validates the authored supervisor selection.
 ///
 /// The supervisor shares the participants' source type while remaining an
@@ -214,7 +191,6 @@ fn validate_supervisor(document: &RobotDocument, errors: &mut Vec<ValidationErro
         });
     }
 }
-
 fn validate_services(document: &RobotDocument, errors: &mut Vec<ValidationError>) {
     let RobotDocument::V0 { services, .. } = document;
     for (service, selection) in services {
@@ -242,7 +218,6 @@ fn validate_services(document: &RobotDocument, errors: &mut Vec<ValidationError>
         }
     }
 }
-
 fn validate_source(field: &str, source: &Source, errors: &mut Vec<ValidationError>) {
     match source {
         Source::Path(path) => {
@@ -251,17 +226,6 @@ fn validate_source(field: &str, source: &Source, errors: &mut Vec<ValidationErro
                     field: format!("{field}.path"),
                     value: path.clone(),
                 });
-            }
-        }
-        Source::Package(package) => {
-            push_identifier_error(&format!("{field}.package.name"), &package.name, errors);
-            validate_exact_version(
-                &format!("{field}.package.version"),
-                &package.version,
-                errors,
-            );
-            if let Some(registry) = &package.registry {
-                push_identifier_error(&format!("{field}.package.registry"), registry, errors);
             }
         }
         Source::Git(git) => {
@@ -287,17 +251,6 @@ fn validate_source(field: &str, source: &Source, errors: &mut Vec<ValidationErro
         }
     }
 }
-
-fn validate_exact_version(field: &str, version: &str, errors: &mut Vec<ValidationError>) {
-    if semver::Version::parse(version).is_ok_and(|parsed| parsed.to_string() == version) {
-        return;
-    }
-    errors.push(ValidationError::InvalidIdentifier {
-        field: field.to_owned(),
-        value: version.to_owned(),
-    });
-}
-
 fn validate_connections(document: &RobotDocument, errors: &mut Vec<ValidationError>) {
     let known = document.instance_ids();
     let RobotDocument::V0 {
@@ -334,7 +287,6 @@ fn validate_connections(document: &RobotDocument, errors: &mut Vec<ValidationErr
                 instance: consumer.instance.clone(),
             });
         }
-
         let source_values = sources.as_slice();
         if source_values.is_empty() {
             errors.push(ValidationError::EmptyConnectionSources {
@@ -369,7 +321,6 @@ fn validate_connections(document: &RobotDocument, errors: &mut Vec<ValidationErr
         }
     }
 }
-
 fn validate_component_model(document: &ComponentDocument, errors: &mut Vec<String>) {
     let ComponentDocument::V0 { model, .. } = document;
     if model.file.as_os_str().is_empty() || model.file.to_string_lossy().contains("..") {
@@ -385,7 +336,6 @@ fn validate_component_model(document: &ComponentDocument, errors: &mut Vec<Strin
         ));
     }
 }
-
 fn validate_component_capabilities(document: &ComponentDocument, errors: &mut Vec<String>) {
     let ComponentDocument::V0 { capabilities, .. } = document;
     let mut seen_names = BTreeSet::new();
@@ -406,7 +356,6 @@ fn validate_component_capabilities(document: &ComponentDocument, errors: &mut Ve
         }
     }
 }
-
 fn push_identifier_error(field: &str, value: &str, errors: &mut Vec<ValidationError>) {
     if !is_identifier(value) {
         errors.push(ValidationError::InvalidIdentifier {
@@ -415,7 +364,6 @@ fn push_identifier_error(field: &str, value: &str, errors: &mut Vec<ValidationEr
         });
     }
 }
-
 fn push_config_errors(value: &Value, field: &str, errors: &mut Vec<ValidationError>) {
     match value {
         Value::Null => errors.push(ValidationError::NullConfiguration {
@@ -427,15 +375,12 @@ fn push_config_errors(value: &Value, field: &str, errors: &mut Vec<ValidationErr
         }),
     }
 }
-
 pub(crate) fn is_identifier(value: &str) -> bool {
     phoxal::artifact::document::is_identifier(value)
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
     #[test]
     fn parse_and_validate_accepts_a_minimal_document() {
         let yaml = r#"
@@ -449,7 +394,6 @@ supervisor:
         let RobotDocument::V0 { robot, .. } = &doc;
         assert_eq!(robot.id, "rover");
     }
-
     #[test]
     fn parse_and_validate_collects_identifier_errors() {
         let yaml = r#"
@@ -466,7 +410,6 @@ supervisor:
             crate::project::error::Error::InvalidRobot { .. }
         ));
     }
-
     #[test]
     fn component_validation_accepts_explicit_native_capabilities_and_refuses_bad_root() {
         let text = "schema: phoxal/component/v0\nmodel: {file: models/entry, root_body: mount}\ncapabilities:\n  encoder:\n    kind: encoder\n    publish_rate_hz: 50.0\n    target: {kind: joint, id: wheel_joint}\nassets: [resources]\n";

@@ -1,8 +1,0 @@
-[package]
-name = "passive-component-fixture"
-version = "0.1.0"
-edition = "2024"
-rust-version = "1.88"
-publish = false
-autolib = false
-autobins = false

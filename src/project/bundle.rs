@@ -244,10 +244,7 @@ pub(crate) struct FrozenSimulation {
     pub(crate) artifact_ids: BTreeMap<(String, String), String>,
     /// The pinned simulator application selection.
     ///
-    /// Managed selections are guarded by the shared provisioning lock for
-    /// the whole prepared lifetime; replacement and removal take the
-    /// exclusive side. An explicit override carries no guard: the caller
-    /// owns that path's stability.
+    /// The installed executable remains caller-owned and its contents are trusted.
     pub(crate) simulator: super::simulation::SimulatorArtifact,
 }
 
@@ -2157,7 +2154,6 @@ fn source_identity(source: &PackageSource) -> Result<String, Error> {
     match source {
         PackageSource::Local { .. } => Ok("local".to_owned()),
         PackageSource::Git { source } => sanitize_git_source(source, Path::new("Cargo.toml")),
-        PackageSource::Registry { source } | PackageSource::Other { source } => Ok(source.clone()),
     }
 }
 

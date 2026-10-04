@@ -5,7 +5,7 @@ edition = "2021"
 publish = false
 
 [dependencies]
-phoxal = { version = "=0.0.0-dev.8", registry = "phoxal", default-features = false }
+phoxal = { version = "0.69.0", default-features = false }
 
 [[bin]]
 name = "phoxal-supervisor"

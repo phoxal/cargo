@@ -8,8 +8,6 @@
 //! preserves existing installations on candidate failure, and reuses
 //! matching caches.
 
-#[path = "support/registry.rs"]
-mod registry;
 mod support;
 
 use std::fs;
@@ -63,8 +61,13 @@ fn stage_supervisor_fixture(
             bytes
         )
     };
-    fs::write(dir.join("Cargo.toml"), format!("[workspace]\n[package]\nname = \"phoxal-supervisor\"\nversion = \"{version}\"\nedition = \"2021\"\n"))
-        .unwrap_or_else(|error| panic!("fixture manifest: {error}"));
+    fs::write(
+        dir.join("Cargo.toml"),
+        format!(
+            "[package]\nname = \"phoxal-supervisor\"\nversion = \"{version}\"\nedition = \"2021\"\n"
+        ),
+    )
+    .unwrap_or_else(|error| panic!("fixture manifest: {error}"));
     let execution_marker = if contract_main == FOREIGN_TARGET_CONTRACT_MAIN {
         format!(
             "std::fs::write({:?}, b\"executed\").unwrap();",
@@ -89,7 +92,7 @@ fn stage_robot_with_supervisor(root: &Path, supervisor_path: &str) -> PathBuf {
     fs::create_dir_all(robot.join("src")).unwrap_or_else(|error| panic!("robot dir: {error}"));
     fs::write(
         robot.join("Cargo.toml"),
-        "[workspace]\n[package]\nname = \"selection-proof-robot\"\nversion = \"0.1.0\"\nedition = \"2021\"\nbuild = \"build.rs\"\npublish = false\n",
+        "[package]\nname = \"selection-proof-robot\"\nversion = \"0.1.0\"\nedition = \"2021\"\nbuild = \"build.rs\"\npublish = false\n",
     )
     .unwrap_or_else(|error| panic!("robot manifest: {error}"));
     let fixture_base = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/robot-base");
@@ -367,130 +370,12 @@ fn supervisor_output(robot: &Path) -> String {
 }
 
 #[test]
-fn registry_releases_coexist_recover_offline_and_refuse_an_incompatible_upgrade()
--> Result<(), Box<dyn std::error::Error>> {
-    use flate2::{Compression, write::GzEncoder};
-    use sha2::{Digest, Sha256};
-    let guard = tempfile::tempdir()?;
-    let root = guard.path();
-    let registry = root.join("registry");
-    let home = root.join("home");
-    let cargo_home = root.join("cargo-home");
-    fs::create_dir_all(&registry)?;
-    fs::create_dir_all(&cargo_home)?;
-    let package = "phoxal-supervisor";
-    let mut entries = Vec::new();
-    for (version, contract) in [
-        ("0.1.0", FIXTURE_CONTRACT_MAIN),
-        ("0.2.0", FIXTURE_CONTRACT_MAIN),
-        ("0.3.0", WRONG_BUNDLE_CONTRACT_MAIN),
-    ] {
-        let source =
-            stage_supervisor_fixture(root, &format!("release-{version}"), version, contract);
-        let archive_dir = registry.join("api/v1/crates").join(package).join(version);
-        fs::create_dir_all(&archive_dir)?;
-        let archive_path = archive_dir.join("download");
-        let encoder = GzEncoder::new(fs::File::create(&archive_path)?, Compression::default());
-        let mut archive = tar::Builder::new(encoder);
-        archive.append_dir_all(format!("{package}-{version}"), &source)?;
-        archive.into_inner()?.finish()?;
-        // This checksum belongs to the registry archive acquisition boundary.
-        let checksum = format!("{:x}", Sha256::digest(fs::read(&archive_path)?));
-        entries.push(serde_json::json!({"name": package, "vers": version, "deps": [], "cksum": checksum, "features": {}, "yanked": false}).to_string());
-    }
-    let index = registry.join("ph/ox");
-    fs::create_dir_all(&index)?;
-    fs::write(index.join(package), format!("{}\n", entries.join("\n")))?;
-    let server = registry::RegistryServer::start(&registry)?;
-    fs::write(
-        registry.join("config.json"),
-        format!(
-            "{{\"dl\":\"http://127.0.0.1:{}/api/v1/crates\"}}",
-            server.port
-        ),
-    )?;
-    let robot_a = authored_robot(
-        &root.join("a"),
-        "{ package: { name: phoxal-supervisor, version: '0.1.0', registry: proof } }",
-    );
-    let robot_b = authored_robot(
-        &root.join("b"),
-        "{ package: { name: phoxal-supervisor, version: '0.2.0', registry: proof } }",
-    );
-    let build = |robot: &Path, offline: bool| {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_cargo-phoxal"));
-        command
-            .current_dir(robot)
-            .env_remove("CARGO_TARGET_DIR")
-            .env("PHOXAL_HOME", &home)
-            .env("CARGO_HOME", &cargo_home)
-            .env(
-                "CARGO_REGISTRIES_PROOF_INDEX",
-                format!("sparse+http://127.0.0.1:{}/", server.port),
-            )
-            .args(["build"]);
-        if offline {
-            command.arg("--offline");
-        }
-        command.output().expect("registry selection workflow")
-    };
-    for (robot, version) in [(&robot_a, "0.1.0"), (&robot_b, "0.2.0")] {
-        let output = build(robot, false);
-        assert!(
-            output.status.success(),
-            "registry {version}: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        assert_eq!(
-            supervisor_output(robot).trim(),
-            format!("supervisor {version}")
-        );
-    }
-    fs::remove_dir_all(cargo_home.join("registry"))?;
-    for robot in [&robot_a, &robot_b] {
-        let output = build(robot, true);
-        assert!(
-            output.status.success(),
-            "installed selection reuse without Cargo registry cache: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
-    let manifest = robot_a.join("target/phoxal/selection-proof-robot/bundle/manifest.json");
-    let prior_manifest = fs::read(&manifest)?;
-    write_selection(
-        &robot_a,
-        "{ package: { name: phoxal-supervisor, version: '0.3.0', registry: proof } }",
-    );
-    let rejected = build(&robot_a, false);
-    assert!(!rejected.status.success());
-    assert!(
-        String::from_utf8_lossy(&rejected.stderr).contains("bundle revision"),
-        "{}",
-        String::from_utf8_lossy(&rejected.stderr)
-    );
-    assert_eq!(fs::read(&manifest)?, prior_manifest);
-    assert_eq!(supervisor_output(&robot_a).trim(), "supervisor 0.1.0");
-    write_selection(
-        &robot_a,
-        "{ package: { name: phoxal-supervisor, version: '0.1.0', registry: proof } }",
-    );
-    assert!(build(&robot_a, true).status.success());
-    Ok(())
-}
-
-#[test]
 fn pinned_git_supervisor_uses_the_shared_resolver_and_validates_package_path()
 -> Result<(), Box<dyn std::error::Error>> {
     let guard = tempfile::tempdir()?;
     let root = guard.path();
     let repo = root.join("repository");
-    let source = stage_supervisor_fixture(&repo, "apps/supervisor", "0.4.0", FIXTURE_CONTRACT_MAIN);
-    let manifest = fs::read_to_string(source.join("Cargo.toml"))?.replace("[workspace]\n", "");
-    fs::write(source.join("Cargo.toml"), manifest)?;
-    fs::write(
-        repo.join("Cargo.toml"),
-        "[workspace]\nresolver = '2'\nmembers = ['apps/supervisor']\n",
-    )?;
+    stage_supervisor_fixture(&repo, "apps/supervisor", "0.4.0", FIXTURE_CONTRACT_MAIN);
     for args in [
         vec!["init", "-q"],
         vec!["add", "."],

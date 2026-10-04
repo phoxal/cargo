@@ -751,9 +751,9 @@ supervisor:
   source: { path: supervisor }
 services:
   consumer:
-    source: { package: { name: phoxal-service-consumer, version: 0.1.0 } }
+    source: { path: ../consumer }
   producer:
-    source: { package: { name: phoxal-service-producer, version: 0.1.0 } }
+    source: { path: ../producer }
 connections:
   consumer.input: producer.output
 "#,

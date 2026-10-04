@@ -1,14 +1,8 @@
+use crate::project::error::Error;
+use cargo_metadata::{CargoOpt, Message, Metadata, MetadataCommand};
 use std::ffi::OsString;
 use std::path::Path;
 use std::process::{Command, ExitStatus};
-
-use cargo_metadata::{CargoOpt, Message, Metadata, MetadataCommand};
-
-use crate::project::error::Error;
-
-/// The retained public sparse index used by official Phoxal package coordinates.
-pub(crate) const PHOXAL_REGISTRY_INDEX: &str = "sparse+https://phoxal.github.io/registry/";
-
 /// The deployment target one command builds for.
 ///
 /// An explicit `--target` argument or option wins; otherwise the command
@@ -19,7 +13,6 @@ pub(crate) fn effective_target(options: &CargoOptions) -> String {
         .or_else(|| options.target.clone())
         .unwrap_or_else(phoxal::artifact::bundle::host_execution_target)
 }
-
 /// Reads one `--target <value>` style argument from a raw Cargo argument
 /// list.
 fn cargo_arg_value(arguments: &[std::ffi::OsString], name: &str) -> Option<String> {
@@ -43,71 +36,6 @@ fn cargo_arg_value(arguments: &[std::ffi::OsString], name: &str) -> Option<Strin
     }
     value
 }
-
-/// Returns whether Cargo's source identity denotes any registry protocol.
-pub(crate) fn is_registry_source(source: &str) -> bool {
-    source.starts_with("registry+") || source.starts_with("sparse+")
-}
-
-/// Always supply the effective Phoxal registry index explicitly.
-///
-/// `cargo install --registry phoxal` does not discover a project-level
-/// `.cargo/config.toml` when the working directory is itself a package
-/// root, so relying on discovery breaks preparation inside robot projects.
-/// The authored value (nearest configuration wins) is passed through so a
-/// project mirror or test registry keeps precedence over the public
-/// default; the environment variable still wins because Cargo reads it
-/// directly.
-pub(crate) fn registry_config(root: &Path) -> Option<String> {
-    let env_name = "CARGO_REGISTRIES_PHOXAL_INDEX";
-    if std::env::var_os(env_name).is_some() {
-        return None;
-    }
-    registry_index(root, "phoxal").map(|index| format!("registries.phoxal.index={index:?}"))
-}
-
-/// Resolves the registry identity using the same environment/config chain as Cargo.
-pub(crate) fn registry_index(root: &Path, registry: &str) -> Option<String> {
-    let env_name = format!(
-        "CARGO_REGISTRIES_{}_INDEX",
-        registry.to_uppercase().replace('-', "_")
-    );
-    if let Ok(index) = std::env::var(&env_name) {
-        return Some(index);
-    }
-    let mut files = Vec::new();
-    for directory in root.ancestors() {
-        files.push(directory.join(".cargo/config.toml"));
-        files.push(directory.join(".cargo/config"));
-    }
-    if let Some(home) = std::env::var_os("CARGO_HOME")
-        .map(std::path::PathBuf::from)
-        .or_else(|| {
-            std::env::var_os("HOME").map(|home| std::path::PathBuf::from(home).join(".cargo"))
-        })
-    {
-        files.push(home.join("config.toml"));
-        files.push(home.join("config"));
-    }
-    for path in files {
-        let Ok(source) = std::fs::read_to_string(path) else {
-            continue;
-        };
-        let Ok(config) = toml::from_str::<toml::Value>(&source) else {
-            continue;
-        };
-        if let Some(index) = config
-            .get("registries")
-            .and_then(|v| v.get(registry))
-            .and_then(|v| v.get("index"))
-            .and_then(toml::Value::as_str)
-        {
-            return Some(index.to_owned());
-        }
-    }
-    (registry == "phoxal").then(|| PHOXAL_REGISTRY_INDEX.to_owned())
-}
-
 /// The normalized build selection, shared by acquisition and bundle grouping.
 #[derive(Debug, serde::Serialize)]
 pub(crate) struct BuildSelection {
@@ -117,7 +45,6 @@ pub(crate) struct BuildSelection {
     all_features: bool,
     no_default_features: bool,
 }
-
 impl BuildSelection {
     pub(crate) fn capture(options: &CargoOptions) -> Self {
         let profile = cargo_arg_value(&options.cargo_args, "--profile")
@@ -171,7 +98,6 @@ impl BuildSelection {
         selection.no_default_features = false;
         selection
     }
-
     pub(crate) fn apply(&self, command: &mut Command) {
         command.args(["--target", &self.target, "--profile", &self.profile]);
         if !self.features.is_empty() {
@@ -185,7 +111,6 @@ impl BuildSelection {
         }
     }
 }
-
 /// Constructs the shared registry/Git acquisition command for executable owners.
 pub(crate) fn source_install_command(
     root: &Path,
@@ -202,22 +127,10 @@ pub(crate) fn source_install_command(
         .arg(installation)
         .args(["--bin", binary]);
     BuildSelection::for_source(options).apply(&mut command);
-    if let Some(config) = registry_config(root) {
-        command.args(["--config", &config]);
-    }
     if options.offline || options.lock == LockMode::Frozen {
         command.arg("--offline");
     }
     match source {
-        Source::Package(package) => {
-            command.args([
-                "--registry",
-                package.registry.as_deref().unwrap_or("phoxal"),
-                "--version",
-                &format!("={}", package.version),
-                &package.name,
-            ]);
-        }
         Source::Git(git) => {
             command.args(["--git", &git.url, "--rev", &git.rev, &git.name]);
         }
@@ -227,7 +140,6 @@ pub(crate) fn source_install_command(
     }
     command
 }
-
 /// Cargo's lockfile policy for project preparation and commands.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum LockMode {
@@ -239,7 +151,6 @@ pub enum LockMode {
     /// Require the existing lock and forbid all network access.
     Frozen,
 }
-
 impl LockMode {
     /// Returns the flags used for this policy.
     #[must_use]
@@ -251,7 +162,6 @@ impl LockMode {
         }
     }
 }
-
 /// Shared preparation and Cargo-command options.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CargoOptions {
@@ -287,7 +197,6 @@ pub struct CargoOptions {
     /// Cargo package and target-selection options supplied by the caller.
     pub selection: CargoSelection,
 }
-
 impl Default for CargoOptions {
     fn default() -> Self {
         Self {
@@ -307,7 +216,6 @@ impl Default for CargoOptions {
         }
     }
 }
-
 /// Cargo package and target selectors that remain meaningful at the
 /// `cargo-phoxal` boundary.
 ///
@@ -344,7 +252,6 @@ pub struct CargoSelection {
     /// Select named benchmarks.
     pub benches_named: Vec<String>,
 }
-
 impl CargoSelection {
     fn append_to(&self, command: &mut Command) {
         if self.workspace {
@@ -387,7 +294,6 @@ impl CargoSelection {
             command.args(["--bench", bench]);
         }
     }
-
     fn is_empty(&self) -> bool {
         !self.workspace
             && self.packages.is_empty()
@@ -404,7 +310,6 @@ impl CargoSelection {
             && self.benches_named.is_empty()
     }
 }
-
 impl CargoOptions {
     /// Validates flags before any Cargo process or manifest mutation occurs.
     pub fn validate(&self) -> Result<(), Error> {
@@ -432,7 +337,6 @@ impl CargoOptions {
         }
         Ok(())
     }
-
     pub(crate) fn append_common(
         &self,
         command: &mut Command,
@@ -471,7 +375,6 @@ impl CargoOptions {
         }
         command.args(&self.cargo_args);
     }
-
     pub(crate) fn cargo_program(&self) -> std::path::PathBuf {
         self.cargo_path
             .clone()
@@ -479,7 +382,6 @@ impl CargoOptions {
             .unwrap_or_else(|| std::path::PathBuf::from("cargo"))
     }
 }
-
 /// The supported source-development Cargo operations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CargoOperation {
@@ -490,7 +392,6 @@ pub enum CargoOperation {
     /// Run tests selected by Cargo for the root robot package.
     Test,
 }
-
 impl CargoOperation {
     /// The Cargo subcommand spelling.
     #[must_use]
@@ -502,7 +403,6 @@ impl CargoOperation {
         }
     }
 }
-
 /// Captured output from one successful Cargo invocation.
 #[derive(Debug)]
 pub struct CargoOutput {
@@ -511,7 +411,6 @@ pub struct CargoOutput {
     /// Captured standard error.
     pub stderr: Vec<u8>,
 }
-
 /// Invokes Cargo metadata from an optional isolated source tree.
 pub(crate) fn load_metadata_at(
     manifest: &Path,
@@ -541,9 +440,6 @@ pub(crate) fn load_metadata_at(
         .iter()
         .map(|flag| (*flag).to_owned())
         .collect::<Vec<_>>();
-    if let Some(config) = registry_config(current_dir) {
-        extra.extend(["--config".to_owned(), config]);
-    }
     if options.offline {
         extra.push("--offline".to_owned());
     }
@@ -556,7 +452,6 @@ pub(crate) fn load_metadata_at(
         source,
     })
 }
-
 /// Runs the selected target set from the prepared project's root graph.
 pub(crate) fn run(
     prepared: &crate::PreparedProject,
@@ -565,7 +460,6 @@ pub(crate) fn run(
 ) -> Result<Vec<CargoOutput>, Error> {
     run_with_env(prepared, operation, options, &[])
 }
-
 /// Run Cargo with immutable environment entries inherited by test binaries.
 pub(crate) fn run_with_env(
     prepared: &crate::PreparedProject,
@@ -614,7 +508,6 @@ pub(crate) fn run_with_env(
     }
     Ok(outputs)
 }
-
 fn command_for(
     prepared: &crate::PreparedProject,
     operation: CargoOperation,
@@ -625,13 +518,9 @@ fn command_for(
     let mut command = Command::new(options.cargo_program());
     command.current_dir(prepared.cargo_workdir());
     command.arg(operation.as_str());
-    if let Some(config) = registry_config(prepared.cargo_workdir()) {
-        command.args(["--config", &config]);
-    }
     options.append_common(&mut command, include_message_format, include_selection);
     command
 }
-
 /// Builds one selected executable while retaining Cargo's machine-readable
 /// artifact records for bundle assembly.
 pub(crate) fn build_target(
@@ -664,9 +553,6 @@ pub(crate) fn build_target(
             .current_dir(workdir)
             .args(["build", "--manifest-path"]);
         command.arg(manifest);
-        if let Some(config) = registry_config(workdir) {
-            command.args(["--config", &config]);
-        }
         let mut local_options = options.clone();
         local_options.features.clear();
         local_options.all_features = false;
@@ -693,18 +579,11 @@ pub(crate) fn build_target(
     ]);
     run_command(command, CargoOperation::Build)
 }
-
 fn append_target_selection(
     command: &mut Command,
     prepared: &crate::PreparedProject,
     target: &crate::SelectedTarget,
 ) {
-    // Cargo only permits `--features` for the selected workspace package. A
-    // root feature may nevertheless activate an optional dependency whose
-    // binary we need to build. Select both packages through the root graph so
-    // those root features remain effective while `--bin` still names the
-    // dependency executable. This also keeps the invocation valid for a
-    // registry or Git package that is outside the robot workspace.
     if target.package_id != prepared.cargo_root_package().id.to_string() {
         command.args([
             "--package",
@@ -713,10 +592,6 @@ fn append_target_selection(
     }
     command.args(["--package", target.package_id.as_str()]);
     command.args(["--bin", target.target.as_str()]);
-    // The selected binary's `required-features` gate makes the target
-    // eligible only when those features are enabled. Cargo addresses a
-    // direct dependency feature through the dependency key authored by the
-    // robot, which may differ from the package name when it is renamed.
     if !target.required_features.is_empty() {
         let mut features = collect_existing_features(command);
         for feature in &target.required_features {
@@ -727,7 +602,6 @@ fn append_target_selection(
         command.args(["--features", &features.join(",")]);
     }
 }
-
 /// Pull every comma-separated feature already present on `command` so the
 /// auto-merge in `append_target_selection` does not duplicate an explicit
 /// caller list.
@@ -763,7 +637,6 @@ fn collect_existing_features(command: &Command) -> Vec<String> {
     }
     features
 }
-
 /// Extracts one selected executable from Cargo's JSON compiler-artifact stream.
 pub(crate) fn artifact_path(
     stdout: &[u8],
@@ -797,7 +670,6 @@ pub(crate) fn artifact_path(
         message: "no compiler-artifact executable matched the selected package".to_owned(),
     })
 }
-
 pub(crate) fn run_command(
     mut command: Command,
     operation: CargoOperation,
@@ -819,65 +691,15 @@ pub(crate) fn run_command(
         stderr: output.stderr,
     })
 }
-
 fn status_string(status: ExitStatus) -> String {
     status
         .code()
         .map(|code| code.to_string())
         .unwrap_or_else(|| "terminated by signal".to_owned())
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn registry_sources_include_git_and_sparse_index_protocols() {
-        assert!(is_registry_source("registry+https://example.invalid/index"));
-        assert!(is_registry_source(
-            "sparse+https://phoxal.github.io/registry/"
-        ));
-        assert!(!is_registry_source("git+https://example.invalid/repo"));
-    }
-
-    #[test]
-    fn registry_config_passes_the_authored_index_through() {
-        if std::env::var_os("CARGO_REGISTRIES_PHOXAL_INDEX").is_some() {
-            let output = std::process::Command::new(std::env::current_exe().expect("test binary"))
-                .args([
-                    "--exact",
-                    "project::cargo::tests::registry_config_passes_the_authored_index_through",
-                    "--nocapture",
-                ])
-                .env_remove("CARGO_REGISTRIES_PHOXAL_INDEX")
-                .output()
-                .expect("isolated registry configuration test");
-            assert!(
-                output.status.success(),
-                "{}\n{}",
-                String::from_utf8_lossy(&output.stdout),
-                String::from_utf8_lossy(&output.stderr)
-            );
-            return;
-        }
-        // `cargo install --registry phoxal` skips project configuration
-        // discovery when the working directory is a package root, so the
-        // effective index must always be passed explicitly. The nearest
-        // authored configuration keeps its exact value.
-        let project = tempfile::tempdir().expect("project root");
-        let cargo = project.path().join(".cargo");
-        std::fs::create_dir_all(&cargo).expect("cargo config directory");
-        std::fs::write(
-            cargo.join("config.toml"),
-            "[registries.phoxal]\nindex = \"sparse+https://mirror.invalid/registry/\"\n",
-        )
-        .expect("cargo config");
-        assert_eq!(
-            registry_config(project.path()).as_deref(),
-            Some("registries.phoxal.index=\"sparse+https://mirror.invalid/registry/\"")
-        );
-    }
-
     #[test]
     fn collect_existing_features_reads_space_and_equals_forms() {
         let mut command = Command::new("cargo");
@@ -889,7 +711,6 @@ mod tests {
             vec!["scenario".to_owned(), "imu".to_owned(), "vision".to_owned()]
         );
     }
-
     #[test]
     fn collect_existing_features_dedupes_overlapping_entries() {
         let mut command = Command::new("cargo");

@@ -1,17 +1,14 @@
 //! Exact participant installation and compiled contract preparation.
-
-use std::collections::{BTreeMap, BTreeSet};
-use std::fs::{self, File, OpenOptions};
-use std::path::{Path, PathBuf};
-use std::process::Command;
-
 use super::cargo::CargoOptions;
 use super::document::{RobotDocument, Source};
 use super::file_lock::ExclusiveFileLock;
 use super::selection::PackageSource;
 use super::{Error, ProjectLayout};
 use fs4::TryLockError;
-
+use std::collections::{BTreeMap, BTreeSet};
+use std::fs::{self, File, OpenOptions};
+use std::path::{Path, PathBuf};
+use std::process::Command;
 #[derive(Debug, Clone)]
 pub(crate) struct InstalledSelection {
     pub(crate) package: String,
@@ -24,7 +21,6 @@ pub(crate) struct InstalledSelection {
     pub(crate) source_root: PathBuf,
     pub(crate) source: PackageSource,
 }
-
 pub(crate) fn selected_installations(
     layout: &ProjectLayout,
     document: &RobotDocument,
@@ -70,12 +66,10 @@ pub(crate) fn selected_installations(
     }
     Ok(selected)
 }
-
 struct SelectionRequest<'a> {
     binary: Option<&'a str>,
     source: &'a Source,
 }
-
 /// A cache key for the complete resolved source and actual build selection.
 pub(crate) fn installation_store(
     root: &Path,
@@ -85,22 +79,9 @@ pub(crate) fn installation_store(
     options: &CargoOptions,
 ) -> Result<PathBuf, Error> {
     use sha2::{Digest as _, Sha256};
-    let registry_index = match source {
-        Source::Package(package) => {
-            let registry = package.registry.as_deref().unwrap_or("phoxal");
-            super::cargo::registry_index(root, registry).ok_or_else(|| {
-                invalid(
-                    root,
-                    format!("registry `{registry}` has no configured index"),
-                )
-            })?
-        }
-        _ => String::new(),
-    };
     let selection = serde_json::to_vec(&(
         source,
         binary,
-        registry_index,
         super::cargo::BuildSelection::for_source(options),
     ))
     .map_err(|error| invalid(root, error.to_string()))?;
@@ -108,7 +89,6 @@ pub(crate) fn installation_store(
         .join("packages/selections")
         .join(format!("{:x}", Sha256::digest(selection))))
 }
-
 fn selected_installation(
     layout: &ProjectLayout,
     home: &Path,
@@ -121,27 +101,9 @@ fn selected_installation(
         return local_selection(layout, Path::new(path), binary, options);
     }
     let store = installation_store(layout.root(), home, source, binary, options)?;
-    let (package, authored_version, source) = match source {
-        Source::Package(package) => {
-            let registry = package.registry.as_deref().unwrap_or("phoxal");
-            (
-                package.name.as_str(),
-                Some(package.version.as_str()),
-                PackageSource::Registry {
-                    source: super::cargo::registry_index(layout.root(), registry).ok_or_else(
-                        || {
-                            invalid(
-                                layout.robot_manifest(),
-                                format!("registry `{registry}` has no configured index"),
-                            )
-                        },
-                    )?,
-                },
-            )
-        }
+    let (package, source) = match source {
         Source::Git(git) => (
             git.name.as_str(),
-            None,
             PackageSource::Git {
                 source: format!("git+{}#{}", git.url, git.rev),
             },
@@ -151,7 +113,6 @@ fn selected_installation(
     let binary = binary.unwrap_or(package);
     let executable = store.join("bin").join(binary);
     let source_root = store.join("source");
-    // The endpoint surface is extracted from the selected installed binary.
     if !executable.is_file()
         || !store.join("package-id").is_file()
         || !store.join(".crates.toml").is_file()
@@ -161,14 +122,12 @@ fn selected_installation(
             format!("{package} is not prepared; run `cargo phoxal prepare`"),
         ));
     }
-    let version = if let Some(version) = authored_version {
-        version.to_owned()
-    } else {
-        fs::read_to_string(store.join("package-version")).map_err(|source| Error::ArtifactFile {
+    let version = fs::read_to_string(store.join("package-version")).map_err(|source| {
+        Error::ArtifactFile {
             path: store.join("package-version"),
             source,
-        })?
-    };
+        }
+    })?;
     Ok(InstalledSelection {
         package: package.to_owned(),
         version,
@@ -186,7 +145,6 @@ fn selected_installation(
         source,
     })
 }
-
 fn local_selection(
     layout: &ProjectLayout,
     path: &Path,
@@ -210,7 +168,6 @@ fn local_selection(
             })?;
     package_selection(&source_root, binary, options)
 }
-
 /// Resolves the Cargo package at `source_root` and its selected binary.
 fn package_selection(
     source_root: &Path,
@@ -253,7 +210,6 @@ fn package_selection(
         source: PackageSource::Local { manifest_path },
     })
 }
-
 /// Prepares the executable and API closure declared by `robot.yaml`.
 pub(crate) fn prepare(
     layout: &ProjectLayout,
@@ -267,7 +223,6 @@ pub(crate) fn prepare(
     let robot = super::document::parse_and_validate(&text, layout.robot_manifest())?;
     prepare_graph(layout, options, &robot).map(|(changes, _)| changes)
 }
-
 /// Prepares selected binaries and returns the graph after robot-owned
 /// conversions have been lowered exactly once.
 pub(crate) fn prepare_graph(
@@ -279,7 +234,6 @@ pub(crate) fn prepare_graph(
     let changes = prepare_robot(layout, options, robot.clone())?;
     Ok((changes, robot.clone()))
 }
-
 fn prepare_robot(
     layout: &ProjectLayout,
     options: &CargoOptions,
@@ -295,10 +249,6 @@ fn prepare_robot(
     let RobotDocument::V0 {
         robot, services, ..
     } = robot;
-    // Selections of the robot package itself consume other participants; their
-    // compilation consumes every other participant's prepared products —
-    // services AND components — so they prepare last. Everything else
-    // keeps its authored order.
     let root = layout
         .root()
         .canonicalize()
@@ -307,12 +257,10 @@ fn prepare_robot(
             source,
         })?;
     let is_self = |source: &Source| {
-        matches!(source, Source::Path(path)
-            if layout
-                .root()
-                .join(Path::new(path))
-                .canonicalize()
-                .is_ok_and(|resolved| resolved == root))
+        matches!(
+            source, Source::Path(path) if layout.root().join(Path::new(path))
+            .canonicalize().is_ok_and(| resolved | resolved == root)
+        )
     };
     let mut selections: Vec<(&String, &Source, Option<&str>)> = services
         .iter()
@@ -340,7 +288,6 @@ fn prepare_robot(
     }
     Ok(changes)
 }
-
 /// Builds one local Rust-contract participant and prepares its extracted
 /// contract products under the robot's `.phoxal/local/` tree.
 ///
@@ -368,7 +315,6 @@ fn prepare_local_contract(
     )
     .map(|_| ())
 }
-
 /// Builds one selected participant and writes its extracted contract
 /// products to `contract_dir`, skipping the write while the recorded
 /// provenance still matches the compiled executable.
@@ -398,9 +344,6 @@ fn prepare_selection_products(
         .current_dir(&workdir)
         .args(["build", "--manifest-path"]);
     command.arg(&manifest_path);
-    if let Some(config) = super::cargo::registry_config(&workdir) {
-        command.args(["--config", &config]);
-    }
     let mut local_options = options.clone();
     local_options.features.clear();
     local_options.all_features = false;
@@ -444,7 +387,6 @@ fn prepare_selection_products(
         contract_dir,
     )
 }
-
 /// Restores project-local metadata from an existing executable without
 /// acquiring or compiling its package again.
 fn prepare_executable_contract(
@@ -459,145 +401,25 @@ fn prepare_executable_contract(
         package: package.to_owned(),
         version: Some(version.to_owned()),
     };
-    // Inspect the executable's CURRENT embedded contract: freshness is
-    // contract/descriptor content, never executable bytes.
     let contract =
         super::artifact::inspect_file(executable).map_err(|error| Error::ContractPreparation {
             message: format!("cannot inspect {}: {error}", executable.display()),
         })?;
     let descriptors = merge_descriptor_closures(&contract)?;
-    if prepared_matches(
+    phoxal_build::write_prepared(
         contract_dir,
         selection_identity,
         selection_binary,
-        &contract,
-        &descriptors,
-    ) {
-        return Ok(false);
-    }
-    write_prepared_contract(
-        contract_dir,
-        selection_identity,
-        selection_binary,
-        &contract.runtime,
-        &descriptors,
         &executable_record,
-    )?;
-    Ok(true)
-}
-
-/// Whether the prepared product already carries exactly this contract and
-/// descriptor content.
-fn prepared_matches(
-    contract_dir: &Path,
-    selection: &phoxal_build::PreparedSelection,
-    binary: Option<&str>,
-    contract: &super::artifact::ArtifactContract,
-    descriptors: &prost_types::FileDescriptorSet,
-) -> bool {
-    let Ok(prepared) = phoxal_build::read_prepared_for(contract_dir, selection, binary) else {
-        return false;
-    };
-    let Ok(existing_runtime) = serde_json::to_value(&contract.runtime) else {
-        return false;
-    };
-    if prepared.file.runtime != existing_runtime {
-        return false;
-    }
-    use prost::Message as _;
-    prepared.descriptors.encode_to_vec() == descriptors.encode_to_vec()
-}
-
-/// Writes one prepared contract directory atomically: `contract.json`
-/// and `descriptors.pb` land together through a staging directory, so an
-/// interrupted preparation can never mix new metadata with old
-/// descriptors.
-pub(crate) fn write_prepared_contract(
-    contract_dir: &Path,
-    selection: &phoxal_build::PreparedSelection,
-    binary: Option<&str>,
-    runtime: &phoxal::artifact::RuntimeRecord,
-    descriptors: &prost_types::FileDescriptorSet,
-    executable: &phoxal_build::PreparedExecutable,
-) -> Result<(), Error> {
-    use prost::Message as _;
-    let _guard = phoxal_build::PreparedPublication::acquire(contract_dir).map_err(|error| {
-        Error::ContractPreparation {
-            message: error.to_string(),
-        }
-    })?;
-    let parent = contract_dir.parent().unwrap_or_else(|| Path::new("."));
-    let staged = tempfile::Builder::new()
-        .prefix(".phoxal-prepared-")
-        .tempdir_in(parent)
-        .map_err(|source| Error::ArtifactFile {
-            path: parent.to_owned(),
-            source,
-        })?;
-    let staging = staged.path().join("candidate");
-    fs::create_dir(&staging).map_err(|source| Error::ArtifactFile {
-        path: staging.clone(),
-        source,
-    })?;
-    let runtime_record =
-        serde_json::to_value(runtime).map_err(|error| Error::ContractPreparation {
-            message: error.to_string(),
-        })?;
-    let contract_file = phoxal_build::PreparedContractFile {
-        generation: phoxal_build::CONTRACT_GENERATION,
-        selection: selection.clone(),
-        binary: binary.map(str::to_owned),
-        executable: executable.clone(),
-        runtime: runtime_record,
-    };
-    let contract_path = staging.join(phoxal_build::CONTRACT_FILE);
-    fs::write(
-        &contract_path,
-        serde_json::to_vec_pretty(&contract_file).map_err(|error| Error::ContractPreparation {
+        serde_json::to_value(&contract.runtime).map_err(|error| Error::ContractPreparation {
             message: error.to_string(),
         })?,
+        &descriptors,
     )
-    .map_err(|source| Error::ArtifactFile {
-        path: contract_path.clone(),
-        source,
-    })?;
-    let descriptor_path = staging.join(phoxal_build::DESCRIPTORS_FILE);
-    fs::write(&descriptor_path, descriptors.encode_to_vec()).map_err(|source| {
-        Error::ArtifactFile {
-            path: descriptor_path.clone(),
-            source,
-        }
-    })?;
-    let previous = staged.path().join("previous");
-    if contract_dir.exists() {
-        fs::rename(contract_dir, &previous).map_err(|source| Error::ArtifactFile {
-            path: contract_dir.to_owned(),
-            source,
-        })?;
-    }
-    // Keep the old pair until publication succeeds; readers hold the shared
-    // sibling lock and cannot observe the gap between these two renames.
-    let candidate = staging;
-    if let Err(source) = fs::rename(&candidate, contract_dir) {
-        if previous.exists()
-            && let Err(restore) = fs::rename(&previous, contract_dir)
-        {
-            let retained = staged.keep();
-            return Err(Error::ContractPreparation {
-                message: format!(
-                    "publication failed: {source}; restoration failed: {restore}; previous prepared product preserved at {}",
-                    retained.display()
-                ),
-            });
-        }
-        return Err(Error::ArtifactFile {
-            path: contract_dir.to_owned(),
-            source,
-        });
-    }
-    Ok(())
+    .map_err(|error| Error::ContractPreparation {
+        message: error.to_string(),
+    })
 }
-
 /// Extracts the executable path of one binary from Cargo's JSON messages.
 fn artifact_executable(stdout: &[u8], binary: &str) -> Option<PathBuf> {
     for line in String::from_utf8_lossy(stdout).lines() {
@@ -613,7 +435,6 @@ fn artifact_executable(stdout: &[u8], binary: &str) -> Option<PathBuf> {
     }
     None
 }
-
 /// Folds every retained descriptor closure of one artifact into a single
 /// standard descriptor set, collapsing identical files and rejecting
 /// conflicting definitions.
@@ -650,7 +471,6 @@ pub(crate) fn merge_descriptor_closures(
     files.sort_by(|left, right| left.name().cmp(right.name()));
     Ok(prost_types::FileDescriptorSet { file: files })
 }
-
 fn prepare_selection(
     layout: &ProjectLayout,
     options: &CargoOptions,
@@ -675,22 +495,11 @@ fn prepare_selection(
                 format!("{instance} local source must be a nonempty relative path"),
             ));
         }
-        // Every local participant owns its endpoint surface in Rust: it
-        // prepares from its compiled artifact. Unrelated adjacent files
-        // stay untouched.
         let selection = local_selection(layout, path, binary, options)?;
         prepare_local_contract(layout, options, path, binary, &selection)?;
         return Ok(None);
     }
     let selection_identity = match source {
-        Source::Package(package) => phoxal_build::PreparedSelection::Registry {
-            registry: package
-                .registry
-                .clone()
-                .unwrap_or_else(|| "phoxal".to_owned()),
-            name: package.name.clone(),
-            version: package.version.clone(),
-        },
         Source::Git(git) => phoxal_build::PreparedSelection::Git {
             name: git.name.clone(),
             revision: git.rev.clone(),
@@ -701,15 +510,12 @@ fn prepare_selection(
     };
     let store = installation_store(layout.root(), home, source, binary, options)?;
     let (package, expected_version) = match source {
-        Source::Package(package) => (package.name.as_str(), Some(package.version.as_str())),
         Source::Git(git) => (git.name.as_str(), None),
         Source::Path(_) => unreachable!("handled above"),
     };
     let declared_binary = binary;
     let binary = binary.unwrap_or(package);
     let installed = store.join("bin").join(binary);
-    // The installation is shared across robots. Project-local metadata can
-    // always be recovered from its binary, including after deleting `.phoxal`.
     if installed.is_file()
         && store.join(".crates.toml").is_file()
         && store.join("package-id").is_file()
@@ -746,8 +552,6 @@ fn prepare_selection(
         install.path(),
         options,
     );
-    // Cargo's package build identity can collide across installed Git checkouts.
-    // The existing complete selection identity also owns its Cargo build directory.
     let cache_key = store
         .file_name()
         .ok_or_else(|| invalid(&store, "selection store has no build-cache key"))?;
@@ -820,9 +624,15 @@ fn prepare_selection(
                 source,
             })?;
             if let Err(source) = fs::rename(install.path(), &store) {
-                fs::rename(&previous, &store).map_err(|restore| {
-                    invalid(&store, format!("cannot publish installation: {source}; cannot restore previous installation: {restore}"))
-                })?;
+                fs::rename(&previous, &store)
+                    .map_err(|restore| {
+                        invalid(
+                            &store,
+                            format!(
+                                "cannot publish installation: {source}; cannot restore previous installation: {restore}"
+                            ),
+                        )
+                    })?;
                 return Err(Error::ArtifactFile {
                     path: store,
                     source,
@@ -837,7 +647,6 @@ fn prepare_selection(
     })?;
     Ok(Some(format!("{instance} {package} {version}")))
 }
-
 pub(crate) fn captured_source(
     output: &[u8],
     binary: &str,
@@ -916,10 +725,8 @@ pub(crate) fn captured_source(
         ),
     ))
 }
-
 fn retain_package_files(source: &Path, installed: &Path) -> Result<(), Error> {
     let retained = installed.join("source");
-    // Only component model resources need source retention.
     fs::create_dir_all(&retained).map_err(|error| Error::ArtifactFile {
         path: retained.clone(),
         source: error,
@@ -936,7 +743,6 @@ fn retain_package_files(source: &Path, installed: &Path) -> Result<(), Error> {
     }
     Ok(())
 }
-
 fn preparation_lock(root: &Path) -> Result<ExclusiveFileLock, Error> {
     let directory = root.join("target/phoxal");
     let path = directory.join("preparation.lock");
@@ -963,7 +769,6 @@ fn preparation_lock(root: &Path) -> Result<ExclusiveFileLock, Error> {
         Err(TryLockError::Error(error)) => Err(invalid(&path, error.to_string())),
     }
 }
-
 fn installation_lock(home: &Path) -> Result<ExclusiveFileLock, Error> {
     let directory = home.join("packages");
     fs::create_dir_all(&directory).map_err(|source| Error::ArtifactFile {
@@ -983,7 +788,6 @@ fn installation_lock(home: &Path) -> Result<ExclusiveFileLock, Error> {
         })?;
     ExclusiveFileLock::acquire(file).map_err(|source| Error::ArtifactFile { path, source })
 }
-
 pub(crate) fn phoxal_home() -> Result<PathBuf, Error> {
     if let Some(path) = std::env::var_os("PHOXAL_HOME") {
         if path.is_empty() {
@@ -1008,7 +812,6 @@ pub(crate) fn phoxal_home() -> Result<PathBuf, Error> {
             .join("phoxal"))
     }
 }
-
 fn host_target() -> Result<String, Error> {
     let output = Command::new("rustc")
         .arg("-vV")
@@ -1026,34 +829,29 @@ fn host_target() -> Result<String, Error> {
         .map(str::to_owned)
         .ok_or_else(|| invalid(Path::new("rustc"), "rustc did not report a host target"))
 }
-
 fn identifier(value: &str) -> bool {
     !value.is_empty()
         && value.bytes().all(|byte| {
             byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-' || byte == b'_'
         })
 }
-
 fn invalid(path: &Path, message: impl Into<String>) -> Error {
     Error::ManifestPreparation {
         path: path.to_owned(),
         message: message.into(),
     }
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
     #[test]
     fn git_selection_with_package_path_remains_git() {
         let selected: Source = serde_yaml::from_str(
-            "git:\n  name: acme-motion\n  url: https://example.test/motion.git\n  rev: 0123456789abcdef0123456789abcdef01234567\n  path: services/motion\n",
-        )
-        .expect("Git selection");
+                "git:\n  name: acme-motion\n  url: https://example.test/motion.git\n  rev: 0123456789abcdef0123456789abcdef01234567\n  path: services/motion\n",
+            )
+            .expect("Git selection");
         assert!(matches!(selected, Source::Git(_)));
     }
-
     #[test]
     fn captured_source_accepts_workspace_inherited_package_version() {
         let directory = tempfile::tempdir().expect("temporary workspace");
@@ -1072,7 +870,12 @@ mod tests {
         .expect("provider manifest");
         let source = provider.join("src/main.rs");
         fs::write(&source, "fn main() {}\n").expect("provider source");
-        let message = serde_json::json!({"reason":"compiler-artifact","package_id":"path+file:///proof-provider#1.2.3","target":{"name":"proof-provider","kind":["bin"],"src_path":source}}).to_string();
+        let message = serde_json::json!(
+            { "reason" : "compiler-artifact", "package_id" :
+            "path+file:///proof-provider#1.2.3", "target" : { "name" : "proof-provider",
+            "kind" : ["bin"], "src_path" : source } }
+        )
+        .to_string();
         let options = CargoOptions {
             offline: true,
             ..CargoOptions::default()
@@ -1089,7 +892,6 @@ mod tests {
         assert_eq!(package_id, "path+file:///proof-provider#1.2.3");
         assert_eq!(version, "1.2.3");
     }
-
     #[test]
     fn retained_component_contains_runtime_resources_without_package_source() {
         let directory = tempfile::tempdir().expect("temporary package");
@@ -1097,7 +899,11 @@ mod tests {
         let installed = directory.path().join("installed");
         fs::create_dir_all(source.join("assets")).expect("asset directory");
         fs::create_dir_all(source.join("src")).expect("source directory");
-        fs::write(source.join("component.yaml"), "schema: phoxal/component/v0\nmodel: { file: model.xml, root_body: mount }\ncapabilities: {}\nassets: [assets]\n").expect("component definition");
+        fs::write(
+                source.join("component.yaml"),
+                "schema: phoxal/component/v0\nmodel: { file: model.xml, root_body: mount }\ncapabilities: {}\nassets: [assets]\n",
+            )
+            .expect("component definition");
         fs::write(source.join("model.xml"), "<mujoco model=\"proof\"/>").expect("model");
         fs::write(source.join("assets/mesh.obj"), "proof mesh").expect("resource");
         fs::write(source.join("src/main.rs"), "fn main() {}").expect("Rust source");
@@ -1106,7 +912,6 @@ mod tests {
             "[package]\nname = \"proof\"\nversion = \"1.0.0\"\n",
         )
         .expect("manifest");
-
         retain_package_files(&source, &installed).expect("retain runtime resources");
         for path in ["component.yaml", "model.xml", "assets/mesh.obj"] {
             assert!(

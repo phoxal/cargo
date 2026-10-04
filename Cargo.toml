@@ -1,11 +1,11 @@
 
 [package]
 name = "cargo-phoxal"
-version = "0.0.0-dev.13"
+version = "0.1.0"
 edition = "2024"
 rust-version = "1.88"
 license-file = "LICENSE"
-publish = ["phoxal"]
+publish = true
 exclude = ["tests/"]
 description = "The Phoxal project compiler and Cargo source-development command."
 documentation = "https://github.com/phoxal/cargo#readme"
@@ -19,32 +19,21 @@ path = "src/main.rs"
 [dependencies]
 clap = { "version" = "4.6.1", "features" = ["derive", "env"] }
 serde_json = { "version" = "1.0.149" }
-semver = { "version" = "1.0" }
-base64 = { "version" = "0.22.1" }
 cargo_metadata = { "version" = "0.23.1", "features" = ["builder"] }
-flate2 = { "version" = "1.1.10" }
 fs4 = { "version" = "1.1.0" }
-heck = { "version" = "0.5.0" }
 jsonschema = { "version" = "0.46.6", "default-features" = false }
-keyring = { "version" = "3.6.3" }
-libc = { "version" = "0.2.180" }
-reqwest = { "version" = "0.12.28", "default-features" = false, "features" = ["blocking", "json", "rustls-tls"] }
 object = { "version" = "0.36.7", "default-features" = false, "features" = ["std", "write_core", "read_core", "elf", "macho"] }
 prost-reflect = { "version" = "0.16.5" }
 prost = { "version" = "0.14.4" }
 prost-types = { "version" = "0.14.4" }
-prettyplease = { "version" = "0.2.37" }
 serde = { "version" = "1.0.228", "features" = ["derive"] }
 serde_yaml = { "version" = "0.9" }
 sha2 = { "version" = "0.10.9" }
 tempfile = { "version" = "3.27.0" }
-tar = { "version" = "0.4.46" }
 thiserror = { "version" = "2.0.18" }
 toml = { "version" = "1" }
-toml_edit = { "version" = "0.25.12" }
-syn = { "version" = "2.0", "features" = ["full", "extra-traits"] }
-phoxal = { "version" = "=0.0.0-dev.8", "registry" = "phoxal", "default-features" = false, "features" = ["scenario", "build"] }
-phoxal-build = { "version" = "=0.0.0-dev.8", "registry" = "phoxal" }
+phoxal = { "version" = "0.69.0", "default-features" = false, "features" = ["scenario"] }
+phoxal-build = { "version" = "0.69.0" }
 
 [lints]
 

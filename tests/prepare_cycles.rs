@@ -405,10 +405,6 @@ fn git_participant_revision_bump_keeps_preparation_green() -> Result<(), Box<dyn
         .args(["generate-lockfile", "--offline", "--manifest-path"])
         .arg(source.join("Cargo.toml"))
         .current_dir(&source)
-        .env(
-            "CARGO_REGISTRIES_PHOXAL_INDEX",
-            "sparse+https://phoxal.github.io/registry/",
-        )
         .output()?;
     assert!(
         lock.status.success(),

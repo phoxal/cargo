@@ -17,12 +17,9 @@ mod file_lock;
 pub(crate) mod manifest_check;
 pub(crate) mod participant;
 mod passive;
-mod publication;
 pub mod scenario;
 mod selection;
 mod simulation;
-mod simulator_installer;
-mod submission;
 mod supervisor;
 mod validation;
 
@@ -35,18 +32,13 @@ pub use bundle::{CompiledBundle, SimulationModelFacts};
 pub use cargo::{CargoOperation, CargoOptions, CargoOutput, CargoSelection, LockMode};
 pub use discovery::ProjectLayout;
 pub use document::RobotDocument;
-pub use error::{DiscoveryError, Error, PublicationError, SourceError};
+pub use error::{DiscoveryError, Error, SourceError};
 pub(crate) use participant::phoxal_home;
 
-pub use publication::{
-    PublicationKind, PublicationOptions, PublicationResult, prepare_publication,
-};
 pub use selection::{SelectedTarget, SourceSelection};
 pub use simulation::{
     SimulationBound, SimulationPresentation, SimulationRunOptions, SimulationRunReport,
-    install_simulator, simulator_status, uninstall_simulator,
 };
-pub use submission::{SubmissionResult, submit_publication};
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -139,16 +131,23 @@ impl Project {
         Ok(prepared)
     }
 
-    /// Finalizes and runs one finite simulation from a prepared snapshot,
-    /// with bounded supervisor cleanup.
-    /// Run one finite simulation: one preparation and one probe, then the
-    /// finalized bundle.
-    pub fn run_simulation(
+    /// Compile one simulation bundle, freezing inputs before its single native probe.
+    pub fn build_simulation(
         &self,
         options: &CargoOptions,
-        request: &SimulationRunOptions,
-    ) -> Result<SimulationRunReport, Error> {
-        simulation::run(self, options, request, None)
+        scene: &Path,
+        output: Option<PathBuf>,
+    ) -> Result<CompiledBundle, Error> {
+        let mut request = SimulationRunOptions::new(
+            scene,
+            SimulationPresentation::Headless,
+            SimulationBound::Steps(1),
+        )?;
+        if let Some(output) = output {
+            request = request.with_output(output);
+        }
+        let snapshot = simulation::prepare_simulation(self, options, &request)?;
+        simulation::finalize_prepared(&snapshot, &request, None)
     }
 }
 

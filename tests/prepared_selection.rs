@@ -562,10 +562,6 @@ fn git_rust_contract_participant_prepares_from_the_installed_artifact()
         .args(["generate-lockfile", "--offline", "--manifest-path"])
         .arg(source.join("Cargo.toml"))
         .current_dir(&source)
-        .env(
-            "CARGO_REGISTRIES_PHOXAL_INDEX",
-            "sparse+https://phoxal.github.io/registry/",
-        )
         .output()?;
     assert!(
         lock.status.success(),

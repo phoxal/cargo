@@ -18,10 +18,6 @@ pub enum PackageSource {
     Local { manifest_path: PathBuf },
     /// A pinned Git package.
     Git { source: String },
-    /// A registry package, including the configured Phoxal registry.
-    Registry { source: String },
-    /// A future or custom Cargo source that this reader preserves verbatim.
-    Other { source: String },
 }
 
 /// One Cargo target selected for execution.
@@ -322,23 +318,6 @@ fn selected_target(package: &Package, target: &Target) -> SelectedTarget {
         manifest_path: None,
         executable: None,
         required_features: target.required_features.clone(),
-    }
-}
-
-pub(crate) fn package_source(package: &Package) -> PackageSource {
-    match &package.source {
-        None => PackageSource::Local {
-            manifest_path: package.manifest_path.as_std_path().to_owned(),
-        },
-        Some(source) if source.repr.starts_with("git+") => PackageSource::Git {
-            source: source.repr.clone(),
-        },
-        Some(source) if super::cargo::is_registry_source(&source.repr) => PackageSource::Registry {
-            source: source.repr.clone(),
-        },
-        Some(source) => PackageSource::Other {
-            source: source.repr.clone(),
-        },
     }
 }
 

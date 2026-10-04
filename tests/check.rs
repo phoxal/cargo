@@ -94,8 +94,9 @@ fn independently_selected_participant_keeps_its_version_and_shared_artifact() {
     fs::create_dir_all(provider.join("src")).expect("provider directory");
     fs::write(
         provider.join("Cargo.toml"),
-        "[workspace]\n[package]\nname = \"selection-provider\"\nversion = \"0.7.0\"\nedition = \"2024\"\n",
-    ).expect("provider manifest");
+        "[package]\nname = \"selection-provider\"\nversion = \"0.7.0\"\nedition = \"2024\"\n",
+    )
+    .expect("provider manifest");
     fs::copy(root.join("build.rs"), provider.join("build.rs")).expect("provider contract");
     fs::copy(root.join("src/main.rs"), provider.join("src/main.rs")).expect("provider main");
     let yaml = fs::read_to_string(root.join("robot.yaml")).expect("robot document");
@@ -145,7 +146,7 @@ fn passive_path_component_does_not_require_a_robot_rust_dependency() {
     let (_component_guard, component) = stage("passive-component");
     let yaml = fs::read_to_string(root.join("robot.yaml")).unwrap();
     fs::create_dir(root.join("caster")).unwrap();
-    for name in ["Cargo.toml", "component.yaml", "model.xml"] {
+    for name in ["component.yaml", "model.xml"] {
         fs::copy(component.join(name), root.join("caster").join(name)).unwrap();
     }
     let selection =
@@ -184,53 +185,16 @@ fn passive_path_component_does_not_require_a_robot_rust_dependency() {
     );
 }
 
-#[path = "support/registry.rs"]
-mod registry;
-
 #[test]
-fn passive_registry_and_git_selections_reuse_retained_assets_offline()
--> Result<(), Box<dyn std::error::Error>> {
-    use sha2::{Digest as _, Sha256};
+fn passive_git_selection_reuses_retained_assets_offline() -> Result<(), Box<dyn std::error::Error>>
+{
     use std::process::Command;
     let (_guard, root) = stage("check-valid");
     let (_component_guard, component) = stage("passive-component");
-    // The publication carrier is an ordinary Cargo library, not a process.
-    let manifest = fs::read_to_string(component.join("Cargo.toml"))?
-        .replace("autolib = false", "autolib = true");
-    fs::write(component.join("Cargo.toml"), manifest)?;
-    fs::create_dir(component.join("src"))?;
-    fs::write(component.join("src/lib.rs"), "")?;
-    let registry_root = root.join("registry");
-    let archive_path = registry_root.join("api/v1/crates/passive-component-fixture/0.1.0/download");
-    fs::create_dir_all(archive_path.parent().ok_or("archive parent")?)?;
-    let archive = flate2::write::GzEncoder::new(
-        fs::File::create(&archive_path)?,
-        flate2::Compression::default(),
-    );
-    let mut tar = tar::Builder::new(archive);
-    tar.append_dir_all("passive-component-fixture-0.1.0", &component)?;
-    tar.into_inner()?.finish()?;
-    let checksum = format!("{:x}", Sha256::digest(fs::read(&archive_path)?));
-    fs::create_dir_all(registry_root.join("pa/ss"))?;
-    fs::write(
-        registry_root.join("pa/ss/passive-component-fixture"),
-        format!(
-            "{}\n",
-            serde_json::json!({"name":"passive-component-fixture","vers":"0.1.0","deps":[],"cksum":checksum,"features":{},"yanked":false})
-        ),
-    )?;
-    let server = registry::RegistryServer::start(&registry_root)?;
-    fs::write(
-        registry_root.join("config.json"),
-        format!(
-            "{{\"dl\":\"http://127.0.0.1:{}/api/v1/crates\"}}",
-            server.port
-        ),
-    )?;
     let checkout = root.join("git-source");
     let git_component = checkout.join("component");
-    fs::create_dir_all(git_component.join("src"))?;
-    for name in ["Cargo.toml", "component.yaml", "model.xml", "src/lib.rs"] {
+    fs::create_dir_all(&git_component)?;
+    for name in ["component.yaml", "model.xml"] {
         fs::copy(component.join(name), git_component.join(name))?;
     }
     for args in [
@@ -264,7 +228,7 @@ fn passive_registry_and_git_selections_reuse_retained_assets_offline()
     let revision = String::from_utf8(revision.stdout)?.trim().to_owned();
     let yaml = fs::read_to_string(root.join("robot.yaml"))?;
     let selection = format!(
-        "components:\n    registry_caster:\n      source: {{ package: {{ name: passive-component-fixture, version: '0.1.0', registry: proof }} }}\n      mount_site: registry_mount\n    git_caster:\n      source: {{ git: {{ name: passive-component-fixture, url: 'file://{}', rev: '{revision}', path: component }} }}\n      mount_site: git_mount",
+        "components:\n    git_caster:\n      source: {{ git: {{ name: passive-component-fixture, url: 'file://{}', rev: '{revision}', path: component }} }}\n      mount_site: git_mount",
         checkout.display()
     );
     fs::write(
@@ -278,10 +242,6 @@ fn passive_registry_and_git_selections_reuse_retained_assets_offline()
             .env_remove("CARGO_TARGET_DIR")
             .env("PHOXAL_HOME", root.join(".phoxal-home"))
             .env("CARGO_HOME", &cargo_home)
-            .env(
-                "CARGO_REGISTRIES_PROOF_INDEX",
-                format!("sparse+http://127.0.0.1:{}/", server.port),
-            )
             .arg("check")
             .args(offline.then_some("--offline"))
             .output()
@@ -304,11 +264,11 @@ fn passive_registry_and_git_selections_reuse_retained_assets_offline()
     );
     let entries = fs::read_dir(root.join(".phoxal-home/packages/passive"))?
         .filter_map(Result::ok)
-        .filter(|entry| entry.path().join("source/model.xml").is_file())
+        .filter(|entry| entry.path().join("model.xml").is_file())
         .count();
     assert_eq!(
-        entries, 2,
-        "independent registry and Git selections retain their declared assets"
+        entries, 1,
+        "pinned Git selection retains its declared assets"
     );
     Ok(())
 }

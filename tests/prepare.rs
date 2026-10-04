@@ -1,14 +1,6 @@
-#[path = "support/registry.rs"]
-mod registry;
-use registry::RegistryServer;
-
 use std::fs;
 use std::path::Path;
 use std::process::Command;
-
-use flate2::Compression;
-use flate2::write::GzEncoder;
-use sha2::{Digest, Sha256};
 
 /// The build script of a dependency-free Rust-contract participant whose
 /// binary retains one observation endpoint (`__ENDPOINT__`, publishing
@@ -334,6 +326,25 @@ fn exact_git_revision_prepares_the_alternate_binary_contract()
         &phoxal_home.join("packages/selections"),
         "Cargo.toml"
     )?);
+    fs::remove_dir_all(robot.join(".phoxal"))?;
+    fs::remove_dir_all(cargo_home.join("git"))?;
+    let recovered = Command::new(env!("CARGO_BIN_EXE_cargo-phoxal"))
+        .args(["prepare", "--offline"])
+        .current_dir(&robot)
+        .env("CARGO_HOME", &cargo_home)
+        .env("PHOXAL_HOME", &phoxal_home)
+        .output()?;
+    assert!(
+        recovered.status.success(),
+        "offline recovery: {}",
+        String::from_utf8_lossy(&recovered.stderr)
+    );
+    assert!(
+        fs::read_to_string(
+            find_prepared(&robot, &format!("git-{package}@"))?.join("contract.json")
+        )?
+        .contains("telemetry")
+    );
     // An independent checkout of the same package/version/binary must
     // retain its own compiled contract even when the caller shares a target directory.
     let alternate = directory.path().join("alternate-source");
@@ -405,233 +416,5 @@ fn exact_git_revision_prepares_the_alternate_binary_contract()
         endpoints.contains("\"alternate_telemetry\""),
         "the new source's contract must survive a shared caller cache: {endpoints}"
     );
-    Ok(())
-}
-
-#[test]
-fn exact_registry_participant_recovers_prepared_contract_without_cargo_cache()
--> Result<(), Box<dyn std::error::Error>> {
-    let directory = tempfile::tempdir()?;
-    let package = "proof-registry-provider";
-    let version = "0.1.0";
-    let source = directory.path().join("source");
-    let registry = directory.path().join("registry");
-    let robot = directory.path().join("robot");
-    let cargo_home = directory.path().join("cargo-home");
-    let phoxal_home = directory.path().join("phoxal-home");
-    fs::create_dir_all(&robot)?;
-    fs::create_dir_all(&cargo_home)?;
-    write_rust_contract_provider(&source, package, version, None, "status", &cargo_home)?;
-
-    let archive_dir = registry.join("api/v1/crates").join(package).join(version);
-    fs::create_dir_all(&archive_dir)?;
-    let archive_path = archive_dir.join("download");
-    let archive = GzEncoder::new(fs::File::create(&archive_path)?, Compression::default());
-    let mut archive = tar::Builder::new(archive);
-    archive.append_dir_all(format!("{package}-{version}"), &source)?;
-    archive.into_inner()?.finish()?;
-    let checksum = Sha256::digest(fs::read(&archive_path)?);
-    let checksum = checksum
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect::<String>();
-    let index = registry.join("pr/oo");
-    fs::create_dir_all(&index)?;
-    fs::write(
-        index.join(package),
-        format!(
-            "{}\n",
-            serde_json::json!({"name": package, "vers": version, "deps": [], "cksum": checksum, "features": {}, "yanked": false})
-        ),
-    )?;
-
-    let server = RegistryServer::start(&registry)?;
-    fs::write(
-        registry.join("config.json"),
-        format!(
-            "{{\"dl\":\"http://127.0.0.1:{}/api/v1/crates\"}}",
-            server.port
-        ),
-    )?;
-    fs::write(
-        robot.join("Cargo.toml"),
-        "[package]\nname = \"proof-robot\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
-    )?;
-    fs::write(
-        robot.join("robot.yaml"),
-        format!(
-            "schema: phoxal/robot/v0\nrobot: {{ id: proof-robot }}\nsupervisor:\n  source: {{ path: supervisor }}\nservices:\n  provider:\n    source:\n      package: {{ name: {package}, version: '{version}', registry: proof }}\n"
-        ),
-    )?;
-    let prepared = || -> Result<std::path::PathBuf, Box<dyn std::error::Error>> {
-        Ok(
-            find_prepared(&robot, &format!("registry-proof-{package}@{version}"))?
-                .join("contract.json"),
-        )
-    };
-    let prepare = |offline: bool| -> Result<std::process::Output, Box<dyn std::error::Error>> {
-        Ok(Command::new(env!("CARGO_BIN_EXE_cargo-phoxal"))
-            .arg("prepare")
-            .args(offline.then_some("--offline"))
-            .current_dir(&robot)
-            .env("CARGO_HOME", &cargo_home)
-            .env("PHOXAL_HOME", &phoxal_home)
-            .env(
-                "CARGO_REGISTRIES_PROOF_INDEX",
-                format!("sparse+http://127.0.0.1:{}/", server.port),
-            )
-            .output()?)
-    };
-    let first = prepare(false)?;
-    assert!(
-        first.status.success(),
-        "{}",
-        String::from_utf8_lossy(&first.stderr)
-    );
-    let endpoints = fs::read_to_string(prepared()?)?;
-    assert!(
-        endpoints.contains("proof.registry.v1.Status"),
-        "the prepared contract carries the installed artifact's payload identity"
-    );
-    assert!(contains_file(
-        &phoxal_home.join("packages/selections"),
-        package
-    )?);
-    assert!(!contains_file(
-        &phoxal_home.join("packages/selections"),
-        "Cargo.toml"
-    )?);
-    let warm = prepare(false)?;
-    assert!(
-        warm.status.success(),
-        "{}",
-        String::from_utf8_lossy(&warm.stderr)
-    );
-    assert!(
-        warm.stderr.is_empty(),
-        "warm preparation should reuse the exact package"
-    );
-
-    fs::remove_dir_all(robot.join(".phoxal"))?;
-    fs::remove_dir_all(cargo_home.join("registry"))?;
-    let recovered = prepare(true)?;
-    assert!(
-        recovered.status.success(),
-        "{}",
-        String::from_utf8_lossy(&recovered.stderr)
-    );
-    assert!(fs::read_to_string(prepared()?)?.contains("proof.registry.v1.Status"));
-
-    fs::write(&archive_path, b"tampered archive")?;
-    fs::remove_dir_all(robot.join(".phoxal"))?;
-    fs::remove_dir_all(phoxal_home.join("packages/selections"))?;
-    let rejected = prepare(false)?;
-    assert!(!rejected.status.success());
-    assert!(
-        String::from_utf8_lossy(&rejected.stderr).contains("checksum"),
-        "{}",
-        String::from_utf8_lossy(&rejected.stderr)
-    );
-    Ok(())
-}
-
-#[test]
-fn registry_rust_contract_participant_prepares_from_the_installed_artifact()
--> Result<(), Box<dyn std::error::Error>> {
-    let directory = tempfile::tempdir()?;
-    let package = "proof-registry-rust-provider";
-    let version = "0.1.0";
-    let source = directory.path().join("source");
-    let registry = directory.path().join("registry");
-    let robot = directory.path().join("robot");
-    let cargo_home = directory.path().join("cargo-home");
-    let phoxal_home = directory.path().join("phoxal-home");
-    fs::create_dir_all(&robot)?;
-    fs::create_dir_all(&cargo_home)?;
-    write_rust_contract_provider(&source, package, version, None, "status", &cargo_home)?;
-    fs::write(
-        robot.join("Cargo.toml"),
-        "[package]\nname = \"proof-robot\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
-    )?;
-    fs::write(
-        robot.join("robot.yaml"),
-        format!(
-            "schema: phoxal/robot/v0\nrobot: {{ id: proof-robot }}\nsupervisor:\n  source: {{ path: supervisor }}\nservices:\n  provider:\n    source:\n      package: {{ name: {package}, version: '{version}', registry: proof }}\nconnections: {{}}\n"
-        ),
-    )?;
-
-    let archive_dir = registry.join("api/v1/crates").join(package).join(version);
-    fs::create_dir_all(&archive_dir)?;
-    let archive_path = archive_dir.join("download");
-    let archive = GzEncoder::new(fs::File::create(&archive_path)?, Compression::default());
-    let mut archive = tar::Builder::new(archive);
-    archive.append_dir_all(format!("{package}-{version}"), &source)?;
-    archive.into_inner()?.finish()?;
-    let checksum = Sha256::digest(fs::read(&archive_path)?);
-    let checksum = checksum
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect::<String>();
-    let index = registry.join("pr/oo");
-    fs::create_dir_all(&index)?;
-    fs::write(
-        index.join(package),
-        format!(
-            "{}\n",
-            serde_json::json!({"name": package, "vers": version, "deps": [], "cksum": checksum, "features": {}, "yanked": false})
-        ),
-    )?;
-
-    let server = RegistryServer::start(&registry)?;
-    fs::write(
-        registry.join("config.json"),
-        format!(
-            "{{\"dl\":\"http://127.0.0.1:{}/api/v1/crates\"}}",
-            server.port
-        ),
-    )?;
-    let prepare = || -> Result<std::process::Output, Box<dyn std::error::Error>> {
-        Ok(Command::new(env!("CARGO_BIN_EXE_cargo-phoxal"))
-            .arg("prepare")
-            .current_dir(&robot)
-            .env("CARGO_HOME", &cargo_home)
-            .env("PHOXAL_HOME", &phoxal_home)
-            .env(
-                "CARGO_REGISTRIES_PROOF_INDEX",
-                format!("sparse+http://127.0.0.1:{}/", server.port),
-            )
-            .output()?)
-    };
-    let first = prepare()?;
-    assert!(
-        first.status.success(),
-        "a registry Rust-contract package prepares from its installed artifact:\n--- stdout ---\n{}\n--- stderr ---\n{}",
-        String::from_utf8_lossy(&first.stdout),
-        String::from_utf8_lossy(&first.stderr),
-    );
-    let contract_dir = find_prepared(&robot, &format!("registry-proof-{package}@{version}"))?;
-    let endpoints = fs::read_to_string(contract_dir.join("contract.json"))?;
-    assert!(
-        endpoints.contains("proof.registry.v1.Status"),
-        "the registry selection's prepared contract carries its payload identity"
-    );
-    assert!(!fs::read(contract_dir.join("descriptors.pb"))?.is_empty());
-    assert!(contains_file(
-        &phoxal_home.join("packages/selections"),
-        package
-    )?);
-    assert!(!contains_file(
-        &phoxal_home.join("packages/selections"),
-        "Cargo.toml"
-    )?);
-
-    // A second prepare is a warm no-op over the installed artifact.
-    let warm = prepare()?;
-    assert!(
-        warm.status.success(),
-        "{}",
-        String::from_utf8_lossy(&warm.stderr)
-    );
-    assert!(String::from_utf8_lossy(&warm.stdout).is_empty());
     Ok(())
 }
