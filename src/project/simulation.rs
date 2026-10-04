@@ -278,6 +278,8 @@ impl SimulationRunReport {
         } = self;
         *simulator_exit_code == Some(0)
             && cleanup.error.is_none()
+            && cleanup.supervisor_exited
+            && !cleanup.supervisor_killed
             && *supervisor_ready
             && *provider_contract_verified
     }
@@ -843,10 +845,15 @@ fn launch(
             String::from_utf8_lossy(&output.stderr)
         ))
     })?;
-    if !output.status.success() && report.success() {
-        return Err(simulation_error(
-            "simulator process failed despite a success report",
-        ));
+    let SimulationRunReport::V0 {
+        simulator_exit_code,
+        ..
+    } = &report;
+    if *simulator_exit_code != output.status.code() {
+        return Err(simulation_error(format!(
+            "simulator reported exit code {simulator_exit_code:?}, but its process returned {}",
+            output.status
+        )));
     }
     Ok(report)
 }
@@ -1061,6 +1068,41 @@ fn main() {{ let status = std::process::Command::new("sh").arg({script:?}).args(
 mod tests {
     use super::*;
     use crate::project::bundle;
+
+    #[test]
+    fn simulation_success_requires_orderly_supervisor_exit() {
+        let base = serde_json::json!({
+            "schema": "phoxal/simulation-run/v0",
+            "scene": "scene.xml", "bundle": "bundle",
+            "simulator": {"package": "phoxal-simulator", "version": "independent-release",
+                "binary": "phoxal-simulator", "source": "installed-executable", "executable": "simulator"},
+            "scope": "local", "supervisor_id": "local", "run_id": "test",
+            "supervisor_ready": true, "provider_contract_verified": true,
+            "simulator_exit_code": 0, "simulator_wall_time_ns": 1,
+            "simulator_stdout": "", "simulator_stderr": "", "scenario": null, "terminal": null,
+            "cleanup": {"supervisor_stop_requested": true, "supervisor_exited": true,
+                "supervisor_killed": false, "error": null}
+        });
+        let report: SimulationRunReport = serde_json::from_value(base.clone()).unwrap();
+        assert!(report.success());
+        for (field, value) in [
+            ("supervisor_exited", serde_json::json!(false)),
+            ("supervisor_killed", serde_json::json!(true)),
+            ("error", serde_json::json!("supervisor exited 7")),
+        ] {
+            let mut invalid = base.clone();
+            invalid["cleanup"][field] = value;
+            let report: SimulationRunReport = serde_json::from_value(invalid).unwrap();
+            assert!(
+                !report.success(),
+                "cleanup field {field} must refuse success"
+            );
+        }
+        let mut nonzero = base;
+        nonzero["simulator_exit_code"] = serde_json::json!(1);
+        let report: SimulationRunReport = serde_json::from_value(nonzero).unwrap();
+        assert!(!report.success());
+    }
 
     #[test]
     fn simulation_bound_rejects_zero_and_non_finite_values() {

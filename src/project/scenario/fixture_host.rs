@@ -273,10 +273,7 @@ fn serve_request(
                 simulator_stderr,
                 ..
             } = &report;
-            let lifecycle_passing = *simulator_exit_code == Some(0)
-                && cleanup.error.is_none()
-                && *supervisor_ready
-                && *provider_contract_verified;
+            let lifecycle_passing = report.success();
             if !lifecycle_passing {
                 return send_failure(
                     stream,
@@ -284,7 +281,7 @@ fn serve_request(
                     "lifecycle",
                     format!(
                         "simulator exit {simulator_exit_code:?}, supervisor ready {supervisor_ready}, provider contract verified {provider_contract_verified}, cleanup {:?}; simulator stdout: {}; simulator stderr: {}",
-                        cleanup.error,
+                        cleanup,
                         simulator_stdout.chars().take(4_000).collect::<String>(),
                         simulator_stderr.chars().take(4_000).collect::<String>(),
                     ),
@@ -296,7 +293,9 @@ fn serve_request(
                 &HostMessage::Completed {
                     request_id,
                     report: evidence,
-                    cleanup_succeeded: cleanup.error.is_none(),
+                    cleanup_succeeded: cleanup.error.is_none()
+                        && cleanup.supervisor_exited
+                        && !cleanup.supervisor_killed,
                     lifecycle_passing,
                 },
             )
