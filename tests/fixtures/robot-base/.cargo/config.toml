@@ -1,0 +1,7 @@
+# Declares the Phoxal registry so fixture manifests containing
+# `registry = "phoxal"` parse cleanly. Tests invoke cargo-phoxal with
+# `--offline`, and the registry dependency is patched to the local fake
+# supervisor, so this URL is never queried.
+
+[registries.phoxal]
+index = "sparse+https://example.invalid/"

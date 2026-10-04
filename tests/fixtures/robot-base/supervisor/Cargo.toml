@@ -1,0 +1,12 @@
+[package]
+name = "phoxal-supervisor"
+version = "0.0.0-dev.8"
+edition = "2021"
+publish = false
+
+[dependencies]
+phoxal = { version = "=0.0.0-dev.8", registry = "phoxal", default-features = false }
+
+[[bin]]
+name = "phoxal-supervisor"
+path = "src/main.rs"

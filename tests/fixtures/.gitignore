@@ -1,0 +1,7 @@
+# A stray `cargo phoxal check` (or any other cargo invocation) inside a
+# fixture will create `target/` and `Cargo.lock` in place. The
+# integration tests stage each fixture into a fresh tempdir, so neither
+# file is part of the actual test surface; they only pollute the commit
+# if left tracked.
+target/
+Cargo.lock

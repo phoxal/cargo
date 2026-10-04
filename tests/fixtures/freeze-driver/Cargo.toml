@@ -1,0 +1,12 @@
+[package]
+name = "phoxal-freeze-driver-fixture"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+phoxal = { version = "=0.0.0-dev.8", registry = "phoxal", default-features = false, features = ["runtime"] }
+serde = { version = "1.0", features = ["derive"] }
+
+[build-dependencies]
+phoxal = { version = "=0.0.0-dev.8", registry = "phoxal", default-features = false, features = ["build"] }

@@ -1,0 +1,1 @@
+<mujoco><worldbody><body name="mount"><joint name="wheel_joint" type="hinge"/><geom type="sphere" size="0.1"/></body></worldbody><actuator><velocity name="wheel_motor" joint="wheel_joint"/></actuator></mujoco>

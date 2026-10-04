@@ -1,0 +1,9 @@
+schema: phoxal/robot/v0
+robot:
+  id: check-valid-robot
+  components: {}
+brain: {}
+services: {}
+connections: {}
+supervisor:
+  source: { path: supervisor }

@@ -1,0 +1,3 @@
+schema: phoxal/component/v0
+model: { file: model.xml, root_body: mount }
+capabilities: {}

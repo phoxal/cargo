@@ -1,0 +1,11 @@
+name: acquisition qualification
+on: [workflow_dispatch]
+permissions:
+  contents: read
+jobs:
+  acquisition:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - run: cargo test --locked --features host-acceptance --test host_acquisition

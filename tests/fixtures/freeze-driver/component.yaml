@@ -1,0 +1,14 @@
+schema: phoxal/component/v0
+model: {file: model.xml, root_body: mount}
+capabilities:
+  encoder:
+    kind: encoder
+    publish_rate_hz: 50.0
+    target: {kind: joint, id: wheel_joint}
+  motor:
+    kind: motor
+    command: velocity
+    max_torque_nm: 2.0
+    max_velocity_radps: 10.0
+    target: {kind: actuator, id: wheel_motor}
+    joint: wheel_joint
