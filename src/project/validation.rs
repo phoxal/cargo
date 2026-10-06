@@ -106,11 +106,10 @@ fn schema_is_null(schema: &serde_json::Value) -> bool {
     schema.get("type").and_then(serde_json::Value::as_str) == Some("null")
 }
 
-pub(crate) fn validate_connections_for_document_with_virtual_producers(
+pub(crate) fn validate_connections_for_document(
     prepared: &PreparedProject,
     contracts: &BTreeMap<ArtifactKey, ArtifactContract>,
     document: &RobotDocument,
-    virtual_producers: &[&str],
 ) -> Result<(), Error> {
     let mut instance_contracts = BTreeMap::new();
     for (instance, target) in prepared.assembly_targets() {
@@ -120,13 +119,10 @@ pub(crate) fn validate_connections_for_document_with_virtual_producers(
         };
         instance_contracts.insert(instance, contract.clone());
     }
-    artifact::validate_connected_endpoints_with_virtual_producers(
-        document,
-        &instance_contracts,
-        virtual_producers,
-    )
-    .map_err(|error| Error::ArtifactInvalid {
-        path: prepared.layout().robot_manifest().to_owned(),
-        message: error.to_string(),
+    artifact::validate_connected_endpoints(document, &instance_contracts).map_err(|error| {
+        Error::ArtifactInvalid {
+            path: prepared.layout().robot_manifest().to_owned(),
+            message: error.to_string(),
+        }
     })
 }

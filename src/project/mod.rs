@@ -5,6 +5,7 @@
 //! or native simulator implementations.
 
 mod application;
+mod archive;
 pub mod artifact;
 mod bundle;
 mod cargo;
@@ -20,6 +21,7 @@ mod passive;
 pub mod scenario;
 mod selection;
 mod simulation;
+pub(crate) use simulation::selected_simulator_executable;
 mod supervisor;
 mod validation;
 
@@ -137,7 +139,7 @@ impl Project {
         options: &CargoOptions,
         scene: &Path,
         output: Option<PathBuf>,
-    ) -> Result<CompiledBundle, Error> {
+    ) -> Result<(CompiledBundle, PathBuf), Error> {
         let mut request = SimulationRunOptions::new(
             scene,
             SimulationPresentation::Headless,
@@ -147,7 +149,16 @@ impl Project {
             request = request.with_output(output);
         }
         let snapshot = simulation::prepare_simulation(self, options, &request)?;
-        simulation::finalize_prepared(&snapshot, &request, None)
+        let relative_scene = snapshot
+            .frozen
+            .scene
+            .strip_prefix(snapshot.frozen.staging.path())
+            .map_err(|error| Error::SimulationInvalid {
+                message: format!("frozen scene escapes its closure: {error}"),
+            })?;
+        let bundle = simulation::finalize_prepared(&snapshot, &request, None)?;
+        let scene = bundle.root().join(relative_scene);
+        Ok((bundle, scene))
     }
 }
 
@@ -225,7 +236,7 @@ impl PreparedProject {
         options: &CargoOptions,
         output: impl AsRef<Path>,
     ) -> Result<CompiledBundle, Error> {
-        bundle::assemble_with_inputs(self, options, output, false, None, None)
+        bundle::assemble_with_inputs(self, options, output, true, None, None)
     }
 
     /// Builds an immutable bundle and launches its selected supervisor in the
@@ -265,14 +276,20 @@ impl PreparedProject {
 
     /// Returns the default bundle path under Cargo's target directory.
     #[must_use]
-    pub fn default_bundle_path(&self) -> PathBuf {
+    pub fn default_bundle_path(&self, options: &CargoOptions) -> PathBuf {
         let RobotDocument::V0 { robot, .. } = &self.document;
         self.cargo_metadata
             .target_directory
             .as_std_path()
             .join("phoxal")
             .join(&robot.id)
-            .join("bundle")
+            .join(cargo::effective_target(options))
+            .join(options.profile.as_deref().unwrap_or(if options.release {
+                "release"
+            } else {
+                "dev"
+            }))
+            .join("build")
     }
 
     pub(crate) fn assembly_targets(&self) -> Vec<(String, &SelectedTarget)> {

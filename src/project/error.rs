@@ -88,12 +88,6 @@ pub enum ValidationError {
         /// Invalid endpoint text.
         value: String,
     },
-    /// A connection list was present but empty.
-    #[error("{field} must contain at least one producer")]
-    EmptyConnectionSources {
-        /// Authored connection field.
-        field: String,
-    },
     /// A connection listed the same producer more than once.
     #[error("{field} lists producer '{producer}' more than once")]
     DuplicateConnectionSource {
@@ -182,6 +176,9 @@ pub enum SourceError {
 /// The top-level error returned by project discovery, preparation, and Cargo commands.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
+    /// Shared prepared-input configuration or publication failed.
+    #[error(transparent)]
+    PreparedInput(#[from] phoxal_build::Error),
     /// Project discovery failed.
     #[error("project discovery failed: {0}")]
     Discovery(#[from] DiscoveryError),
@@ -295,6 +292,12 @@ pub enum Error {
     #[error("simulation preparation failed: {message}")]
     SimulationInvalid {
         /// Simulation contract diagnostic.
+        message: String,
+    },
+    /// An executed scenario failed an assertion or its runtime.
+    #[error("scenario failed: {message}")]
+    ScenarioFailed {
+        /// Scenario execution diagnostic.
         message: String,
     },
     /// Cargo did not report the selected executable in its machine-readable

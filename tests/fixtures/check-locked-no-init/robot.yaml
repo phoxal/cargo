@@ -4,6 +4,6 @@ robot:
   components: {}
 brain: {}
 services: {}
-connections: {}
+connections: []
 supervisor:
   source: { path: supervisor }

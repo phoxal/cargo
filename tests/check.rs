@@ -9,6 +9,20 @@
 mod support;
 
 use std::fs;
+use std::io::Read;
+
+#[allow(clippy::expect_used, reason = "acceptance archive assertions")]
+fn archive_manifest(path: &std::path::Path) -> serde_json::Value {
+    let mut archive =
+        zip::ZipArchive::new(fs::File::open(path).expect("build archive")).expect("valid ZIP");
+    let mut bytes = Vec::new();
+    archive
+        .by_name("manifest.json")
+        .expect("manifest entry")
+        .read_to_end(&mut bytes)
+        .expect("manifest bytes");
+    serde_json::from_slice(&bytes).expect("resolved manifest")
+}
 
 use support::stage;
 
@@ -116,9 +130,7 @@ fn independently_selected_participant_keeps_its_version_and_shared_artifact() {
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
-    let manifest: serde_json::Value =
-        serde_json::from_slice(&fs::read(bundle.join("manifest.json")).expect("manifest"))
-            .expect("resolved manifest");
+    let manifest = archive_manifest(&bundle);
     let artifacts = manifest["artifacts"].as_array().expect("artifacts");
     let provider = artifacts
         .iter()
@@ -168,9 +180,7 @@ fn passive_path_component_does_not_require_a_robot_rust_dependency() {
         "{}",
         String::from_utf8_lossy(&built.stderr)
     );
-    let manifest: serde_json::Value =
-        serde_json::from_slice(&fs::read(root.join("passive-bundle/manifest.json")).unwrap())
-            .unwrap();
+    let manifest = archive_manifest(&root.join("passive-bundle"));
     assert_eq!(manifest["components"][0]["instance"], "caster");
     assert_eq!(manifest["components"][0]["driver"], false);
     assert_eq!(

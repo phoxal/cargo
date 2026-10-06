@@ -1,12 +1,12 @@
 [package]
-name = "phoxal-freeze-driver-fixture"
+name = "configured-output-provider"
 version = "0.1.0"
 edition = "2024"
 publish = false
 
 [dependencies]
 phoxal = { version = "0.70.0", default-features = false, features = ["runtime"] }
-serde = { version = "1.0", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
 
 [build-dependencies]
-phoxal = { version = "0.70.0", default-features = false, features = ["build"] }
+phoxal-build = "0.70.0"

@@ -221,7 +221,7 @@ fn brain_message_edit_keeps_preparation_green() -> Result<(), Box<dyn std::error
     fs::write(robot.join("src/main.rs"), brain_main("u64", ""))?;
     fs::write(
         robot.join("robot.yaml"),
-        "schema: phoxal/robot/v0\nrobot: { id: proof-cycle-robot }\nsupervisor:\n  source: { path: supervisor }\nservices:\n  provider:\n    source: { path: provider }\nconnections:\n  brain.telemetry: provider.provider_status\n",
+        "schema: phoxal/robot/v0\nrobot: { id: proof-cycle-robot }\nsupervisor:\n  source: { path: supervisor }\nservices:\n  provider:\n    source: { path: provider }\nconnections:\n  - from: provider.provider_status\n    to: brain.telemetry\n",
     )?;
 
     let first = invoke(&robot, &["prepare", "--offline"]);
@@ -286,7 +286,7 @@ fn shared_namespace_repeated_preparation_stays_green() -> Result<(), Box<dyn std
     )?;
     fs::write(
         robot.join("robot.yaml"),
-        "schema: phoxal/robot/v0\nrobot: { id: proof-cycle-robot }\nsupervisor:\n  source: { path: supervisor }\nservices:\n  provider:\n    source: { path: provider }\nconnections:\n  brain.telemetry: provider.provider_status\n",
+        "schema: phoxal/robot/v0\nrobot: { id: proof-cycle-robot }\nsupervisor:\n  source: { path: supervisor }\nservices:\n  provider:\n    source: { path: provider }\nconnections:\n  - from: provider.provider_status\n    to: brain.telemetry\n",
     )?;
 
     let first = invoke(&robot, &["prepare", "--offline"]);
@@ -424,7 +424,7 @@ fn git_participant_revision_bump_keeps_preparation_green() -> Result<(), Box<dyn
 
     let robot_yaml = |revision: &str| {
         format!(
-            "schema: phoxal/robot/v0\nrobot: {{ id: proof-cycle-robot }}\nsupervisor:\n  source: {{ path: supervisor }}\nservices:\n  provider:\n    source:\n      git:\n        name: proof-cycle-provider\n        url: file://{}\n        rev: {revision}\nconnections:\n  brain.telemetry: provider.provider_status\n",
+            "schema: phoxal/robot/v0\nrobot: {{ id: proof-cycle-robot }}\nsupervisor:\n  source: {{ path: supervisor }}\nservices:\n  provider:\n    source:\n      git:\n        name: proof-cycle-provider\n        url: file://{}\n        rev: {revision}\nconnections:\n  - from: provider.provider_status\n    to: brain.telemetry\n",
             source.display()
         )
     };
@@ -633,7 +633,7 @@ fn canonical_conversion_contract_stays_consumable() -> Result<(), Box<dyn std::e
     fs::write(robot.join("src/conversions.rs"), CONVERSIONS)?;
     fs::write(
         robot.join("robot.yaml"),
-        "schema: phoxal/robot/v0\nrobot: { id: proof-cycle-robot }\nsupervisor:\n  source: { path: supervisor }\nbrain: { binary: proof-cycle-robot }\nservices:\n  provider:\n    source: { path: provider }\nconnections:\n  brain.telemetry: provider.provider_status\n",
+        "schema: phoxal/robot/v0\nrobot: { id: proof-cycle-robot }\nsupervisor:\n  source: { path: supervisor }\nbrain: { binary: proof-cycle-robot }\nservices:\n  provider:\n    source: { path: provider }\nconnections:\n  - from: provider.provider_status\n    to: brain.telemetry\n",
     )?;
 
     let first = invoke(&robot, &["prepare", "--offline"]);

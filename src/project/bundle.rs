@@ -74,6 +74,11 @@ impl CompiledBundle {
         &self.root
     }
 
+    /// Atomically publish this runnable directory as a portable ZIP.
+    pub fn archive(&self, output: &Path) -> Result<(), Error> {
+        super::archive::publish(&self.root, output)
+    }
+
     /// Absolute path of one bundled executable.
     #[must_use]
     pub fn executable(&self, name: &str) -> PathBuf {
@@ -85,7 +90,6 @@ impl CompiledBundle {
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct SimulationRunInput<'a> {
     pub(crate) program: &'a Program,
-    pub(crate) fixture_instance_id: &'a str,
 }
 
 #[derive(Debug, Clone)]
@@ -307,9 +311,22 @@ pub(crate) fn freeze_robot_closure(
             artifacts
                 .get(&(target.package_id.clone(), target.target.clone()))
                 .map(|(_, _, contract, _)| contract.clone())
-                .map(|contract| (instance, contract.summary()))
+                .map(|contract| {
+                    let mut summary = contract.summary();
+                    let RuntimeRecord::V0 { outputs, .. } = &summary.runtime;
+                    if outputs.iter().any(|output| output.family.is_some()) {
+                        let config = instance_config(prepared, &instance);
+                        summary.runtime = summary
+                            .runtime
+                            .resolve_outputs(config.value().ok_or_else(|| {
+                                simulation_error("output family requires configuration")
+                            })?)
+                            .map_err(simulation_error)?;
+                    }
+                    Ok((instance, summary))
+                })
         })
-        .collect::<BTreeMap<_, _>>();
+        .collect::<Result<BTreeMap<_, _>, Error>>()?;
     let contracts = artifacts
         .iter()
         .map(|(key, (_, _, contract, _))| (key.clone(), contract.clone()))
@@ -465,7 +482,7 @@ fn closed_scene_closure(
 /// Finalizes one simulation bundle from a frozen closure.
 ///
 /// Finalization is pure assembly: it lowers instances and connections from
-/// the prepared document, applies scenario substitutions, validates against
+/// the unchanged prepared document, validates normal scenario ingress against
 /// the captured contracts, admits the manifest, and publishes the staged
 /// closure. No Cargo build, acquisition, probe, or live source read runs
 /// here.
@@ -487,9 +504,6 @@ pub(crate) fn finalize_simulation_bundle(
 
     let mut instances: Vec<BundleInstance> = Vec::new();
     for (instance, target) in prepared.assembly_targets() {
-        if facts.is_some() && prepared.executable_role(&instance) == "driver" {
-            continue;
-        }
         let key = (target.package_id.clone(), target.target.clone());
         let artifact_id = frozen
             .artifact_ids
@@ -513,14 +527,8 @@ pub(crate) fn finalize_simulation_bundle(
     instances.sort_by(|left, right| left.id.cmp(&right.id));
 
     let document = prepared.document().clone();
-    let mut execution_document = document.clone();
     if let Some(scenario) = simulation_run.as_ref() {
-        apply_scenario_substitutions(
-            &mut execution_document,
-            scenario.program,
-            scenario.fixture_instance_id,
-            &frozen.simulation_contracts,
-        )?;
+        validate_scenario_inputs(scenario.program, &frozen.simulation_contracts)?;
     }
     validation::validate_configurations(prepared, &frozen.contracts)?;
     crate::project::artifact::validate_descriptor_closure_consistency(
@@ -533,16 +541,7 @@ pub(crate) fn finalize_simulation_bundle(
         path: prepared.cargo_manifest_path().to_owned(),
         message: error.to_string(),
     })?;
-    let virtual_producers: Vec<&str> = simulation_run
-        .as_ref()
-        .map(|scenario| vec![scenario.fixture_instance_id])
-        .unwrap_or_default();
-    validation::validate_connections_for_document_with_virtual_producers(
-        prepared,
-        &frozen.contracts,
-        &execution_document,
-        &virtual_producers,
-    )?;
+    validation::validate_connections_for_document(prepared, &frozen.contracts, &document)?;
 
     let mut components = prepared
         .cargo_sources()
@@ -563,7 +562,9 @@ pub(crate) fn finalize_simulation_bundle(
 
     let supervisor_relative = format!("{BIN_DIR}/supervisor");
     let connections = resolved_connections(prepared)?;
-    let simulation = facts
+    // Native facts validate the prepared closure; the common manifest remains
+    // usable for hardware and receives command-owned native selection at run time.
+    let _simulation = facts
         .map(|facts| build_simulation_definition(prepared, facts, &frozen.simulation_contracts))
         .transpose()?;
     let RobotDocument::V0 { robot, .. } = prepared.document();
@@ -579,7 +580,6 @@ pub(crate) fn finalize_simulation_bundle(
         components,
         component_sources: frozen.component_sources.clone(),
         model: frozen.model.clone(),
-        simulation,
     };
     phoxal::artifact::bundle::AdmittedBundle::validate(manifest.clone()).map_err(|message| {
         Error::BundleInvalid {
@@ -690,17 +690,27 @@ pub(crate) fn assemble_with_inputs(
             artifacts
                 .get(&(target.package_id.clone(), target.target.clone()))
                 .map(|(_, _, contract, _)| contract.clone())
-                .map(|contract| (instance, contract.summary()))
+                .map(|contract| {
+                    let mut summary = contract.summary();
+                    let RuntimeRecord::V0 { outputs, .. } = &summary.runtime;
+                    if outputs.iter().any(|output| output.family.is_some()) {
+                        let config = instance_config(prepared, &instance);
+                        summary.runtime = summary
+                            .runtime
+                            .resolve_outputs(config.value().ok_or_else(|| {
+                                simulation_error("output family requires configuration")
+                            })?)
+                            .map_err(simulation_error)?;
+                    }
+                    Ok((instance, summary))
+                })
         })
-        .collect::<BTreeMap<_, _>>();
+        .collect::<Result<BTreeMap<_, _>, Error>>()?;
     let inventory = stage_artifact_inventory(prepared, &artifacts, staged_root)?;
     let artifact_records = inventory.into_values().collect::<Vec<_>>();
 
     let mut instances: Vec<BundleInstance> = Vec::new();
     for (instance, target) in prepared.assembly_targets() {
-        if simulation_facts.is_some() && prepared.executable_role(&instance) == "driver" {
-            continue;
-        }
         let key = (target.package_id.clone(), target.target.clone());
         let (_, _, _, artifact_id) = artifacts.get(&key).ok_or_else(|| Error::ArtifactCapture {
             package: target.package.clone(),
@@ -727,7 +737,7 @@ pub(crate) fn assemble_with_inputs(
         prepared.cargo_workdir(),
         &super::supervisor::AuthoredSupervisor::capture(prepared.document())?,
         options,
-        include_native_assets,
+        simulation_facts.is_some(),
     )?;
 
     let contract_map = artifacts
@@ -735,14 +745,8 @@ pub(crate) fn assemble_with_inputs(
         .map(|(key, (_, _, contract, _))| (key.clone(), contract.clone()))
         .collect::<BTreeMap<_, _>>();
     let document = prepared.document().clone();
-    let mut execution_document = document.clone();
     if let Some(scenario) = simulation_run.as_ref() {
-        apply_scenario_substitutions(
-            &mut execution_document,
-            scenario.program,
-            scenario.fixture_instance_id,
-            &simulation_contracts,
-        )?;
+        validate_scenario_inputs(scenario.program, &simulation_contracts)?;
     }
     validation::validate_configurations(prepared, &contract_map)?;
     crate::project::artifact::validate_descriptor_closure_consistency(
@@ -754,16 +758,7 @@ pub(crate) fn assemble_with_inputs(
         path: prepared.cargo_manifest_path().to_owned(),
         message: error.to_string(),
     })?;
-    let virtual_producers = simulation_run
-        .as_ref()
-        .map(|scenario| vec![scenario.fixture_instance_id])
-        .unwrap_or_default();
-    validation::validate_connections_for_document_with_virtual_producers(
-        prepared,
-        &contract_map,
-        &execution_document,
-        &virtual_producers,
-    )?;
+    validation::validate_connections_for_document(prepared, &contract_map, &document)?;
 
     let mut components = prepared
         .cargo_sources()
@@ -790,7 +785,7 @@ pub(crate) fn assemble_with_inputs(
     let _ = &supervisor_selection.provenance;
     let target = super::cargo::effective_target(options);
     let connections = resolved_connections(prepared)?;
-    let simulation = simulation_facts
+    let _simulation = simulation_facts
         .map(|facts| build_simulation_definition(prepared, facts, &simulation_contracts))
         .transpose()?;
     let RobotDocument::V0 { robot, .. } = prepared.document();
@@ -806,7 +801,6 @@ pub(crate) fn assemble_with_inputs(
         components,
         component_sources,
         model: staged_model.as_ref().map(|model| model.closure.clone()),
-        simulation,
     };
 
     // The tool only ever publishes a manifest the shared admission accepts.
@@ -894,11 +888,11 @@ fn package_version(prepared: &PreparedProject, package_id: &str) -> Result<Strin
         })
 }
 
-/// Lowers the authored connection map into typed resolved references.
+/// Lowers authored directed edges into typed resolved references.
 fn resolved_connections(prepared: &PreparedProject) -> Result<Vec<BundleConnection>, Error> {
-    let RobotDocument::V0 { connections, .. } = prepared.document();
+    let connections = prepared.document().connection_sources();
     let mut resolved = Vec::new();
-    for (consumer, sources) in connections {
+    for (consumer, sources) in &connections {
         let consumer = phoxal::artifact::document::PortReference::parse(consumer)
             .map_err(|error| simulation_error(error.to_string()))?;
         let mut lowered = Vec::new();
@@ -921,20 +915,10 @@ fn resolved_connections(prepared: &PreparedProject) -> Result<Vec<BundleConnecti
     Ok(resolved)
 }
 
-fn apply_scenario_substitutions(
-    document: &mut RobotDocument,
+fn validate_scenario_inputs(
     program: &Program,
-    fixture_instance_id: &str,
     contracts: &BTreeMap<String, ArtifactSummary>,
 ) -> Result<(), Error> {
-    let RobotDocument::V0 { connections, .. } = document;
-    if fixture_instance_id.is_empty() {
-        return Err(simulation_error(
-            "scenario fixture instance id must not be empty",
-        ));
-    }
-    let mut substitutions =
-        BTreeMap::<String, (String, phoxal::contracts::OwnedMethodSignature)>::new();
     for step in program.steps() {
         let (target_instance, signature) = match &step.action {
             Action::Setpoint {
@@ -944,25 +928,12 @@ fn apply_scenario_substitutions(
             } => (target_instance, consumer_signature),
             Action::Withdraw {
                 target_instance,
-                producer_signature,
-            } => (target_instance, producer_signature),
+                consumer_signature,
+            } => (target_instance, consumer_signature),
             Action::Command { .. } => continue,
         };
         let consumer = format!("{target_instance}.{}", signature.endpoint);
-        let replacement = format!("{fixture_instance_id}.{}", signature.endpoint);
-        if let Some(existing) =
-            substitutions.insert(consumer.clone(), (replacement.clone(), signature.clone()))
-            && existing.0 != replacement
-        {
-            return Err(simulation_error(format!(
-                "scenario program maps `{consumer}` to competing fixture producers"
-            )));
-        }
-    }
-    for (consumer, (replacement, signature)) in substitutions {
-        let (target_instance, target_port) = consumer
-            .split_once('.')
-            .ok_or_else(|| simulation_error(format!("invalid scenario consumer `{consumer}`")))?;
+        let target_port = signature.endpoint.as_str();
         let contract = contracts.get(target_instance).ok_or_else(|| {
             simulation_error(format!(
                 "scenario target `{consumer}` has no compiled input contract"
@@ -979,7 +950,7 @@ fn apply_scenario_substitutions(
             })?;
         if input.delivery != crate::project::artifact::InputDelivery::LeasedValue {
             return Err(simulation_error(format!(
-                "scenario substitution `{consumer}` is not a setpoint input"
+                "scenario input `{consumer}` is not a setpoint input"
             )));
         }
         let signature_matches = input
@@ -994,7 +965,7 @@ fn apply_scenario_substitutions(
             && signature.is_leased_call();
         if !signature_matches {
             return Err(simulation_error(format!(
-                "scenario substitution `{consumer}` expects {} -> {}, compiled consumer records {:?} -> {:?} on port {:?}",
+                "scenario input `{consumer}` expects {} -> {}, compiled consumer records {:?} -> {:?} on port {:?}",
                 signature.request,
                 signature.response,
                 input.request_fqn,
@@ -1002,10 +973,6 @@ fn apply_scenario_substitutions(
                 input.port
             )));
         }
-        connections.insert(
-            consumer,
-            crate::project::document::ConnectionSources::One(replacement),
-        );
     }
     Ok(())
 }
@@ -1114,10 +1081,8 @@ fn build_simulation_definition(
             expected_setpoint_keys, actual_binding_keys
         )));
     }
-    let prepared_document_connections = match prepared.document() {
-        RobotDocument::V0 { connections, .. } => connections,
-    };
-    for (consumer, sources) in prepared_document_connections {
+    let prepared_document_connections = prepared.document().connection_sources();
+    for (consumer, sources) in &prepared_document_connections {
         let consumer = crate::project::document::PortReference::parse(consumer)
             .map_err(|error| simulation_error(error.to_string()))?;
         if !driver_instances.contains(&consumer.instance) {

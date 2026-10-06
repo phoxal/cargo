@@ -83,9 +83,9 @@ fn write_rust_contract_provider(
 }
 
 /// Finds the unique prepared-contract directory whose key contains the
-/// given fragment, under a project's `.phoxal/prepared` root.
+/// given fragment, under a project's configured prepared-input root.
 fn find_prepared(project: &std::path::Path, fragment: &str) -> std::io::Result<std::path::PathBuf> {
-    let root = project.join(".phoxal/prepared");
+    let root = phoxal_build::prepared_input_root(project).map_err(std::io::Error::other)?;
     let mut matches = Vec::new();
     for entry in fs::read_dir(&root)? {
         let entry = entry?;
@@ -105,7 +105,7 @@ fn find_prepared(project: &std::path::Path, fragment: &str) -> std::io::Result<s
     assert_eq!(
         matches.len(),
         1,
-        "expected exactly one prepared contract matching {fragment:?}; .phoxal/prepared holds {listing:?}"
+        "expected exactly one prepared contract matching {fragment:?}; prepared-input root holds {listing:?}"
     );
     Ok(matches.remove(0))
 }
@@ -138,6 +138,14 @@ fn local_participant_prepares_from_its_compiled_artifact() -> Result<(), Box<dyn
         &cargo_home,
     )?;
 
+    fs::create_dir_all(robot.join(".cargo"))?;
+    fs::write(
+        robot.join(".cargo/config.toml"),
+        format!(
+            "[build]\ntarget-dir = {:?}\n",
+            directory.path().join("caller-target").to_string_lossy()
+        ),
+    )?;
     let output = Command::new(env!("CARGO_BIN_EXE_cargo-phoxal"))
         .arg("prepare")
         .arg("--offline")
@@ -299,6 +307,14 @@ fn exact_git_revision_prepares_the_alternate_binary_contract()
             source.display()
         ),
     )?;
+    fs::create_dir_all(robot.join(".cargo"))?;
+    fs::write(
+        robot.join(".cargo/config.toml"),
+        format!(
+            "[build]\ntarget-dir = {:?}\n",
+            directory.path().join("caller-target").to_string_lossy()
+        ),
+    )?;
     let output = Command::new(env!("CARGO_BIN_EXE_cargo-phoxal"))
         .arg("prepare")
         .current_dir(&robot)
@@ -326,7 +342,7 @@ fn exact_git_revision_prepares_the_alternate_binary_contract()
         &phoxal_home.join("packages/selections"),
         "Cargo.toml"
     )?);
-    fs::remove_dir_all(robot.join(".phoxal"))?;
+    fs::remove_dir_all(phoxal_build::prepared_input_root(&robot)?)?;
     fs::remove_dir_all(cargo_home.join("git"))?;
     let recovered = Command::new(env!("CARGO_BIN_EXE_cargo-phoxal"))
         .args(["prepare", "--offline"])
@@ -396,7 +412,15 @@ fn exact_git_revision_prepares_the_alternate_binary_contract()
         )
         .replace(&revision, &alternate_revision),
     )?;
-    fs::remove_dir_all(robot.join(".phoxal"))?;
+    fs::remove_dir_all(phoxal_build::prepared_input_root(&robot)?)?;
+    fs::create_dir_all(robot.join(".cargo"))?;
+    fs::write(
+        robot.join(".cargo/config.toml"),
+        format!(
+            "[build]\ntarget-dir = {:?}\n",
+            directory.path().join("caller-target").to_string_lossy()
+        ),
+    )?;
     let output = Command::new(env!("CARGO_BIN_EXE_cargo-phoxal"))
         .arg("prepare")
         .current_dir(&robot)

@@ -535,14 +535,12 @@ fn validate_runtime(runtime: &RuntimeRecord) -> Result<(), Error> {
     Ok(())
 }
 
-#[cfg(test)]
-pub use connections::validate_connected_endpoints;
 /// Validates all graph connections for which both endpoint artifacts exist.
 ///
 /// The validation is intentionally endpoint-first: kind and complete request /
 /// response identities are compared before any descriptor message-root
 /// filtering can remove service evidence.
-pub use connections::validate_connected_endpoints_with_virtual_producers;
+pub use connections::{validate_connected_endpoints, validate_prepared_endpoints};
 
 /// Rejects conflicting imported definitions across the executable contract
 /// closures admitted into one bundle.
@@ -755,7 +753,8 @@ services:
   producer:
     source: { path: ../producer }
 connections:
-  consumer.input: producer.output
+  - from: producer.output
+    to: consumer.input
 "#,
         )
         .expect("document parses");
@@ -779,6 +778,8 @@ connections:
                 config_schema: serde_json::json!({"type":"object"}),
                 inputs: Vec::new(),
                 outputs: vec![OutputRecord {
+                    family: None,
+                    family_template: None,
                     name: "output".to_owned(),
                     port: Some("output".to_owned()),
                     signature: Some(signature),

@@ -321,11 +321,6 @@ impl CargoOptions {
                 ),
             });
         }
-        if self.all_features && self.no_default_features {
-            return Err(Error::InvalidOptions {
-                message: "--all-features and --no-default-features cannot be combined".to_owned(),
-            });
-        }
         if self
             .features
             .iter()

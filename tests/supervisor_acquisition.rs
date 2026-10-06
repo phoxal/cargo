@@ -110,6 +110,13 @@ fn stage_robot_with_supervisor(root: &Path, supervisor_path: &str) -> PathBuf {
     robot
 }
 
+fn runnable_build(robot: &Path) -> PathBuf {
+    robot
+        .join("target/phoxal/selection-proof-robot")
+        .join(phoxal::artifact::application::HOST_EXECUTION_TARGET)
+        .join("release/build")
+}
+
 /// Runs a build in the isolated home.
 fn build_in(robot: &Path, phoxal_home: &Path) -> std::process::Output {
     Command::new(env!("CARGO_BIN_EXE_cargo-phoxal"))
@@ -155,12 +162,12 @@ fn one_unchanged_tool_accepts_two_differently_versioned_compatible_supervisors()
 
     // Each robot's bundle contains its own selected supervisor copy.
     let manifest_a: serde_json::Value = serde_json::from_slice(
-        &fs::read(robot_a.join("target/phoxal/selection-proof-robot/bundle/manifest.json"))
+        &fs::read(runnable_build(&robot_a).join("manifest.json"))
             .unwrap_or_else(|error| panic!("manifest A: {error}")),
     )
     .unwrap_or_else(|error| panic!("decode manifest A: {error}"));
     let manifest_b: serde_json::Value = serde_json::from_slice(
-        &fs::read(robot_b.join("target/phoxal/selection-proof-robot/bundle/manifest.json"))
+        &fs::read(runnable_build(&robot_b).join("manifest.json"))
             .unwrap_or_else(|error| panic!("manifest B: {error}")),
     )
     .unwrap_or_else(|error| panic!("decode manifest B: {error}"));
@@ -168,7 +175,7 @@ fn one_unchanged_tool_accepts_two_differently_versioned_compatible_supervisors()
     assert_eq!(manifest_b["robot_id"], "selection-proof-robot");
     assert_ne!(robot_a, robot_b);
     for (robot, version) in [(&robot_a, "0.1.0"), (&robot_b, "0.2.0")] {
-        let executable = robot.join("target/phoxal/selection-proof-robot/bundle/bin/supervisor");
+        let executable = runnable_build(robot).join("bin/supervisor");
         let output = Command::new(executable)
             .output()
             .expect("execute compatible host fixture");
@@ -278,7 +285,7 @@ fn a_failed_candidate_preserves_the_existing_installation_and_bundles() {
     let robot = stage_robot_with_supervisor(root, "../good-supervisor");
     let output = build_in(&robot, &home);
     assert!(output.status.success(), "the compatible supervisor builds");
-    let bundle_manifest = robot.join("target/phoxal/selection-proof-robot/bundle/manifest.json");
+    let bundle_manifest = runnable_build(&robot).join("manifest.json");
     let original =
         fs::read(&bundle_manifest).unwrap_or_else(|error| panic!("original manifest: {error}"));
 
@@ -361,7 +368,7 @@ fn write_selection(robot: &Path, source: &str) {
 }
 
 fn supervisor_output(robot: &Path) -> String {
-    let binary = robot.join("target/phoxal/selection-proof-robot/bundle/bin/supervisor");
+    let binary = runnable_build(robot).join("bin/supervisor");
     let output = Command::new(binary)
         .output()
         .unwrap_or_else(|error| panic!("execute compatible fixture: {error}"));
@@ -451,7 +458,7 @@ fn incompatible_edit_of_the_same_local_source_preserves_the_selected_product() {
         .expect("entry")
         .path();
     let selected = store.join("product/bin/phoxal-supervisor");
-    let manifest = robot.join("target/phoxal/selection-proof-robot/bundle/manifest.json");
+    let manifest = runnable_build(&robot).join("manifest.json");
     let original_manifest = fs::read(&manifest).expect("bundle");
     stage_supervisor_fixture(root, "supervisor", "0.2.0", WRONG_BUNDLE_CONTRACT_MAIN);
     let incompatible = build_in(&robot, &home);
@@ -486,7 +493,7 @@ fn missing_yaml_selection_fails_without_legacy_inference() {
 }
 
 #[test]
-fn hardware_build_reuses_a_supervisor_without_simulation_but_simulation_preparation_refuses() {
+fn hardware_build_and_ordinary_tests_do_not_require_simulation_interfaces() {
     let temporary = tempfile::tempdir().unwrap();
     let root = temporary.path();
     stage_supervisor_fixture(root, "hardware-supervisor", "0.7.0", HARDWARE_ONLY_MAIN);
@@ -498,20 +505,19 @@ fn hardware_build_reuses_a_supervisor_without_simulation_but_simulation_preparat
         "{}",
         String::from_utf8_lossy(&hardware.stderr)
     );
-    let manifest = robot.join("target/phoxal/selection-proof-robot/bundle/manifest.json");
+    let manifest = runnable_build(&robot).join("manifest.json");
     let hardware_manifest = fs::read(&manifest).unwrap();
-    let simulation = Command::new(env!("CARGO_BIN_EXE_cargo-phoxal"))
+    let ordinary_tests = Command::new(env!("CARGO_BIN_EXE_cargo-phoxal"))
         .current_dir(&robot)
         .env_remove("CARGO_TARGET_DIR")
         .env("PHOXAL_HOME", &home)
         .args(["phoxal", "test"])
         .output()
         .unwrap();
-    assert!(!simulation.status.success());
     assert!(
-        String::from_utf8_lossy(&simulation.stderr).contains("simulation revision"),
-        "{}",
-        String::from_utf8_lossy(&simulation.stderr)
+        ordinary_tests.status.success(),
+        "ordinary Rust tests must not require the simulation interface: {}",
+        String::from_utf8_lossy(&ordinary_tests.stderr)
     );
     assert_eq!(fs::read(&manifest).unwrap(), hardware_manifest);
     assert!(build_in(&robot, &home).status.success());

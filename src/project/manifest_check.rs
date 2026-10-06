@@ -41,7 +41,7 @@ pub(crate) fn validate_prepared_connections(
         let Some((source, binary)) = selected(instance) else {
             continue;
         };
-        let contract_dir = prepared_root(root, source, binary);
+        let contract_dir = prepared_root(root, source, binary)?;
         if !contract_dir.join(phoxal_build::CONTRACT_FILE).is_file() {
             continue;
         }
@@ -102,13 +102,13 @@ pub(crate) fn validate_prepared_connections(
         connections: filtered_connections,
         ..
     } = &mut filtered;
-    filtered_connections.retain(|field, _| {
-        let Ok(consumer) = PortReference::parse(field) else {
+    filtered_connections.retain(|connection| {
+        let Ok(consumer) = PortReference::parse(&connection.to) else {
             return true;
         };
         consumer.instance == "brain" || contracts.contains_key(&consumer.instance)
     });
-    let virtual_producers: Vec<String> = services
+    let deferred_sources: Vec<String> = services
         .keys()
         .chain(
             robot
@@ -120,15 +120,11 @@ pub(crate) fn validate_prepared_connections(
         .filter(|instance| !contracts.contains_key(instance.as_str()))
         .cloned()
         .collect();
-    let virtual_producers: Vec<&str> = virtual_producers.iter().map(String::as_str).collect();
-    super::artifact::validate_connected_endpoints_with_virtual_producers(
-        &filtered,
-        &contracts,
-        &virtual_producers,
-    )
-    .map_err(|error| Error::DeclarationCheck {
-        message: error.to_string(),
-    })?;
+    let deferred_sources: Vec<&str> = deferred_sources.iter().map(String::as_str).collect();
+    super::artifact::validate_prepared_endpoints(&filtered, &contracts, &deferred_sources)
+        .map_err(|error| Error::DeclarationCheck {
+            message: error.to_string(),
+        })?;
     Ok((prepared_count, brain_validated))
 }
 
@@ -147,6 +143,14 @@ pub(crate) fn selection_identity(source: &Source) -> phoxal_build::PreparedSelec
 
 /// The prepared-contract directory of one selection, when composition
 /// prepared its Rust contract from a compiled artifact.
-pub(crate) fn prepared_root(root: &Path, source: &Source, binary: Option<&str>) -> PathBuf {
-    phoxal_build::prepared_dir(root, &selection_identity(source), binary)
+pub(crate) fn prepared_root(
+    root: &Path,
+    source: &Source,
+    binary: Option<&str>,
+) -> Result<PathBuf, Error> {
+    Ok(phoxal_build::prepared_dir(
+        root,
+        &selection_identity(source),
+        binary,
+    )?)
 }

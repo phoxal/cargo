@@ -5,29 +5,64 @@ use crate::project::document::{PortReference, RobotDocument};
 use phoxal::artifact::RuntimeRecord;
 use std::collections::BTreeMap;
 
-#[cfg(test)]
 pub fn validate_connected_endpoints(
     document: &RobotDocument,
     contracts: &BTreeMap<String, ArtifactContract>,
 ) -> Result<(), Error> {
-    validate_connected_endpoints_with_virtual_producers(document, contracts, &[])
+    validate_prepared_endpoints(document, contracts, &[])
 }
 
-pub fn validate_connected_endpoints_with_virtual_producers(
+/// Preliminary declaration checks may defer sources whose contracts are not prepared yet.
+/// Runnable assembly always uses the complete-contract validator above.
+pub fn validate_prepared_endpoints(
     document: &RobotDocument,
     contracts: &BTreeMap<String, ArtifactContract>,
-    virtual_producers: &[&str],
+    deferred_sources: &[&str],
 ) -> Result<(), Error> {
-    let RobotDocument::V0 {
-        robot, connections, ..
-    } = document;
-    for (instance, contract) in contracts {
+    let contracts = contracts
+        .iter()
+        .map(|(instance, contract)| {
+            let mut contract = contract.clone();
+            let RuntimeRecord::V0 { outputs, .. } = &contract.runtime;
+            if outputs.iter().any(|output| output.family.is_some()) {
+                let RobotDocument::V0 {
+                    robot, services, ..
+                } = document;
+                let config = services
+                    .get(instance)
+                    .and_then(|selection| selection.config.as_ref())
+                    .or_else(|| {
+                        robot
+                            .components
+                            .get(instance)
+                            .and_then(|component| component.driver.as_ref())
+                            .and_then(|driver| driver.get("config"))
+                    })
+                    .ok_or_else(|| {
+                        Error::InvalidContract(format!(
+                            "{instance} output family requires configuration"
+                        ))
+                    })?;
+                contract.runtime = contract
+                    .runtime
+                    .resolve_outputs(config)
+                    .map_err(Error::InvalidContract)?;
+            }
+            Ok((instance.clone(), contract))
+        })
+        .collect::<Result<BTreeMap<_, _>, Error>>()?;
+    let RobotDocument::V0 { robot, .. } = document;
+    let connections = document.connection_sources();
+    for (instance, contract) in &contracts {
         let RuntimeRecord::V0 { inputs, .. } = &contract.runtime;
         for input in inputs {
             if matches!(
                 input.delivery,
-                InputDelivery::CallIngress | InputDelivery::CallCompletions
-            ) {
+                InputDelivery::CallIngress
+                    | InputDelivery::CallCompletions
+                    | InputDelivery::ObservationLatest
+            ) || (input.delivery == InputDelivery::LeasedValue && input.signature.is_some())
+            {
                 continue;
             }
             let consumer = format!("{instance}.{}", input.name);
@@ -40,7 +75,7 @@ pub fn validate_connected_endpoints_with_virtual_producers(
             }
         }
     }
-    for (consumer_text, sources) in connections {
+    for (consumer_text, sources) in &connections {
         let consumer =
             PortReference::parse(consumer_text).map_err(|error| Error::InvalidConnection {
                 consumer: consumer_text.clone(),
@@ -91,7 +126,7 @@ pub fn validate_connected_endpoints_with_virtual_producers(
                     message: error.to_string(),
                 })?;
             let Some(producer_contract) = contracts.get(&producer.instance) else {
-                if virtual_producers.contains(&producer.instance.as_str()) {
+                if deferred_sources.contains(&producer.instance.as_str()) {
                     continue;
                 }
                 if robot.components.contains_key(&producer.instance) {
@@ -260,11 +295,30 @@ mod tests {
         let contracts = BTreeMap::from([(
             "motion".into(),
             contract(
+                json!([{"name":"samples", "delivery":"observation_history"}]),
+                json!([]),
+            ),
+        )]);
+        assert!(validate_connected_endpoints(&document(json!([])), &contracts).is_err());
+    }
+
+    #[test]
+    fn unwired_latest_is_absent_but_an_authored_source_must_still_resolve() {
+        let contracts = BTreeMap::from([(
+            "motion".into(),
+            contract(
                 json!([{"name":"safety", "delivery":"observation_latest"}]),
                 json!([]),
             ),
         )]);
-        assert!(validate_connected_endpoints(&document(json!({})), &contracts).is_err());
+        validate_connected_endpoints(&document(json!([])), &contracts).unwrap();
+        assert!(
+            validate_connected_endpoints(
+                &document(json!([{"from": "missing.constraints", "to": "motion.safety"}])),
+                &contracts
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -287,7 +341,7 @@ mod tests {
             ),
         ]);
         validate_connected_endpoints(
-            &document(json!({"client.request":"server.commands"})),
+            &document(json!([{"from": "server.commands", "to": "client.request"}])),
             &contracts,
         )
         .unwrap();
@@ -304,7 +358,7 @@ mod tests {
         )]);
         assert!(
             validate_connected_endpoints(
-                &document(json!({"consumer.state":["first.state","second.state"]})),
+                &document(json!([{"from": "first.state", "to": "consumer.state"}, {"from": "second.state", "to": "consumer.state"}])),
                 &contracts
             )
             .is_err()
@@ -334,7 +388,7 @@ mod tests {
                 ),
             ]);
             let error = validate_connected_endpoints(
-                &document(json!({"client.request":"server.commands"})),
+                &document(json!([{"from": "server.commands", "to": "client.request"}])),
                 &contracts,
             )
             .unwrap_err();

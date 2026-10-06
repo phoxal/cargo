@@ -262,34 +262,77 @@ fn prepare_robot(
             .canonicalize().is_ok_and(| resolved | resolved == root)
         )
     };
-    let mut selections: Vec<(&String, &Source, Option<&str>)> = services
-        .iter()
-        .map(|(instance, selection)| (instance, &selection.source, selection.binary.as_deref()))
-        .chain(
-            robot
-                .components
-                .iter()
-                .filter(|(_, component)| component.driver.is_some())
-                .map(|(instance, component)| {
-                    (instance, &component.source, component.binary.as_deref())
-                }),
-        )
-        .collect();
-    selections.sort_by_key(|(_, source, _)| is_self(source));
+    let mut selections: Vec<(&String, &Source, Option<&str>, Option<&serde_json::Value>)> =
+        services
+            .iter()
+            .map(|(instance, selection)| {
+                (
+                    instance,
+                    &selection.source,
+                    selection.binary.as_deref(),
+                    selection.config.as_ref(),
+                )
+            })
+            .chain(
+                robot
+                    .components
+                    .iter()
+                    .filter(|(_, component)| component.driver.is_some())
+                    .map(|(instance, component)| {
+                        (
+                            instance,
+                            &component.source,
+                            component.binary.as_deref(),
+                            component.config.as_ref(),
+                        )
+                    }),
+            )
+            .collect();
+    selections.sort_by_key(|(_, source, _, _)| is_self(source));
     let mut changes = Vec::new();
     let mut seen = BTreeSet::new();
-    for (instance, source, binary) in selections {
+    for (instance, source, binary, config) in selections {
         if seen.insert(format!("{source:?}:{binary:?}"))
             && let Some(change) =
                 prepare_selection(layout, options, &home, &target, instance, source, binary)?
         {
             changes.push(change);
         }
+        let identity = match source {
+            Source::Path(path) => phoxal_build::PreparedSelection::Path { path: path.clone() },
+            Source::Git(git) => phoxal_build::PreparedSelection::Git {
+                name: git.name.clone(),
+                revision: git.rev.clone(),
+                url: git.url.clone(),
+                path: git.path.clone(),
+            },
+        };
+        let directory = phoxal_build::prepared_dir(layout.root(), &identity, binary)?;
+        let prepared = phoxal_build::read_prepared_for(&directory, &identity, binary)?;
+        let runtime: phoxal::artifact::RuntimeRecord =
+            serde_json::from_value(prepared.file.runtime.clone())
+                .map_err(|error| invalid(&directory, error.to_string()))?;
+        let phoxal::artifact::RuntimeRecord::V0 { outputs, .. } = &runtime;
+        if outputs.iter().any(|output| output.family.is_some()) {
+            let config = config.cloned().unwrap_or(serde_json::Value::Null);
+            let resolved = runtime.resolve_outputs(&config).map_err(|error| {
+                invalid(layout.robot_manifest(), format!("{instance}: {error}"))
+            })?;
+            phoxal_build::write_prepared_instance(
+                layout.root(),
+                instance,
+                &config,
+                &prepared.file,
+                serde_json::to_value(resolved)
+                    .map_err(|error| invalid(&directory, error.to_string()))?,
+                &prepared.descriptors,
+            )?;
+        }
     }
     Ok(changes)
 }
 /// Builds one local Rust-contract participant and prepares its extracted
-/// contract products under the robot's `.phoxal/local/` tree.
+/// contract products under the robot's configured Cargo prepared-input store.
 ///
 /// The prepared directory is keyed by the selection's declared source path
 /// and binary spelling, so two binaries of one package keep distinct
@@ -305,7 +348,7 @@ fn prepare_local_contract(
         path: path.to_string_lossy().into_owned(),
     };
     let contract_dir =
-        phoxal_build::prepared_dir(layout.root(), &selection_identity, declared_binary);
+        phoxal_build::prepared_dir(layout.root(), &selection_identity, declared_binary)?;
     prepare_selection_products(
         options,
         selection,
@@ -532,7 +575,7 @@ fn prepare_selection(
             &version,
             &selection_identity,
             declared_binary,
-            &phoxal_build::prepared_dir(layout.root(), &selection_identity, declared_binary),
+            &phoxal_build::prepared_dir(layout.root(), &selection_identity, declared_binary)?,
         )?;
         return Ok(None);
     }
@@ -606,7 +649,7 @@ fn prepare_selection(
         &version,
         &selection_identity,
         declared_binary,
-        &phoxal_build::prepared_dir(layout.root(), &selection_identity, declared_binary),
+        &phoxal_build::prepared_dir(layout.root(), &selection_identity, declared_binary)?,
     )?;
     if let Some(parent) = store.parent() {
         fs::create_dir_all(parent).map_err(|source| Error::ArtifactFile {

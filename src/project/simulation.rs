@@ -5,7 +5,6 @@
 //! application's explicit model facts, then asks the prepared robot project
 //! to assemble a simulation bundle.
 
-use std::collections::BTreeMap;
 use std::ffi::OsStr;
 use std::fs;
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -22,9 +21,9 @@ use crate::project::cargo::CargoOptions;
 use crate::project::{CompiledBundle, Error, Project, SimulationModelFacts};
 use phoxal::artifact::bundle::BundleManifest;
 use phoxal::artifact::simulation_run::{
-    SimulationApplicationReference, SimulationBinding, SimulationBundleReference,
-    SimulationCapturePolicy, SimulationCaptureRequirement, SimulationExecutionBounds,
-    SimulationModelReference, SimulationProgram, SimulationRunSpecification,
+    SimulationApplicationReference, SimulationBundleReference, SimulationCapturePolicy,
+    SimulationCaptureRequirement, SimulationExecutionBounds, SimulationModelReference,
+    SimulationProgram, SimulationRunSpecification,
 };
 use phoxal::scenario::CapturePolicy;
 use phoxal::scenario::plan_support::{Action, Capture, Program};
@@ -44,17 +43,6 @@ pub enum SimulationPresentation {
     Headless,
     /// Open the simulator's interactive presentation.
     Desktop,
-}
-
-impl SimulationPresentation {
-    /// The simulator command-line spelling.
-    #[must_use]
-    pub const fn flag(self) -> &'static str {
-        match self {
-            Self::Headless => "--headless",
-            Self::Desktop => "--desktop",
-        }
-    }
 }
 
 /// One positive finite bound for a simulation command.
@@ -301,6 +289,8 @@ pub struct PreparedSimulation {
     pub(crate) prepared: crate::PreparedProject,
     pub(crate) frozen: crate::project::bundle::FrozenSimulation,
     pub(crate) facts: SimulationModelFacts,
+    // Drop removes the native probe assembly when the command snapshot ends.
+    _probe_directory: tempfile::TempDir,
 }
 
 /// Prepares one command-scoped simulation: provisioning, project
@@ -358,7 +348,14 @@ fn probe_snapshot(
     cargo_options: &CargoOptions,
     request: &SimulationRunOptions,
 ) -> Result<PreparedSimulation, Error> {
-    let probe_output = probe_bundle_path(&prepared);
+    let probe_directory = tempfile::Builder::new()
+        .prefix("phoxal-probe-")
+        .tempdir()
+        .map_err(|source| Error::ArtifactFile {
+            path: std::env::temp_dir(),
+            source,
+        })?;
+    let probe_output = probe_directory.path().join("build");
     let probe_bundle = crate::project::bundle::finalize_simulation_bundle(
         &prepared,
         &frozen,
@@ -382,6 +379,7 @@ fn probe_snapshot(
         prepared,
         frozen,
         facts,
+        _probe_directory: probe_directory,
     })
 }
 
@@ -421,18 +419,14 @@ pub(crate) fn finalize_prepared(
     let output = request.output.clone().unwrap_or_else(|| {
         snapshot
             .prepared
-            .default_bundle_path()
-            .with_file_name("simulation-bundle")
+            .default_bundle_path(&snapshot.cargo_options)
     });
     let bundle = crate::project::bundle::finalize_simulation_bundle(
         &snapshot.prepared,
         &snapshot.frozen,
         &output,
         Some(&snapshot.facts),
-        scenario.map(|program| crate::project::bundle::SimulationRunInput {
-            program,
-            fixture_instance_id: "scenario",
-        }),
+        scenario.map(|program| crate::project::bundle::SimulationRunInput { program }),
     )?;
     eprintln!("cargo phoxal: finalizing the simulation bundle from the prepared snapshot");
     Ok(bundle)
@@ -494,12 +488,6 @@ fn canonical_scene(path: &Path) -> Result<PathBuf, Error> {
     })
 }
 
-fn probe_bundle_path(prepared: &crate::PreparedProject) -> PathBuf {
-    prepared
-        .default_bundle_path()
-        .with_file_name("simulation-probe-bundle")
-}
-
 /// A user-installed simulator application, selected without installing anything.
 pub(crate) struct SimulatorProvision {
     pub(crate) artifact: SimulatorArtifact,
@@ -509,21 +497,7 @@ fn provision(
     request: &SimulationRunOptions,
     _cargo_options: &CargoOptions,
 ) -> Result<SimulatorProvision, Error> {
-    let selected = request
-        .simulator_executable
-        .clone()
-        .or_else(|| std::env::var_os("PHOXAL_SIMULATOR").map(PathBuf::from));
-    let path = if let Some(path) = selected {
-        path
-    } else {
-        std::env::var_os("PATH").and_then(|paths| std::env::split_paths(&paths).map(|directory| directory.join(DEFAULT_SIMULATOR_BINARY)).find(|path| path.is_file()))
-            .ok_or_else(|| simulation_error("phoxal-simulator is missing; install it with cargo install phoxal-simulator --locked"))?
-    };
-    validate_simulator_application(&path)?;
-    let executable = path.canonicalize().map_err(|source| Error::ArtifactFile {
-        path: path.clone(),
-        source,
-    })?;
+    let executable = selected_simulator_executable(request.simulator_executable.as_deref())?;
     Ok(SimulatorProvision {
         artifact: SimulatorArtifact {
             summary: SimulatorArtifactSummary {
@@ -535,6 +509,38 @@ fn provision(
             },
         },
     })
+}
+
+/// Resolve and inspect the simulator before every public launch, including reuse of a build.
+pub(crate) fn selected_simulator_executable(explicit: Option<&Path>) -> Result<PathBuf, Error> {
+    let selected = explicit
+        .map(Path::to_owned)
+        .or_else(|| std::env::var_os("PHOXAL_SIMULATOR").map(PathBuf::from));
+    let path = selected
+        .or_else(|| {
+            std::env::var_os("PATH").and_then(|paths| {
+                std::env::split_paths(&paths)
+                    .map(|directory| directory.join(DEFAULT_SIMULATOR_BINARY))
+                    .find(|path| path.is_file())
+            })
+        })
+        .ok_or_else(|| {
+            simulation_error(
+                "phoxal-simulator is missing; install it with cargo install phoxal-simulator",
+            )
+        })?;
+    if !path.try_exists().map_err(|source| Error::ArtifactFile {
+        path: path.clone(),
+        source,
+    })? {
+        return Err(simulation_error(format!(
+            "selected phoxal-simulator is missing at {}; install it with cargo install phoxal-simulator or correct PHOXAL_SIMULATOR",
+            path.display()
+        )));
+    }
+    validate_simulator_application(&path)?;
+    path.canonicalize()
+        .map_err(|source| Error::ArtifactFile { path, source })
 }
 
 fn validate_simulator_application(path: &Path) -> Result<(), Error> {
@@ -560,18 +566,16 @@ fn probe(
     simulator: &SimulatorArtifact,
     scene: &Path,
     bundle: &Path,
-    request: &SimulationRunOptions,
+    _request: &SimulationRunOptions,
 ) -> Result<SimulationModelFacts, Error> {
     let mut command = Command::new(&simulator.summary.executable);
     command.args([
-        "--probe",
-        "--scene",
+        "probe",
         &scene.display().to_string(),
-        "--bundle",
+        "--build",
         &bundle.display().to_string(),
         "--json",
     ]);
-    command.arg(request.presentation.flag());
     let output = command
         .output()
         .map_err(|source| Error::SimulationInvalid {
@@ -621,59 +625,11 @@ fn build_run_specification(
             manifest_path.display()
         ))
     })?;
-    let BundleManifest::V0 {
-        robot_id,
-        connections,
-        ..
-    } = &manifest;
+    let BundleManifest::V0 { robot_id, .. } = &manifest;
 
     program
         .verify_identity()
         .map_err(|error| simulation_error(format!("scenario program identity: {error}")))?;
-
-    let mut bindings = BTreeMap::<(String, String), SimulationBinding>::new();
-    for step in program.steps() {
-        let (target_instance, signature, payload_bytes) = match &step.action {
-            Action::Setpoint {
-                target_instance,
-                consumer_signature,
-                encoded_payload,
-                ..
-            } => (target_instance, consumer_signature, encoded_payload.len()),
-            Action::Withdraw {
-                target_instance,
-                producer_signature,
-            } => (target_instance, producer_signature, 0),
-            Action::Command { .. } => continue,
-        };
-        let max_message_bytes = u32::try_from(payload_bytes).map_err(|_| {
-            simulation_error(format!(
-                "scenario payload for {}.{} exceeds u32",
-                target_instance, signature.endpoint
-            ))
-        })?;
-        let key = (target_instance.clone(), signature.endpoint.to_owned());
-        let target = format!("{}.{}", target_instance, signature.endpoint);
-        let binding = SimulationBinding {
-            target_instance: target_instance.clone(),
-            source_instance: "supervisor".to_owned(),
-            signature: signature.clone(),
-            max_message_bytes,
-            replaces_authored_source: connections.iter().any(|connection| {
-                format!(
-                    "{}.{}",
-                    connection.consumer.instance, connection.consumer.endpoint
-                ) == target
-            }),
-        };
-        bindings
-            .entry(key)
-            .and_modify(|existing| {
-                existing.max_message_bytes =
-                    existing.max_message_bytes.max(binding.max_message_bytes);
-            })
-            .or_insert(binding);
-    }
 
     let captures = program
         .captures()
@@ -753,7 +709,6 @@ fn build_run_specification(
         program: SimulationProgram {
             bytes: program.program_bytes().to_vec(),
         },
-        bindings: bindings.into_values().collect(),
         captures,
         execution: SimulationExecutionBounds {
             quantum_ns: facts.quantum_ns,
@@ -796,11 +751,9 @@ fn launch(
     let mut command = Command::new(&simulator.summary.executable);
     command
         .arg("run")
-        .arg("--scene")
         .arg(scene)
-        .arg("--bundle")
+        .arg("--build")
         .arg(bundle.root())
-        .arg(request.presentation.flag())
         .arg("--scope")
         .arg(&request.scope)
         .arg("--supervisor-id")
@@ -821,11 +774,13 @@ fn launch(
             command.arg("--steps").arg(steps.to_string());
         }
         SimulationBound::Duration(duration) => {
-            command.arg("--duration").arg(duration.to_string());
+            command.arg("--duration").arg(format!("{duration}s"));
         }
     }
-    if request.auto_run {
-        command.arg("--auto-run");
+    if request.presentation == SimulationPresentation::Headless {
+        command.arg("--headless");
+    } else if !request.auto_run {
+        command.arg("--paused");
     }
     let output =
         bounded_output(&mut command, request.execution_timeout).map_err(simulation_error)?;
@@ -1199,7 +1154,7 @@ mod tests {
         "method": "actuators",
         "shape": "observation",
         "request": "google.protobuf.Empty",
-        "response": "phoxal.component.actuator.v1.ActuatorSetpoint",
+        "response": "phoxal.component.actuator.v1.ActuatorCommand",
         "retained_latest": true,
         "lease_valid_for_ms": 100
       },
@@ -1252,7 +1207,7 @@ mod tests {
         fs::write(
             root.join("robot.yaml"),
             format!(
-                "schema: phoxal/robot/v0\nrobot:\n  id: freeze-proof-robot\n  model: model.xml\n  components:\n    d1:\n      source:\n        path: {}\n      mount_site: front_left_wheel_mount\n      driver:\n        connection: {{ type: serial, port: /dev/ttyUSB0, baud: 115200 }}\n        config: {{ id: 1 }}\nbrain: {{}}\nservices: {{}}\nconnections:\n  d1.actuator: brain.actuators\n  brain.encoders: d1.encoder\nsupervisor:\n  source: {{ path: .fixture-supervisor }}\n  binary: phoxal-supervisor\n",
+                "schema: phoxal/robot/v0\nrobot:\n  id: freeze-proof-robot\n  model: model.xml\n  components:\n    d1:\n      source:\n        path: {}\n      mount_site: front_left_wheel_mount\n      driver:\n        connection: {{ type: serial, port: /dev/ttyUSB0, baud: 115200 }}\n        config: {{ id: 1 }}\nbrain: {{}}\nservices: {{}}\nconnections:\n  - from: brain.actuators\n    to: d1.actuator\n  - from: d1.encoder\n    to: brain.encoders\nsupervisor:\n  source: {{ path: .fixture-supervisor }}\n  binary: phoxal-supervisor\n",
                 ddsm.display()
             ),
         )
@@ -1272,7 +1227,7 @@ mod tests {
         let simulator = root.join("fake-simulator.sh");
         fs::write(
             &simulator,
-            "#!/bin/sh\nif [ \"$1\" = stage-scene ]; then\n  mkdir -p \"$5\"\n  cp \"$3\" \"$5/$(basename \"$3\")\"\n  if [ -f \"$(dirname \"$3\")/part.xml\" ]; then cp \"$(dirname \"$3\")/part.xml\" \"$5/part.xml\"; fi\n  exit 0\nfi\n# fake probe: identity = sha256 of the received (frozen) scene;\n# the probe then mutates the LIVE scene so a reread would differ.\nscene=\"$3\"\nidentity=$(shasum -a 256 \"$scene\" 2>/dev/null | cut -d' ' -f1)\nif [ -n \"$FAKE_LIVE_SCENE\" ]; then\n  printf '<mujoco model=\"probe-mutated\"/>' > \"$FAKE_LIVE_SCENE\"\nfi\nprintf '{\"model_identity\":\"%s\",\"quantum_ns\":10000000,\"providers\":[{\"rate_microhertz\":50000000,\"service_instance\":\"d1\",\"port\":\"encoder\",\"shape\":\"observation\",\"retained_latest\":false,\"lease_valid_for_ms\":null,\"input_fqn\":\"google.protobuf.Empty\",\"payload_fqn\":\"phoxal.robotics.v1.EncoderSample\"}],\"actuation_bindings\":[{\"service_instance\":\"brain\",\"port\":\"actuators\",\"payload_fqn\":\"phoxal.component.actuator.v1.ActuatorSetpoint\",\"actuator_ids\":[\"d1.motor\"]}]}' \"$identity\"\n",
+            "#!/bin/sh\nif [ \"$1\" = stage-scene ]; then\n  mkdir -p \"$5\"\n  cp \"$3\" \"$5/$(basename \"$3\")\"\n  if [ -f \"$(dirname \"$3\")/part.xml\" ]; then cp \"$(dirname \"$3\")/part.xml\" \"$5/part.xml\"; fi\n  exit 0\nfi\n# fake probe: identity = sha256 of the received (frozen) scene;\n# the probe then mutates the LIVE scene so a reread would differ.\nscene=\"$2\"\nidentity=$(shasum -a 256 \"$scene\" 2>/dev/null | cut -d' ' -f1)\nif [ -n \"$FAKE_LIVE_SCENE\" ]; then\n  printf '<mujoco model=\"probe-mutated\"/>' > \"$FAKE_LIVE_SCENE\"\nfi\nprintf '{\"model_identity\":\"%s\",\"quantum_ns\":10000000,\"providers\":[{\"rate_microhertz\":50000000,\"service_instance\":\"d1\",\"port\":\"encoder\",\"shape\":\"observation\",\"retained_latest\":false,\"lease_valid_for_ms\":null,\"input_fqn\":\"google.protobuf.Empty\",\"payload_fqn\":\"phoxal.robotics.v1.EncoderSample\"}],\"actuation_bindings\":[{\"service_instance\":\"brain\",\"port\":\"actuators\",\"payload_fqn\":\"phoxal.component.actuator.v1.ActuatorCommand\",\"actuator_ids\":[\"d1.motor\"]}]}' \"$identity\"\n",
         )
         .expect("write fake simulator");
         make_executable(&simulator);
@@ -1444,7 +1399,7 @@ mod tests {
             invocation_count(&root.join("cargo-invocations.log")),
             "case preparation/probe must add zero Cargo operations while its harness is running"
         );
-        let probe_output = probe_bundle_path(&snapshot.prepared);
+        let probe_output = snapshot._probe_directory.path().join("build");
         // The probe bundle is assembled from the frozen closure itself: its
         // artifact inventory and supervisor are the frozen ones, so no
         // second live assembly ran between freeze and probe.
@@ -1550,16 +1505,25 @@ mod tests {
         )
         .expect("decode manifest");
         let phoxal::artifact::bundle::BundleManifest::V0 {
-            simulation, model, ..
+            model,
+            instances,
+            connections,
+            ..
         } = manifest;
-        let simulation = simulation.expect("simulation contract present");
+        assert!(instances.iter().any(|instance| instance.id == "d1"
+            && instance.role == phoxal::artifact::bundle::InstanceRole::Driver));
+        assert!(
+            connections
+                .iter()
+                .any(|connection| connection.consumer.to_string() == "d1.actuator")
+        );
         let mut hasher = sha2::Sha256::new();
         use sha2::Digest as _;
         hasher.update(&original_scene);
         assert_eq!(
-            simulation.model_identity,
+            snapshot.facts.model_identity,
             format!("{:x}", hasher.finalize()),
-            "the admitted contract names the probed scene identity"
+            "the command-owned facts name the frozen probed scene identity"
         );
         let model = model.expect("robot model staged");
         let staged_entry = bundle.root().join(&model.entry);

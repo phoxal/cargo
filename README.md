@@ -27,7 +27,7 @@ For tool development, run this repository's binary explicitly:
 cargo run -- phoxal --help
 ```
 
-The tooling supports `cargo phoxal prepare`, `cargo phoxal check`, `cargo phoxal build`, `cargo phoxal run`, `cargo phoxal test`, simulation preparation and delegation.
+The tooling supports `cargo phoxal prepare`, `cargo phoxal check`, `cargo phoxal build`, `cargo phoxal run`, `cargo phoxal test`, `cargo phoxal simulation <scene-file>`, and `cargo phoxal scenario <file>`.
 
 `cargo phoxal prepare` resolves each service and component from its required `source` selection in `robot.yaml`.
 Choose exactly one source form:
@@ -47,26 +47,54 @@ Git selections require a package name and full commit revision, with an optional
 Pinned Git runnable packages are installed into the managed Phoxal home.
 Passive components resolve through the same authored source forms without becoming robot Rust dependencies.
 Their declared model resources are retained for offline preparation; local passive components need no Rust target.
-It extracts compiled endpoint records and schemas into the project's ignored `.phoxal/` tree.
+It extracts compiled endpoint records and schemas under the normal Cargo target root, in `phoxal/prepared/<project-identity>/`.
+Preparation and ordinary Cargo/build-script/IDE reads share the same local Cargo configuration and environment.
+One-off `--target-dir` or command-line `--config` overrides relocate compiler and runnable outputs only; they do not relocate prepared inputs.
+After changing normal target configuration or environment, run `cargo phoxal prepare` again.
+Existing project-side `.cargo` directories track config additions, edits, legacy filename precedence, and deletion without forcing unchanged warm builds.
+When adding a previously absent `.cargo` directory and reusing an existing compiler-output cache, prepare the new input store and clean only the robot package:
+
+```sh
+cargo phoxal prepare
+cargo clean -p <ROBOT_PACKAGE> --target-dir <AFFECTED_COMPILER_OUTPUT>
+```
+
+Retain matching `--target <TRIPLE>` if applicable; omit `--target-dir` when normal configuration already selects the affected output directory.
+Then build normally; do not clean dependencies or every historical target directory.
+Existing global Cargo config files and environment changes are tracked, but adding a previously absent global config file requires the same recovery because Cargo home also contains mutable caches.
 Managed installations retain the selected binary and any component model resources needed for composition.
 Local path participants are built by Cargo from their own package manifest when a runtime bundle is needed.
 Preparation preserves the authored selection and leaves the robot's Cargo manifest unchanged.
-The check, build, run, test, bundle, and simulation entry points prepare these exact selections automatically.
+The check, build, run, test, simulation, and scenario entry points prepare these exact selections automatically.
 
 Each command discovers the nearest robot project, validates explicit composition, and applies the requested Cargo lock and offline policy.
 Pinned Git runnable participant packages install through Cargo into the managed Phoxal home outside the robot's dependency graph.
 The root Cargo graph contains the robot application and its genuine Rust library dependencies.
 
+Author delivery edges as explicit records:
+
+```yaml
+connections:
+  - from: motion.front_left_actuator
+    to: front_left_drive.actuator
+```
+
+Endpoint spelling stays `instance.endpoint`.
+Compiled contracts determine producer/consumer and request/reply roles; repeated destinations retain fan-in where that input contract supports it.
+
 `cargo phoxal check` prepares exact selections, builds the brain, validates compiled contracts and connections, then checks the robot code.
 For differently typed latest observations, the single generated API attaches normal brain endpoints and executes the robot's ordinary `From` or `TryFrom` conversion during that runtime's invocation.
 Conversions preserve the producer's capture stamp and the consumer's freshness and byte bounds.
 
-`cargo phoxal build` assembles the selected brain, service, and component-driver executables into a deterministic bundle under Cargo's target directory by default, or at `--output <directory>`.
+`cargo phoxal build` compiles in release mode, assembles the selected brain, service, and component-driver executables under Cargo's target directory, and writes `bundle/<robot-id>.zip`.
+Use `--output <file.zip>` to select another archive destination.
+The runnable directory is separated by target and profile; the archive contains relative paths and preserves executable permissions.
 The bundle carries one typed resolved manifest (`manifest.json`, schema `phoxal/bundle/v0`) as the sole description of the composition.
 Executables use bundle-local IDs derived from their complete source/build selections.
 Every instance of a repeated driver shares one stored executable.
-The manifest records the supervisor executable path, every instance with its role and resolved configuration, the typed connection graph between instance endpoints, the compiled runtime contracts, and the model and snapshot facts for simulation bundles.
-Simulation bundles also contain the model assets needed by the simulator.
+The manifest records the supervisor executable path, every instance with its role and resolved configuration, the typed connection graph between instance endpoints, and the compiled runtime contracts.
+The common runnable build contains the model assets needed by the simulator and has no separate simulation manifest variant.
+Native probe facts and execution state are command-owned temporary inputs outside that build.
 
 `cargo phoxal run` independently prepares and validates the hardware bundle, then launches the selected supervisor with the isolated `local` scope and `local` supervisor identity and an explicit execution-state directory.
 It does not launch simulation or claim domain readiness or physical safety.
@@ -75,7 +103,9 @@ Change a Git participant's revision in `robot.yaml`, then run preparation or bui
 Local path packages use their current checked-out content.
 
 All source-development commands accept `--cargo <path>` and preserve the selected executable across Cargo metadata and operation invocations.
-Cargo package, workspace, target, and test selectors are forwarded using Cargo's native option names.
+Cargo package, workspace, and test-target selectors apply only to `check` and `test`; whole-robot commands always use the authored graph.
+Whole-robot commands do not accept an arbitrary Cargo argument tail.
+`test -- <arguments>` passes ordinary Rust test-harness arguments.
 In JSON compiler-message mode, compiler JSON remains on stdout and Phoxal progress and structured project diagnostics remain on stderr.
 
 The root project declares its ordinary `phoxal` SDK dependency; the supervisor is not a robot dependency.
@@ -95,25 +125,32 @@ Install the independently versioned application:
 cargo install phoxal-simulator
 ```
 
-From robot-rover, one command prepares the source project and opens its visible desktop simulation:
+From robot-rover, select the scene explicitly:
 
 ```sh
-cargo phoxal simulation project
+cargo phoxal simulation simulation/scene.xml
 ```
 
-The simulator owns this convenience command and invokes the public `cargo phoxal build --simulation-scene simulation/scene.xml` preparation boundary.
-The tool remains a thin proxy for every `simulation` argument, standard stream, interruption, and exit status.
-The simulator owns native prerequisites, scene execution, supervisor launch and cleanup, desktop controls, and terminal/scenario evidence.
-MuJoCo is user-managed and dynamically loaded only for native operations; see the [simulator README](https://github.com/phoxal/simulator#readme) for discovery and controls.
-
-For an explicitly prepared bundle:
+The tool prepares a development build and delegates native execution, controls, cleanup, and terminal evidence to the simulator.
+The validated scene closure is stored in the runnable build and used for execution.
+Simulation does not create or extract a ZIP.
+Use `--release` for release compilation or `--paused` for paused desktop startup.
+The desktop has no arbitrary step-count limit.
+For a finite run without a window:
 
 ```sh
-cargo phoxal build --simulation-scene simulation/scene.xml --output /tmp/rover-simulation
-cargo phoxal simulation run --bundle /tmp/rover-simulation --scene /tmp/rover-simulation/scene/scene.xml --desktop --steps 10000 --auto-run
+cargo phoxal simulation simulation/scene.xml --headless --duration 10s
 ```
 
-Scenario tests retain robot preparation in the tool and delegate the native run and evidence to the simulator.
+An existing runnable directory bypasses robot discovery, Cargo, and source acquisition:
+
+```sh
+cargo phoxal simulation /path/to/scene.xml --build /path/to/build --headless --duration 250ms
+```
+
+`--build` cannot be combined with `--release`.
+The explicitly selected external scene still undergoes simulator-owned native admission.
+MuJoCo is user-managed; see the [simulator README](https://github.com/phoxal/simulator#readme) for discovery and controls.
 
 ## Testing
 
@@ -131,3 +168,21 @@ Versions and generated changelogs are prepared by release-plz, and tested revisi
 Owners are published before dependent consumers.
 Application package versions are independent of SDK versions.
 Normal builds and installations use public dependencies without sibling checkouts or local patches.
+
+## Command choices
+
+| Command | Purpose | Defaults and key options |
+| --- | --- | --- |
+| `prepare` | Prepare selected contracts and generated APIs | Authored graph; advanced acquisition controls |
+| `check` | Check selected Rust code and validate composition | Cargo package/target selectors |
+| `test` | Run ordinary Rust tests | Cargo selectors; `--` for test-harness arguments |
+| `build` | Assemble and archive the complete robot | Release; `-o, --output <ZIP_FILE>` |
+| `run` | Execute the robot with real device drivers | Development; `--release` |
+| `simulation <SCENE_FILE>` | Run native physics | Development and desktop; `--release`, `--paused`, or `--headless --duration 10s` |
+| `scenario <SCENARIO_FILE>` | Execute typed behavior assertions | Headless; `--desktop`, `--release` |
+
+Simulation `--build <BUILD_DIR>` consumes an existing build without Cargo or source acquisition and conflicts with build/acquisition controls.
+Explicit command paths resolve relative to the invocation directory, including invocation from a project subdirectory.
+Authored paths in `robot.yaml` and resources selected by scenario code remain relative to the robot project root.
+Scenarios are ordinary Cargo-declared examples or binaries under `scenarios/`, with `test = false` and an explicit scene.
+They do not masquerade as ordinary Rust tests requiring a command-scoped host.

@@ -1,7 +1,8 @@
-//! Command-scoped run host for function-based simulation tests.
+//! Command-scoped run host for standalone scenario executables.
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -11,7 +12,7 @@ use phoxal::scenario::fixture_protocol::{
 };
 
 use crate::project::cargo::{CargoOperation, CargoOptions, CargoOutput};
-use crate::project::{Error, PreparedProject, Project};
+use crate::project::{Error, PreparedProject};
 
 const MAX_ACTIVE_RUNS: usize = 1;
 
@@ -21,14 +22,95 @@ pub(crate) struct TestHostOptions {
     pub(crate) headless: bool,
 }
 
-/// Run Cargo's native test command while serving any fixture calls made by
-/// the selected test binaries.
-pub(crate) fn run_tests(
-    _project: &Project,
+/// Compile a declared scenario target, then run it against a command-owned host.
+pub(crate) fn run_scenario(
     prepared: &PreparedProject,
     options: &CargoOptions,
-    host: &TestHostOptions,
-) -> Result<Vec<CargoOutput>, Error> {
+    file: &Path,
+    desktop: bool,
+) -> Result<CargoOutput, Error> {
+    let root = prepared.cargo_workdir();
+    let file = root
+        .join(file)
+        .canonicalize()
+        .map_err(|source| Error::ArtifactFile {
+            path: file.to_owned(),
+            source,
+        })?;
+    if !file.starts_with(root.join("scenarios"))
+        || file.extension().is_none_or(|extension| extension != "rs")
+    {
+        return Err(Error::InvalidOptions {
+            message: "scenario must be a Rust file under the robot's scenarios/ directory".into(),
+        });
+    }
+    let target = prepared
+        .cargo_root_package()
+        .targets
+        .iter()
+        .find(|target| target.src_path.as_std_path().canonicalize().ok().as_ref() == Some(&file))
+        .ok_or_else(|| Error::InvalidOptions {
+            message:
+                "declare the scenario as a Cargo [[example]] or [[bin]] with path and test=false"
+                    .into(),
+        })?;
+    if target.test || (!target.is_example() && !target.is_bin()) {
+        return Err(Error::InvalidOptions {
+            message: "scenario target must be an example or binary with test=false".into(),
+        });
+    }
+    let mut compilation = options.clone();
+    compilation.message_format = Some("json".into());
+    compilation.selection = crate::project::CargoSelection::default();
+    if target.is_example() {
+        compilation
+            .selection
+            .examples_named
+            .push(target.name.clone());
+    } else {
+        compilation.selection.binaries.push(target.name.clone());
+    }
+    let outputs = match prepared.run(CargoOperation::Build, &compilation) {
+        Ok(outputs) => outputs,
+        Err(Error::CargoCommand {
+            operation,
+            status,
+            stdout,
+            stderr,
+        }) => {
+            forward_compilation(options, stdout.as_bytes(), stderr.as_bytes());
+            return Err(Error::CargoCommand {
+                operation,
+                status,
+                stdout: String::new(),
+                stderr: String::new(),
+            });
+        }
+        Err(error) => return Err(error),
+    };
+    for output in &outputs {
+        forward_compilation(options, &output.stdout, &output.stderr);
+    }
+    let executable = outputs
+        .iter()
+        .flat_map(|output| output.stdout.split(|byte| *byte == b'\n'))
+        .filter_map(|line| serde_json::from_slice::<cargo_metadata::Message>(line).ok())
+        .find_map(|message| match message {
+            cargo_metadata::Message::CompilerArtifact(artifact)
+                if artifact.target.name == target.name
+                    && artifact.package_id == prepared.cargo_root_package().id =>
+            {
+                artifact.executable
+            }
+            _ => None,
+        })
+        .ok_or_else(|| Error::InvalidOptions {
+            message: "Cargo did not emit the selected scenario executable".into(),
+        })?;
+    let host = TestHostOptions {
+        simulator: None,
+        headless: !desktop,
+    };
     {
         let directory = tempfile::Builder::new()
             .prefix("phoxal-test-")
@@ -66,7 +148,7 @@ pub(crate) fn run_tests(
         let prepared = prepared.clone();
         let fixture_options = host.clone();
         let project_root = prepared.cargo_workdir().to_owned();
-        let environment = vec![
+        let environment = [
             (
                 OsString::from(fixture_protocol::ENV_ENDPOINT),
                 endpoint.clone().into_os_string(),
@@ -74,10 +156,6 @@ pub(crate) fn run_tests(
             (
                 OsString::from(fixture_protocol::ENV_PROJECT_ROOT),
                 project_root.clone().into_os_string(),
-            ),
-            (
-                OsString::from(fixture_protocol::ENV_SCENE),
-                OsString::from("simulation/scene.xml"),
             ),
         ];
 
@@ -93,25 +171,82 @@ pub(crate) fn run_tests(
                     server_stop,
                 )
             });
-            let cargo = crate::project::cargo::run_with_env(
-                &prepared,
-                CargoOperation::Test,
-                options,
-                &environment,
-            );
+            let cargo = Command::new(executable.as_std_path())
+                .current_dir(&project_root)
+                .envs(environment.iter().cloned())
+                .output()
+                .map_err(|source| Error::CargoSpawn {
+                    operation: "scenario".into(),
+                    source,
+                });
             stop.store(true, Ordering::Release);
             let _ = std::os::unix::net::UnixStream::connect(&endpoint);
             let host = server.join().map_err(|_| Error::SimulationInvalid {
-                message: "cargo phoxal test run host panicked".to_owned(),
+                message: "cargo phoxal scenario run host panicked".to_owned(),
             })?;
             match (cargo, host) {
-                (Ok(outputs), Ok(())) => Ok(outputs),
-                (Err(error), _) => Err(error),
+                (Ok(output), Ok(())) if output.status.success() => Ok(CargoOutput {
+                    stdout: output.stdout,
+                    stderr: output.stderr,
+                }),
                 (Ok(_), Err(error)) => Err(error),
+                (Ok(output), Ok(())) => Err(Error::ScenarioFailed {
+                    message: format!(
+                        "scenario exited {}\n{}\n{}",
+                        output.status,
+                        String::from_utf8_lossy(&output.stdout),
+                        String::from_utf8_lossy(&output.stderr)
+                    ),
+                }),
+                (Err(error), _) => Err(error),
             }
         });
         drop(directory);
         result
+    }
+}
+
+// Internal JSON identifies the executable; it must not hide compiler diagnostics.
+fn forward_compilation(options: &CargoOptions, stdout: &[u8], stderr: &[u8]) {
+    let output = compilation_diagnostics(
+        stdout,
+        stderr,
+        options
+            .message_format
+            .as_deref()
+            .is_some_and(|format| format.starts_with("json")),
+    );
+    crate::print_bytes(&output.stdout, false);
+    crate::print_bytes(&output.stderr, true);
+}
+
+fn compilation_diagnostics(stdout: &[u8], stderr: &[u8], json: bool) -> CargoOutput {
+    if json {
+        return CargoOutput {
+            stdout: stdout.to_vec(),
+            stderr: stderr.to_vec(),
+        };
+    }
+    let mut rendered = Vec::new();
+    for line in stdout.split_inclusive(|byte| *byte == b'\n') {
+        match serde_json::from_slice::<cargo_metadata::Message>(line) {
+            Ok(cargo_metadata::Message::CompilerMessage(message)) => {
+                if let Some(diagnostic) = message.message.rendered {
+                    rendered.extend_from_slice(diagnostic.as_bytes());
+                }
+            }
+            Ok(cargo_metadata::Message::TextLine(text)) => {
+                rendered.extend_from_slice(text.as_bytes());
+                rendered.push(b'\n');
+            }
+            Ok(_) => {}
+            Err(_) => rendered.extend_from_slice(line),
+        }
+    }
+    rendered.extend_from_slice(stderr);
+    CargoOutput {
+        stdout: Vec::new(),
+        stderr: rendered,
     }
 }
 
@@ -273,6 +408,12 @@ fn serve_request(
                 simulator_stderr,
                 ..
             } = &report;
+            eprintln!(
+                "cargo phoxal: scenario execution finished: simulator exit {simulator_exit_code:?}, provider verified {provider_contract_verified}, supervisor exited {}, forced kill {}, cleanup {}",
+                cleanup.supervisor_exited,
+                cleanup.supervisor_killed,
+                cleanup.error.as_deref().unwrap_or("complete"),
+            );
             let lifecycle_passing = report.success();
             if !lifecycle_passing {
                 return send_failure(
@@ -336,4 +477,67 @@ fn send_failure(
             },
         },
     )
+}
+
+#[cfg(test)]
+mod compiler_diagnostic_tests {
+    use super::compilation_diagnostics;
+
+    #[test]
+    fn actual_cargo_scenario_errors_and_warnings_are_forwarded() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::create_dir(directory.path().join("scenarios")).unwrap();
+        std::fs::write(directory.path().join("Cargo.toml"),
+            "[package]\nname='diagnostic-fixture'\nversion='0.1.0'\nedition='2024'\n[[example]]\nname='scenario'\npath='scenarios/check.rs'\ntest=false\n").unwrap();
+        for (source, success, diagnostic) in [
+            (
+                "fn main() { absent_function(); }",
+                false,
+                "cannot find function",
+            ),
+            (
+                "fn main() { let unused_value = 1; }",
+                true,
+                "unused variable",
+            ),
+        ] {
+            std::fs::write(directory.path().join("scenarios/check.rs"), source).unwrap();
+            let output = std::process::Command::new(env!("CARGO"))
+                .current_dir(directory.path())
+                .args([
+                    "build",
+                    "--offline",
+                    "--example",
+                    "scenario",
+                    "--message-format=json",
+                ])
+                .output()
+                .unwrap();
+            assert_eq!(output.status.success(), success);
+            let human = compilation_diagnostics(&output.stdout, &output.stderr, false);
+            let rendered = String::from_utf8(human.stderr).unwrap();
+            assert!(rendered.contains(diagnostic), "{rendered}");
+            assert!(!rendered.contains("\"reason\":\"compiler-artifact\""));
+            let json = compilation_diagnostics(&output.stdout, &output.stderr, true);
+            assert_eq!(json.stdout, output.stdout);
+            assert!(
+                String::from_utf8(json.stdout)
+                    .unwrap()
+                    .contains("\"reason\":\"compiler-message\"")
+            );
+        }
+    }
+
+    #[test]
+    fn compiler_records_remain_json_or_render_as_human_diagnostics() {
+        let stdout = br#"{"reason":"compiler-message","package_id":"path+file:///robot#0.1.0","manifest_path":"/robot/Cargo.toml","target":{"kind":["example"],"crate_types":["bin"],"name":"scenario","src_path":"/robot/scenarios/scenario.rs","edition":"2024","doc":false,"doctest":false,"test":false},"message":{"message":"bad scenario","code":null,"level":"error","spans":[],"children":[],"rendered":"error: bad scenario\n"}}
+{"reason":"build-finished","success":false}
+"#;
+        let human = compilation_diagnostics(stdout, b"cargo failed\n", false);
+        assert!(human.stdout.is_empty());
+        assert_eq!(human.stderr, b"error: bad scenario\ncargo failed\n");
+        let json = compilation_diagnostics(stdout, b"cargo failed\n", true);
+        assert_eq!(json.stdout, stdout);
+        assert_eq!(json.stderr, b"cargo failed\n");
+    }
 }

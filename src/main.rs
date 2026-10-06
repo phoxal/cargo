@@ -16,21 +16,6 @@ use project::{
 
 fn main() -> ExitCode {
     let arguments = cargo_arguments(std::env::args_os());
-    if arguments
-        .get(1)
-        .is_some_and(|argument| argument == "simulation")
-    {
-        use std::os::unix::process::CommandExt as _;
-        let executable =
-            std::env::var_os("PHOXAL_SIMULATOR").unwrap_or_else(|| "phoxal-simulator".into());
-        let error = std::process::Command::new(executable)
-            .args(arguments.iter().skip(2))
-            .exec();
-        eprintln!(
-            "cannot start phoxal-simulator: {error}; install it with cargo install phoxal-simulator"
-        );
-        return ExitCode::FAILURE;
-    }
     let cli = Cli::parse_from(arguments);
     let json_diagnostics = cli.json_diagnostics();
     match run(cli) {
@@ -54,9 +39,23 @@ fn cargo_arguments(arguments: impl IntoIterator<Item = OsString>) -> Vec<OsStrin
     arguments
 }
 
-fn run(cli: Cli) -> Result<(), crate::project::Error> {
+fn explicit_path(invocation: &std::path::Path, path: &std::path::Path) -> PathBuf {
+    if path.is_absolute() {
+        path.to_owned()
+    } else {
+        invocation.join(path)
+    }
+}
+
+fn run(mut cli: Cli) -> Result<(), crate::project::Error> {
+    let invocation = std::env::current_dir().map_err(|source| project::Error::ArtifactFile {
+        path: ".".into(),
+        source,
+    })?;
+    cli.normalize_executable_paths(&invocation);
     let command = cli.command;
     match command {
+        Command::Simulation(arguments) => run_simulation(arguments),
         Command::Prepare(arguments) => {
             let options = arguments.options.into_options(Vec::new(), Vec::new());
             let start = std::env::current_dir().map_err(|source| {
@@ -87,30 +86,39 @@ fn run(cli: Cli) -> Result<(), crate::project::Error> {
                     arguments.into_options(Vec::new()),
                 ),
                 Command::Build(arguments) => {
-                    let output = arguments.output.clone();
-                    let simulation_scene = arguments.simulation_scene.clone();
+                    let invocation =
+                        std::env::current_dir().map_err(|source| project::Error::ArtifactFile {
+                            path: ".".into(),
+                            source,
+                        })?;
+                    let output = arguments
+                        .output
+                        .as_ref()
+                        .map(|path| explicit_path(&invocation, path));
                     let options = arguments.into_options();
-                    let bundle = if let Some(scene) = simulation_scene {
-                        project.build_simulation(&options, &scene, output)?
-                    } else {
-                        let prepared = project.prepare(&options)?;
-                        let output = output.unwrap_or_else(|| prepared.default_bundle_path());
-                        prepared.build_bundle(&options, output)?
-                    };
+                    let prepared = project.prepare(&options)?;
+                    let runnable = prepared.default_bundle_path(&options);
+                    let bundle = prepared.build_bundle(&options, runnable)?;
+                    let project::RobotDocument::V0 { robot, .. } = prepared.document();
+                    let archive = output.unwrap_or_else(|| {
+                        prepared
+                            .layout()
+                            .root()
+                            .join("bundle")
+                            .join(format!("{}.zip", robot.id))
+                    });
+                    bundle.archive(&archive)?;
                     print_status(
                         &options,
-                        &format!("compiled bundle: {}", bundle.root().display()),
+                        &format!("runnable build: {}", bundle.root().display()),
                     );
+                    print_status(&options, &format!("robot archive: {}", archive.display()));
                     Ok(())
                 }
                 Command::Run(arguments) => {
-                    if arguments.simulation_scene.is_some() {
-                        return Err(crate::project::Error::InvalidOptions { message: "use build --simulation-scene, then simulation run for native simulation".into() });
-                    }
-                    let output = arguments.output.clone();
                     let options = arguments.into_options();
                     let prepared = project.prepare(&options)?;
-                    let output = output.unwrap_or_else(|| prepared.default_bundle_path());
+                    let output = prepared.default_bundle_path(&options);
                     let bundle = prepared.run_local(&options, output)?;
                     print_status(
                         &options,
@@ -119,6 +127,26 @@ fn run(cli: Cli) -> Result<(), crate::project::Error> {
                     Ok(())
                 }
                 Command::Test(arguments) => run_test(&project, arguments),
+                Command::Scenario(arguments) => {
+                    let mut options = arguments.options.into_options(Vec::new(), Vec::new());
+                    options.release = arguments.release;
+                    let invocation =
+                        std::env::current_dir().map_err(|source| project::Error::ArtifactFile {
+                            path: ".".into(),
+                            source,
+                        })?;
+                    let file = explicit_path(&invocation, &arguments.file);
+                    let prepared = project.prepare(&options)?;
+                    let output = project::scenario::fixture_host::run_scenario(
+                        &prepared,
+                        &options,
+                        &file,
+                        arguments.desktop,
+                    )?;
+                    print_bytes(&output.stdout, false);
+                    print_bytes(&output.stderr, true);
+                    Ok(())
+                }
                 Command::Simulation(_) => unreachable!("simulation was handled above"),
                 Command::Prepare(_) => unreachable!("prepare was handled above"),
             }
@@ -132,7 +160,12 @@ fn run_cargo(
     options: CargoOptions,
 ) -> Result<(), crate::project::Error> {
     let json = json_requested(&options);
-    let prepared = project.prepare(&options)?;
+    let mut preparation_options = options.clone();
+    if matches!(operation, CargoOperation::Test) {
+        preparation_options.cargo_args.clear();
+        preparation_options.test_args.clear();
+    }
+    let prepared = project.prepare(&preparation_options)?;
     let outputs = match operation {
         CargoOperation::Check => prepared.check(&options)?,
         CargoOperation::Test | CargoOperation::Build => prepared.run(operation, &options)?,
@@ -152,8 +185,6 @@ fn run_test(project: &Project, arguments: TestArgs) -> Result<(), crate::project
         options,
         filter,
         no_run,
-        simulator,
-        desktop,
         test_args,
     } = arguments;
     let mut cargo_args = Vec::new();
@@ -163,32 +194,11 @@ fn run_test(project: &Project, arguments: TestArgs) -> Result<(), crate::project
     if no_run {
         cargo_args.push(OsString::from("--no-run"));
     }
-    let options = options.into_options(cargo_args, test_args);
-    let json = json_requested(&options);
-    // Test filters and --no-run belong to cargo test, while preparation
-    // builds the complete robot executable graph.
-    let mut preparation = options.clone();
-    preparation.cargo_args.clear();
-    preparation.test_args.clear();
-    preparation.selection = crate::project::CargoSelection::default();
-    let prepared = project.prepare(&preparation)?;
-    let outputs = crate::project::scenario::fixture_host::run_tests(
+    run_cargo(
         project,
-        &prepared,
-        &options,
-        &crate::project::scenario::fixture_host::TestHostOptions {
-            simulator,
-            headless: !desktop,
-        },
-    )?;
-    for output in outputs {
-        print_bytes(&output.stdout, false);
-        print_bytes(&output.stderr, true);
-    }
-    if json {
-        eprintln!("cargo phoxal: test completed");
-    }
-    Ok(())
+        CargoOperation::Test,
+        options.into_options(cargo_args, test_args),
+    )
 }
 
 fn print_status(options: &CargoOptions, message: &str) {
@@ -204,7 +214,7 @@ fn json_requested(options: &CargoOptions) -> bool {
 }
 
 fn json_common(options: &CommonArgs, cargo_args: &[OsString]) -> bool {
-    json_format(options.message_format.as_deref(), cargo_args)
+    json_format(options.build.message_format.as_deref(), cargo_args)
 }
 
 fn json_format(explicit: Option<&str>, arguments: &[OsString]) -> bool {
@@ -282,6 +292,7 @@ fn diagnostic_path(error: &crate::project::Error) -> Option<PathBuf> {
         | crate::project::Error::ArtifactCapture { .. }
         | crate::project::Error::MissingArtifactContract { .. }
         | crate::project::Error::SimulationInvalid { .. }
+        | crate::project::Error::ScenarioFailed { .. }
         | crate::project::Error::SupervisorLaunch { .. }
         | crate::project::Error::ArtifactInvalid { .. }
         | crate::project::Error::ArtifactFile { .. }
@@ -293,7 +304,8 @@ fn diagnostic_path(error: &crate::project::Error) -> Option<PathBuf> {
         | crate::project::Error::BundleBusy { .. }
         | crate::project::Error::BundleLock { .. }
         | crate::project::Error::BundlePublish { .. }
-        | crate::project::Error::BundleCleanup { .. } => None,
+        | crate::project::Error::BundleCleanup { .. }
+        | crate::project::Error::PreparedInput(_) => None,
     }
 }
 
@@ -321,45 +333,167 @@ struct Cli {
 }
 
 impl Cli {
+    fn normalize_executable_paths(&mut self, invocation: &std::path::Path) {
+        let controls = match &mut self.command {
+            Command::Check(arguments) => &mut arguments.options.build,
+            Command::Test(arguments) => &mut arguments.options.build,
+            Command::Prepare(arguments) => &mut arguments.options,
+            Command::Build(arguments) => &mut arguments.options,
+            Command::Run(arguments) => &mut arguments.options,
+            Command::Simulation(arguments) => &mut arguments.options,
+            Command::Scenario(arguments) => &mut arguments.options,
+        };
+        if let Some(path) = &mut controls.cargo
+            && path.is_relative()
+            && path
+                .parent()
+                .is_some_and(|parent| !parent.as_os_str().is_empty())
+        {
+            *path = explicit_path(invocation, path);
+        }
+    }
+
     fn json_diagnostics(&self) -> bool {
         match &self.command {
             Command::Check(arguments) => json_common(&arguments.options, &arguments.cargo_args),
-            Command::Build(arguments) | Command::Run(arguments) => {
-                json_common(&arguments.options, &arguments.cargo_args)
+            Command::Build(arguments) => {
+                json_format(arguments.options.message_format.as_deref(), &[])
+            }
+            Command::Run(arguments) => {
+                json_format(arguments.options.message_format.as_deref(), &[])
             }
             Command::Test(arguments) => json_common(&arguments.options, &[]),
-            Command::Simulation(_) => false,
-            Command::Prepare(arguments) => json_common(&arguments.options, &[]),
+            Command::Simulation(arguments) => {
+                json_format(arguments.options.message_format.as_deref(), &[])
+            }
+            Command::Scenario(arguments) => {
+                json_format(arguments.options.message_format.as_deref(), &[])
+            }
+            Command::Prepare(arguments) => {
+                json_format(arguments.options.message_format.as_deref(), &[])
+            }
         }
     }
 }
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Install exact selected participants and prepare their Protobuf sources.
+    /// Prepare selected contracts and generated APIs.
     Prepare(PrepareArgs),
     /// Validate the project and selected APIs, then Cargo-check requested code.
     Check(CommandArgs),
-    /// Prepare the project, validate composition, and build selected targets.
+    /// Build the complete robot in release mode and publish its ZIP.
     Build(BuildArgs),
-    /// Prepare, build, validate, and launch the selected supervisor locally.
-    Run(BuildArgs),
-    /// Prepare the project and run tests for the root robot package.
+    /// Build and run the robot on hardware, including real device drivers.
+    Run(RunArgs),
+    /// Run ordinary Rust unit and integration tests.
     Test(TestArgs),
-    /// Forward arguments and process status to phoxal-simulator.
+    /// Build the robot and simulate an explicitly selected scene.
     Simulation(SimulationArgs),
+    /// Execute a standalone Rust scenario declared under scenarios/.
+    Scenario(ScenarioArgs),
+}
+
+#[derive(Debug, Args)]
+struct ScenarioArgs {
+    #[command(flatten)]
+    options: BuildControls,
+    /// Build and execute the release profile.
+    #[arg(long)]
+    release: bool,
+    /// Rust file declared as a Cargo example or binary with test=false.
+    #[arg(value_name = "SCENARIO_FILE")]
+    file: PathBuf,
+    /// Present the scenario on the desktop instead of headless execution.
+    #[arg(long)]
+    desktop: bool,
 }
 
 #[derive(Debug, Args)]
 struct PrepareArgs {
     #[command(flatten)]
-    options: CommonArgs,
+    options: BuildControls,
 }
 
 #[derive(Debug, Args)]
 struct SimulationArgs {
-    #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
-    args: Vec<OsString>,
+    #[command(flatten)]
+    options: BuildControls,
+    /// Scene to simulate. No default scene is selected.
+    #[arg(value_name = "SCENE_FILE")]
+    scene: PathBuf,
+    /// Use an existing runnable build without invoking Cargo or acquiring sources.
+    #[arg(long, value_name = "BUILD_DIR", conflicts_with_all = ["release", "cargo", "locked", "frozen", "offline", "target", "features", "all_features", "no_default_features", "message_format"])]
+    build: Option<PathBuf>,
+    /// Compile the robot with the release profile.
+    #[arg(long)]
+    release: bool,
+    /// Run without a desktop window for a finite duration.
+    #[arg(long, requires = "duration", conflicts_with = "paused")]
+    headless: bool,
+    /// Stop after simulated time, for example 10s or 250ms.
+    #[arg(long, value_parser = positive_duration)]
+    duration: Option<std::time::Duration>,
+    /// Open the desktop simulation paused.
+    #[arg(long)]
+    paused: bool,
+}
+
+fn positive_duration(value: &str) -> Result<std::time::Duration, String> {
+    let duration = humantime::parse_duration(value).map_err(|error| error.to_string())?;
+    if duration.is_zero() {
+        return Err("duration must be positive (for example 10s or 250ms)".into());
+    }
+    Ok(duration)
+}
+
+fn run_simulation(mut arguments: SimulationArgs) -> Result<(), project::Error> {
+    use std::os::unix::process::CommandExt as _;
+    let invocation = std::env::current_dir().map_err(|source| project::Error::ArtifactFile {
+        path: ".".into(),
+        source,
+    })?;
+    arguments.scene = explicit_path(&invocation, &arguments.scene);
+    arguments.build = arguments
+        .build
+        .as_ref()
+        .map(|path| explicit_path(&invocation, path));
+    let (build, scene) = match arguments.build {
+        Some(build) => (build, arguments.scene.clone()),
+        None => {
+            let start = std::env::current_dir().map_err(|source| {
+                project::Error::Discovery(project::DiscoveryError::Resolve {
+                    path: ".".into(),
+                    source,
+                })
+            })?;
+            let project = Project::discover(start)?;
+            let mut options = arguments.options.into_options(Vec::new(), Vec::new());
+            options.release = arguments.release;
+            let (bundle, scene) = project.build_simulation(&options, &arguments.scene, None)?;
+            (bundle.root().to_owned(), scene)
+        }
+    };
+    let executable = project::selected_simulator_executable(None)?;
+    let mut command = std::process::Command::new(executable);
+    command.arg("run").arg(scene).arg("--build").arg(build);
+    if arguments.headless {
+        command.arg("--headless");
+    }
+    if let Some(duration) = arguments.duration {
+        command
+            .arg("--duration")
+            .arg(humantime::format_duration(duration).to_string());
+    }
+    if arguments.paused {
+        command.arg("--paused");
+    }
+    let error = command.exec();
+    Err(project::Error::SimulationInvalid {
+        message: format!(
+            "cannot start phoxal-simulator: {error}; install it with cargo install phoxal-simulator"
+        ),
+    })
 }
 
 #[derive(Debug, Args)]
@@ -379,22 +513,35 @@ impl CommandArgs {
 
 #[derive(Debug, Args)]
 struct BuildArgs {
-    /// Freeze and probe this scene to produce a simulation bundle.
-    #[arg(long)]
-    simulation_scene: Option<PathBuf>,
     #[command(flatten)]
-    options: CommonArgs,
-    /// Compiled bundle directory, defaulting below Cargo's target directory.
-    #[arg(long)]
+    options: BuildControls,
+    /// Archive destination, defaulting to `bundle/<robot-id>.zip`.
+    #[arg(long, short = 'o', value_name = "ZIP_FILE")]
     output: Option<PathBuf>,
-    /// Additional arguments passed to Cargo after Phoxal's standard selectors.
-    #[arg(last = true, allow_hyphen_values = true)]
-    cargo_args: Vec<OsString>,
 }
 
 impl BuildArgs {
     fn into_options(self) -> CargoOptions {
-        self.options.into_options(self.cargo_args, Vec::new())
+        let mut options = self.options.into_options(Vec::new(), Vec::new());
+        options.release = true;
+        options
+    }
+}
+
+#[derive(Debug, Args)]
+struct RunArgs {
+    #[command(flatten)]
+    options: BuildControls,
+    /// Execute a release build instead of development mode.
+    #[arg(long)]
+    release: bool,
+}
+
+impl RunArgs {
+    fn into_options(self) -> CargoOptions {
+        let mut options = self.options.into_options(Vec::new(), Vec::new());
+        options.release = self.release;
+        options
     }
 }
 
@@ -407,52 +554,56 @@ struct TestArgs {
     /// Compile selected tests without executing them.
     #[arg(long)]
     no_run: bool,
-    /// Explicit simulator executable for source-development qualification.
-    #[arg(long)]
-    simulator: Option<PathBuf>,
-    /// Present simulation runs in the desktop application instead of headless mode.
-    #[arg(long)]
-    desktop: bool,
     /// Arguments passed to the root test binary after Cargo's test delimiter.
     #[arg(last = true, allow_hyphen_values = true)]
     test_args: Vec<OsString>,
 }
 
 #[derive(Debug, Args)]
-struct CommonArgs {
+struct BuildControls {
     /// Cargo executable to use for every metadata, build, check, test, and update invocation.
-    #[arg(long, env = "CARGO", hide_env_values = true)]
+    #[arg(long, help_heading = "Advanced build options")]
     cargo: Option<PathBuf>,
     /// Require an existing current Cargo.lock.
-    #[arg(long, conflicts_with = "frozen")]
+    #[arg(
+        long,
+        conflicts_with = "frozen",
+        help_heading = "Advanced build options"
+    )]
     locked: bool,
     /// Require an existing current Cargo.lock and forbid network access.
-    #[arg(long)]
+    #[arg(long, help_heading = "Advanced build options")]
     frozen: bool,
     /// Forbid network access while allowing Cargo's normal lock policy.
-    #[arg(long)]
+    #[arg(long, help_heading = "Advanced build options")]
     offline: bool,
     /// Cargo target triple.
-    #[arg(long)]
+    #[arg(long, help_heading = "Advanced build options")]
     target: Option<String>,
-    /// Cargo profile.
-    #[arg(long)]
-    profile: Option<String>,
     /// Comma-separated or repeated root feature names.
-    #[arg(long, value_delimiter = ',')]
+    #[arg(long, value_delimiter = ',', help_heading = "Advanced build options")]
     features: Vec<String>,
     /// Enable all root features.
-    #[arg(long, conflicts_with = "no_default_features")]
+    #[arg(long, help_heading = "Advanced build options")]
     all_features: bool,
     /// Disable default root features.
-    #[arg(long = "no-default-features")]
+    #[arg(long = "no-default-features", help_heading = "Advanced build options")]
     no_default_features: bool,
-    /// Build with Cargo's release profile.
+    /// Cargo compiler message format, such as `json`.
+    #[arg(long, help_heading = "Advanced build options")]
+    message_format: Option<String>,
+}
+
+#[derive(Debug, Args)]
+struct CommonArgs {
+    #[command(flatten)]
+    build: BuildControls,
+    /// Cargo profile for checking or testing code.
+    #[arg(long, conflicts_with = "release")]
+    profile: Option<String>,
+    /// Check or test in release mode.
     #[arg(long)]
     release: bool,
-    /// Cargo compiler message format, such as `json`.
-    #[arg(long)]
-    message_format: Option<String>,
     /// Select the whole Cargo workspace.
     #[arg(long)]
     workspace: bool,
@@ -494,7 +645,7 @@ struct CommonArgs {
     benches_named: Vec<String>,
 }
 
-impl CommonArgs {
+impl BuildControls {
     fn into_options(self, cargo_args: Vec<OsString>, test_args: Vec<OsString>) -> CargoOptions {
         CargoOptions {
             cargo_path: self.cargo,
@@ -507,30 +658,38 @@ impl CommonArgs {
             },
             offline: self.offline,
             target: self.target,
-            profile: self.profile,
             features: self.features,
             all_features: self.all_features,
             no_default_features: self.no_default_features,
-            release: self.release,
             message_format: self.message_format,
             cargo_args,
             test_args,
-            selection: CargoSelection {
-                workspace: self.workspace,
-                packages: self.packages,
-                excludes: self.excludes,
-                all_targets: self.all_targets,
-                lib: self.lib,
-                bins: self.bins,
-                binaries: self.binaries,
-                examples: self.examples,
-                examples_named: self.examples_named,
-                tests: self.tests,
-                tests_named: self.tests_named,
-                benches: self.benches,
-                benches_named: self.benches_named,
-            },
+            ..CargoOptions::default()
         }
+    }
+}
+
+impl CommonArgs {
+    fn into_options(self, cargo_args: Vec<OsString>, test_args: Vec<OsString>) -> CargoOptions {
+        let mut options = self.build.into_options(cargo_args, test_args);
+        options.profile = self.profile;
+        options.release = self.release;
+        options.selection = CargoSelection {
+            workspace: self.workspace,
+            packages: self.packages,
+            excludes: self.excludes,
+            all_targets: self.all_targets,
+            lib: self.lib,
+            bins: self.bins,
+            binaries: self.binaries,
+            examples: self.examples,
+            examples_named: self.examples_named,
+            tests: self.tests,
+            tests_named: self.tests_named,
+            benches: self.benches,
+            benches_named: self.benches_named,
+        };
+        options
     }
 }
 
@@ -538,6 +697,28 @@ impl CommonArgs {
 mod tests {
     use super::*;
     use clap::Parser;
+
+    #[test]
+    fn explicit_command_paths_keep_the_invocation_directory_and_spaces() {
+        let root = std::path::Path::new("/robots/my rover");
+        let scenarios = root.join("scenarios");
+        assert_eq!(
+            explicit_path(root, std::path::Path::new("scenarios/forward stop.rs")),
+            explicit_path(&scenarios, std::path::Path::new("forward stop.rs"))
+        );
+        assert_eq!(
+            explicit_path(root, std::path::Path::new("scene with spaces.xml")),
+            root.join("scene with spaces.xml")
+        );
+        assert_eq!(
+            explicit_path(&scenarios, std::path::Path::new("/existing build")),
+            PathBuf::from("/existing build")
+        );
+        assert_eq!(
+            explicit_path(&scenarios, std::path::Path::new("release robot.zip")),
+            scenarios.join("release robot.zip")
+        );
+    }
 
     #[test]
     fn cargo_external_subcommand_and_direct_invocation_parse_identically() {
@@ -551,6 +732,57 @@ mod tests {
             .unwrap();
             assert!(matches!(parsed.command, Command::Check(_)));
         }
+    }
+
+    #[test]
+    fn simulation_requires_scene_and_enforces_execution_choices() {
+        assert!(Cli::try_parse_from(["cargo-phoxal", "simulation"]).is_err());
+        assert!(
+            Cli::try_parse_from(["cargo-phoxal", "simulation", "scene.xml", "--headless"]).is_err()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "cargo-phoxal",
+                "simulation",
+                "scene.xml",
+                "--build",
+                "build",
+                "--release"
+            ])
+            .is_err()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "cargo-phoxal",
+                "simulation",
+                "scene.xml",
+                "--duration",
+                "NaN"
+            ])
+            .is_err()
+        );
+        let parsed = Cli::try_parse_from(["cargo-phoxal", "simulation", "scene.xml"])
+            .expect("desktop simulation parses");
+        let Command::Simulation(arguments) = parsed.command else {
+            panic!("wrong command")
+        };
+        assert!(!arguments.release);
+        assert!(!arguments.headless);
+        assert!(arguments.duration.is_none());
+        assert!(arguments.build.is_none());
+        assert!(
+            Cli::try_parse_from([
+                "cargo-phoxal",
+                "simulation",
+                "scene.xml",
+                "--build",
+                "build",
+                "--headless",
+                "--duration",
+                "1.5s"
+            ])
+            .is_ok()
+        );
     }
 
     #[test]
@@ -627,27 +859,89 @@ mod tests {
     }
 
     #[test]
-    fn run_boundary_preserves_the_build_output_and_cargo_argument_surface() {
+    fn whole_robot_commands_reject_cargo_selectors_and_raw_tails() {
+        for command in ["prepare", "build", "run"] {
+            for selector in ["--workspace", "--lib", "--examples", "--tests", "--benches"] {
+                assert!(Cli::try_parse_from(["cargo-phoxal", command, selector]).is_err());
+            }
+            assert!(Cli::try_parse_from(["cargo-phoxal", command, "--", "--release"]).is_err());
+        }
+        assert!(Cli::try_parse_from(["cargo-phoxal", "build", "--profile", "release"]).is_err());
+        assert!(Cli::try_parse_from(["cargo-phoxal", "build", "--release"]).is_err());
+        assert!(Cli::try_parse_from(["cargo-phoxal", "run", "--output", "build"]).is_err());
+        let parsed = Cli::try_parse_from(["cargo-phoxal", "run", "--release"])
+            .expect("run release selection");
+        let Command::Run(arguments) = parsed.command else {
+            panic!("wrong command")
+        };
+        assert!(arguments.into_options().release);
+    }
+
+    #[test]
+    fn cargo_feature_flags_follow_cargo_semantics() {
         let parsed = Cli::try_parse_from([
             "cargo-phoxal",
-            "run",
-            "--output",
-            "target/run-bundle",
-            "--target",
-            "aarch64-unknown-linux-gnu",
-            "--",
-            "--release",
+            "check",
+            "--all-features",
+            "--no-default-features",
         ])
-        .expect("run command parses");
-        let arguments = match parsed.command {
-            Command::Run(arguments) => arguments,
-            _ => panic!("the run command parsed as a different variant"),
+        .expect("Cargo permits both feature flags");
+        let Command::Check(arguments) = parsed.command else {
+            panic!("wrong command")
         };
-        assert_eq!(arguments.output, Some(PathBuf::from("target/run-bundle")));
-        let options = arguments.into_options();
-        assert_eq!(options.target.as_deref(), Some("aarch64-unknown-linux-gnu"));
-        assert!(!options.release);
-        assert_eq!(options.cargo_args, [OsString::from("--release")]);
+        let options = arguments.into_options(Vec::new());
+        options.validate().expect("both feature flags are valid");
+        assert!(options.all_features && options.no_default_features);
+        assert!(
+            Cli::try_parse_from(["cargo-phoxal", "check", "--profile", "release", "--release"])
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn source_execution_accepts_controls_and_existing_build_refuses_them() {
+        assert!(
+            Cli::try_parse_from([
+                "cargo-phoxal",
+                "scenario",
+                "scenarios/forward.rs",
+                "--offline",
+                "--locked",
+                "--features",
+                "proof",
+                "--release"
+            ])
+            .is_ok()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "cargo-phoxal",
+                "simulation",
+                "scene.xml",
+                "--offline",
+                "--features",
+                "proof"
+            ])
+            .is_ok()
+        );
+        for flag in [
+            "--locked",
+            "--offline",
+            "--all-features",
+            "--no-default-features",
+        ] {
+            assert!(
+                Cli::try_parse_from([
+                    "cargo-phoxal",
+                    "simulation",
+                    "scene.xml",
+                    "--build",
+                    "build",
+                    flag
+                ])
+                .is_err()
+            );
+        }
     }
 
     #[test]

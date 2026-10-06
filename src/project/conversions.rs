@@ -1,7 +1,7 @@
 //! Consume the actual conversion endpoints retained by the compiled brain.
 use super::Error;
 use phoxal::artifact::RuntimeRecord;
-use phoxal::artifact::document::{ConnectionSources, RobotDocument};
+use phoxal::artifact::document::{Connection, RobotDocument};
 
 pub(crate) fn lower(
     authored: &RobotDocument,
@@ -12,9 +12,14 @@ pub(crate) fn lower(
     let RobotDocument::V0 { connections, .. } = &mut executable;
     let mut consumers = std::collections::BTreeSet::new();
     for route in conversions {
+        let matching = connections
+            .iter()
+            .enumerate()
+            .filter(|(_, edge)| edge.to == route.consumer)
+            .collect::<Vec<_>>();
         if !consumers.insert(route.consumer.as_str())
-            || connections.get(&route.consumer)
-                != Some(&ConnectionSources::One(route.producer.clone()))
+            || matching.len() != 1
+            || matching[0].1.from != route.producer
         {
             return Err(Error::DeclarationCheck {
                 message: format!(
@@ -23,14 +28,12 @@ pub(crate) fn lower(
                 ),
             });
         }
-        connections.insert(
-            format!("brain.{}", route.input_endpoint),
-            ConnectionSources::One(route.producer.clone()),
-        );
-        connections.insert(
-            route.consumer.clone(),
-            ConnectionSources::One(format!("brain.{}", route.output_endpoint)),
-        );
+        let index = matching[0].0;
+        connections[index].from = format!("brain.{}", route.output_endpoint);
+        connections.push(Connection {
+            from: route.producer.clone(),
+            to: format!("brain.{}", route.input_endpoint),
+        });
     }
     Ok(executable)
 }
@@ -44,7 +47,7 @@ mod tests {
         let authored: RobotDocument = serde_json::from_value(serde_json::json!({
             "schema": "phoxal/robot/v0", "robot": { "id": "proof" },
             "supervisor": { "source": { "path": "supervisor" } },
-            "connections": { "receiver.capture": "source.status" }
+            "connections": [{"from": "source.status", "to": "receiver.capture"}]
         }))
         .unwrap();
         let compiled: RuntimeRecord = serde_json::from_value(serde_json::json!({
@@ -58,20 +61,29 @@ mod tests {
         let executable = lower(&authored, &compiled).unwrap();
         let RobotDocument::V0 { connections, .. } = executable;
         assert_eq!(
-            connections["brain.actual_generated_in_47"],
-            ConnectionSources::One("source.status".into())
+            connections
+                .iter()
+                .find(|edge| edge.to == "brain.actual_generated_in_47")
+                .unwrap()
+                .from,
+            "source.status"
         );
         assert_eq!(
-            connections["receiver.capture"],
-            ConnectionSources::One("brain.actual_generated_out_23".into())
+            connections
+                .iter()
+                .find(|edge| edge.to == "receiver.capture")
+                .unwrap()
+                .from,
+            "brain.actual_generated_out_23"
         );
-        assert!(!connections.contains_key("brain.phoxal_conversion_in_0"));
+        assert!(
+            !connections
+                .iter()
+                .any(|edge| edge.to == "brain.phoxal_conversion_in_0")
+        );
         let mut changed = authored;
         let RobotDocument::V0 { connections, .. } = &mut changed;
-        connections.insert(
-            "receiver.capture".into(),
-            ConnectionSources::One("other.status".into()),
-        );
+        connections[0].from = "other.status".into();
         assert!(
             lower(&changed, &compiled)
                 .unwrap_err()

@@ -270,7 +270,7 @@ fn two_binaries_of_one_package_keep_distinct_prepared_contracts()
     )?;
     fs::write(robot.join("src/main.rs"), BRAIN_MAIN)?;
     let robot_yaml = robot.join("robot.yaml");
-    let valid_wiring = "schema: phoxal/robot/v0\nrobot: { id: proof-multi-robot }\nsupervisor:\n  source: { path: supervisor }\nservices:\n  first:\n    source: { path: provider }\n    binary: alpha\n  second:\n    source: { path: provider }\n    binary: beta\n  third:\n    source: { path: provider }\n    binary: sensor-a\n  fourth:\n    source: { path: provider }\n    binary: sensor_a\nconnections:\n  brain.probe: first.probe\n";
+    let valid_wiring = "schema: phoxal/robot/v0\nrobot: { id: proof-multi-robot }\nsupervisor:\n  source: { path: supervisor }\nservices:\n  first:\n    source: { path: provider }\n    binary: alpha\n  second:\n    source: { path: provider }\n    binary: beta\n  third:\n    source: { path: provider }\n    binary: sensor-a\n  fourth:\n    source: { path: provider }\n    binary: sensor_a\nconnections:\n  - from: first.probe\n    to: brain.probe\n";
     fs::write(&robot_yaml, valid_wiring)?;
 
     let prepare = invoke(&robot, &["prepare", "--offline"]);
@@ -283,7 +283,7 @@ fn two_binaries_of_one_package_keep_distinct_prepared_contracts()
 
     // Each selection keeps its own prepared directory, keyed by the shared
     // identity scheme the build helper consumes.
-    let local = robot.join(".phoxal/prepared");
+    let local = phoxal_build::prepared_input_root(&robot)?;
     let alpha_dir = prepared_dir_for(&local, "bin-alpha");
     let beta_dir = prepared_dir_for(&local, "bin-beta");
     for (label, dir) in [("alpha", &alpha_dir), ("beta", &beta_dir)] {
@@ -403,7 +403,7 @@ fn two_binaries_of_one_package_keep_distinct_prepared_contracts()
     // connection itself.
     fs::write(
         &robot_yaml,
-        valid_wiring.replace("brain.probe: first.probe", "brain.missing: first.probe"),
+        valid_wiring.replace("to: brain.probe", "to: brain.missing"),
     )?;
     let missing = invoke(&robot, &["check", "--offline"]);
     assert!(
@@ -416,10 +416,7 @@ fn two_binaries_of_one_package_keep_distinct_prepared_contracts()
     // fail: the probe call cannot be satisfied by a data output.
     fs::write(
         &robot_yaml,
-        valid_wiring.replace(
-            "brain.probe: first.probe",
-            "brain.probe: first.alpha_status",
-        ),
+        valid_wiring.replace("from: first.probe", "from: first.alpha_status"),
     )?;
     let mismatched = invoke(&robot, &["check", "--offline"]);
     assert!(
@@ -427,11 +424,9 @@ fn two_binaries_of_one_package_keep_distinct_prepared_contracts()
         "a mismatched brain requirement must fail check"
     );
 
-    // The compiled brain validates even when NO connection mentions it —
-    // the original unwired case: strip every brain edge, so the required
-    // telemetry input fails check exactly as build would reject it, while
-    // the connected variant above passed. The probe call needs no
-    // connection of its own.
+    // The brain still compiles its owned payload when no connection mentions
+    // it. An unwired Latest input is explicitly optional; authored connections
+    // make that input required, as covered by the admitted runtime tests.
     fs::write(
         robot.join("src/main.rs"),
         BRAIN_MAIN.replace(
@@ -451,8 +446,8 @@ fn two_binaries_of_one_package_keep_distinct_prepared_contracts()
         ),
     )?;
     let no_brain_connections = valid_wiring.replace(
-        "connections:\n  brain.probe: first.probe\n",
-        "connections: {}\n",
+        "connections:\n  - from: first.probe\n    to: brain.probe\n",
+        "connections: []\n",
     );
     assert!(
         !no_brain_connections.contains("brain."),
@@ -461,10 +456,10 @@ fn two_binaries_of_one_package_keep_distinct_prepared_contracts()
     fs::write(&robot_yaml, no_brain_connections)?;
     let unwired = invoke(&robot, &["check", "--offline"]);
     assert!(
-        !unwired.status.success(),
-        "an unwired required brain input must fail check even without brain connections"
+        unwired.status.success(),
+        "an unwired Latest input must compile without inventing a producer: {}",
+        String::from_utf8_lossy(&unwired.stderr)
     );
-    assert!(String::from_utf8_lossy(&unwired.stderr).contains("brain.telemetry"));
     Ok(())
 }
 
@@ -507,10 +502,20 @@ fn shared_target_dir() -> std::path::PathBuf {
 }
 
 fn invoke(cwd: &std::path::Path, args: &[&str]) -> std::process::Output {
+    fs::create_dir_all(cwd.join(".cargo"))
+        .unwrap_or_else(|error| panic!("fixture Cargo configuration: {error}"));
+    fs::write(
+        cwd.join(".cargo/config.toml"),
+        format!(
+            "[build]\ntarget-dir = {:?}\n",
+            shared_target_dir().to_string_lossy()
+        ),
+    )
+    .unwrap_or_else(|error| panic!("fixture target root: {error}"));
     Command::new(env!("CARGO_BIN_EXE_cargo-phoxal"))
         .current_dir(cwd)
         .env("PHOXAL_HOME", cwd.join(".phoxal-home"))
-        .env("CARGO_TARGET_DIR", shared_target_dir())
+        .env_remove("CARGO_TARGET_DIR")
         .env("CARGO_INCREMENTAL", "0")
         .env("CARGO_PROFILE_DEV_DEBUG", "line-tables-only")
         .args(args)
@@ -622,7 +627,7 @@ fn git_rust_contract_participant_prepares_from_the_installed_artifact()
     fs::write(
         robot.join("robot.yaml"),
         format!(
-            "schema: phoxal/robot/v0\nrobot: {{ id: proof-git-rust-robot }}\nsupervisor:\n  source: {{ path: supervisor }}\nservices:\n  provider:\n    source:\n      git:\n        name: proof-git-rust-provider\n        url: file://{}\n        rev: {revision}\nconnections: {{}}\n",
+            "schema: phoxal/robot/v0\nrobot: {{ id: proof-git-rust-robot }}\nsupervisor:\n  source: {{ path: supervisor }}\nservices:\n  provider:\n    source:\n      git:\n        name: proof-git-rust-provider\n        url: file://{}\n        rev: {revision}\nconnections: []\n",
             source.display()
         ),
     )?;
@@ -636,7 +641,7 @@ fn git_rust_contract_participant_prepares_from_the_installed_artifact()
         String::from_utf8_lossy(&prepare.stdout),
         String::from_utf8_lossy(&prepare.stderr),
     );
-    let prepared_root = robot.join(".phoxal/prepared");
+    let prepared_root = phoxal_build::prepared_input_root(&robot)?;
     let mut matches = Vec::new();
     for entry in fs::read_dir(&prepared_root)?.flatten() {
         let name = entry.file_name().to_string_lossy().into_owned();

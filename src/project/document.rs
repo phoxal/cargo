@@ -11,7 +11,7 @@
 #![deny(unsafe_code)]
 use crate::project::error::{ValidationError, ValidationErrors};
 pub use phoxal::artifact::document::{
-    BrainSelection, ComponentDocument, ConnectionSources, PortReference, RobotDocument, Source,
+    BrainSelection, ComponentDocument, PortReference, RobotDocument, Source,
 };
 use serde_json::Value;
 use std::collections::BTreeSet;
@@ -254,12 +254,10 @@ fn validate_source(field: &str, source: &Source, errors: &mut Vec<ValidationErro
 fn validate_connections(document: &RobotDocument, errors: &mut Vec<ValidationError>) {
     let known = document.instance_ids();
     let RobotDocument::V0 {
-        robot,
-        services,
-        connections,
-        ..
+        robot, services, ..
     } = document;
-    for (consumer_text, sources) in connections {
+    let connections = document.connection_sources();
+    for (consumer_text, sources) in &connections {
         let consumer = match PortReference::parse(consumer_text) {
             Ok(reference) => reference,
             Err(_) => {
@@ -288,12 +286,6 @@ fn validate_connections(document: &RobotDocument, errors: &mut Vec<ValidationErr
             });
         }
         let source_values = sources.as_slice();
-        if source_values.is_empty() {
-            errors.push(ValidationError::EmptyConnectionSources {
-                field: format!("connections.{consumer_text}"),
-            });
-            continue;
-        }
         let mut seen = BTreeSet::new();
         for source_text in source_values {
             let source = match PortReference::parse(source_text) {

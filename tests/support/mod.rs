@@ -42,7 +42,7 @@ pub fn stage(fixture: &str) -> (tempfile::TempDir, PathBuf) {
         fs::write(
             &supervisor,
             manifest.replace(
-                "phoxal = { version = \"0.69.0\", default-features = false }",
+                "phoxal = { version = \"0.70.0\", default-features = false }",
                 &dependency,
             ),
         )
@@ -52,7 +52,7 @@ pub fn stage(fixture: &str) -> (tempfile::TempDir, PathBuf) {
 }
 
 #[allow(dead_code)]
-fn copy_tree(source: &Path, destination: &Path) -> std::io::Result<()> {
+pub(crate) fn copy_tree(source: &Path, destination: &Path) -> std::io::Result<()> {
     let metadata = fs::symlink_metadata(source)?;
     if metadata.is_file() {
         if let Some(parent) = destination.parent() {

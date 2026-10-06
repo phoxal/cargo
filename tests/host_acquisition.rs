@@ -206,6 +206,14 @@ fn local_git_repository_acquisition_prepares_real_products()
     let cargo_phoxal = cargo_phoxal();
     let home = root.join("phoxal-home");
     fs::create_dir_all(&home)?;
+    fs::create_dir_all(robot.join(".cargo"))?;
+    fs::write(
+        robot.join(".cargo/config.toml"),
+        format!(
+            "[build]\ntarget-dir = {:?}\n",
+            tool_root().join("target").to_string_lossy()
+        ),
+    )?;
     let prepared = std::process::Command::new(&cargo_phoxal)
         .arg("prepare")
         .current_dir(&robot)
@@ -219,7 +227,7 @@ fn local_git_repository_acquisition_prepares_real_products()
         String::from_utf8_lossy(&prepared.stdout),
         String::from_utf8_lossy(&prepared.stderr)
     );
-    let prepared_root = robot.join(".phoxal/prepared");
+    let prepared_root = phoxal_build::prepared_input_root(&robot)?;
     let git_products: Vec<_> = fs::read_dir(&prepared_root)?
         .filter_map(|entry| entry.ok())
         .map(|entry| entry.path())
