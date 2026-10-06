@@ -504,6 +504,10 @@ mod compiler_diagnostic_tests {
             std::fs::write(directory.path().join("scenarios/check.rs"), source).unwrap();
             let output = std::process::Command::new(env!("CARGO"))
                 .current_dir(directory.path())
+                // This fixture checks successful warning forwarding even when
+                // the parent repository's CI denies warnings.
+                .env("RUSTFLAGS", "")
+                .env_remove("CARGO_ENCODED_RUSTFLAGS")
                 .args([
                     "build",
                     "--offline",
@@ -513,7 +517,14 @@ mod compiler_diagnostic_tests {
                 ])
                 .output()
                 .unwrap();
-            assert_eq!(output.status.success(), success);
+            assert_eq!(
+                output.status.success(),
+                success,
+                "Cargo fixture status {}:\nstdout:\n{}\nstderr:\n{}",
+                output.status,
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            );
             let human = compilation_diagnostics(&output.stdout, &output.stderr, false);
             let rendered = String::from_utf8(human.stderr).unwrap();
             assert!(rendered.contains(diagnostic), "{rendered}");
