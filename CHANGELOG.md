@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0](https://github.com/phoxal/cargo/compare/cargo-phoxal-v0.1.1...cargo-phoxal-v0.2.0) - 2026-10-06
+
+### Added
+
+- [**breaking**] simplify robot builds simulation and scenario commands
+
+### Other
+
+- isolate warning fixture from parent CI rustflags
+
 ## [0.1.1](https://github.com/phoxal/cargo/compare/cargo-phoxal-v0.1.0...cargo-phoxal-v0.1.1) - 2026-10-04
 
 ### Fixed
