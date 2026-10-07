@@ -75,9 +75,8 @@ impl Project {
 
     pub fn prepare_inputs(&self, options: &CargoOptions) -> Result<Vec<String>, Error> {
         let changes = participant::prepare(&self.layout, options, &self.document)?;
-        let RobotDocument::V0 {
-            robot, services, ..
-        } = &self.document;
+        let RobotDocument::V0 { robot, .. } = &self.document;
+        let phoxal::artifact::document::RobotSection { services, .. } = robot;
         let selections = services
             .iter()
             .map(|(instance, service)| {

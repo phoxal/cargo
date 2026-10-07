@@ -44,9 +44,9 @@ mod tests {
     #[test]
     fn lowering_uses_compiled_endpoints_and_refuses_stale_authored_edges() {
         let authored: RobotDocument = serde_json::from_value(serde_json::json!({
-            "schema": "phoxal/robot/v0", "robot": { "id": "proof" },
+            "schema": "phoxal/robot/v0", "robot": { "id": "proof", "services": {"receiver": {"source": {"path": "receiver"}, "bindings": {"capture": "source.status"}}} },
             "supervisor": { "source": { "path": "supervisor" } },
-            "services": {"receiver": {"source": {"path": "receiver"}, "bindings": {"capture": "source.status"}}}
+
 
         }))
         .unwrap();

@@ -114,7 +114,7 @@ fn independently_selected_participant_keeps_its_version_and_shared_artifact() {
     fs::copy(root.join("build.rs"), provider.join("build.rs")).expect("provider contract");
     fs::copy(root.join("src/main.rs"), provider.join("src/main.rs")).expect("provider main");
     let yaml = fs::read_to_string(root.join("robot.yaml")).expect("robot document");
-    fs::write(root.join("robot.yaml"), yaml.replace("services: {}", "services:\n  first: { source: { path: provider } }\n  second: { source: { path: provider } }"))
+    fs::write(root.join("robot.yaml"), yaml.replace("  services: {}", "  services:\n    first: { source: { path: provider } }\n    second: { source: { path: provider } }"))
         .expect("participant selections");
     let bundle = root.join("bundle");
     let output = std::process::Command::new(env!("CARGO_BIN_EXE_cargo-phoxal"))

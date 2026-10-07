@@ -745,15 +745,15 @@ schema: phoxal/robot/v0
 robot:
   id: rover
   components: {}
+  services:
+    consumer:
+      source: { path: ../consumer }
+      bindings:
+        input: producer.output
+    producer:
+      source: { path: ../producer }
 supervisor:
   source: { path: supervisor }
-services:
-  consumer:
-    source: { path: ../consumer }
-    bindings:
-      input: producer.output
-  producer:
-    source: { path: ../producer }
 "#,
         )
         .expect("document parses");
