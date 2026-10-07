@@ -218,7 +218,8 @@ Every selected runtime executable must expose its exact compiled contract metada
 Install the independently versioned application:
 
 ```sh
-cargo install phoxal-simulator
+cargo install phoxal-simulator --locked
+phoxal-simulator setup
 ```
 
 From robot-rover, select the scene explicitly:
@@ -246,7 +247,9 @@ cargo phoxal simulation /path/to/scene.xml --build /path/to/build --headless --d
 
 `--build` cannot be combined with `--release` or `-f/--file`.
 The explicitly selected external scene still undergoes simulator-owned native admission.
-MuJoCo is user-managed; see the [simulator README](https://github.com/phoxal/simulator#readme) for discovery and controls.
+The simulator owns explicit checksum-pinned MuJoCo 3.12.0 prebuilt setup and bounded native discovery.
+Ordinary starts do not download a runtime.
+See the [simulator README](https://github.com/phoxal/simulator#readme) for supported targets, strict external-library overrides, recovery and controls.
 
 ## Testing
 
