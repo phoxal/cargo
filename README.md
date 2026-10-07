@@ -43,8 +43,7 @@ source:
 ```
 
 Top-level `sources` names concrete selections that participants or the supervisor may reference with `source: {ref: name}`.
-This named-source syntax and nested robot grouping are implemented in this source revision and require SDK 0.72.0; released cargo-phoxal 0.3.0 does not implement them.
-Current source builds use the published SDK 0.72.0 and phoxal-build 0.72.0 without local SDK patches.
+Published cargo-phoxal 0.4.0 supports this named-source syntax and nested robot grouping using SDK 0.72.0 and phoxal-build 0.72.0 without local SDK patches.
 The tool merges all selected files before resolving references once, so a later file can override a named source shared by several instances.
 Names do not chain or inherit, and every named entry must be a valid concrete path or Git selection even when unused.
 Changing source kind requires `!replace`; ordinary map merging never silently drops conflicting path/Git/ref fields.
