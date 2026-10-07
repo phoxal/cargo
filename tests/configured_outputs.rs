@@ -62,7 +62,7 @@ fn shared_executable_has_instance_bound_apis_and_stale_config_requires_prepare()
     )
     .unwrap();
     fs::write(root.join("src/main.rs"), "phoxal::api!();\n#[phoxal::endpoints]struct BrainApi{}\nstruct Brain;\n#[phoxal::runtime(contract=BrainApi,period_ms=20)]impl Brain{#[init]fn init(_:())->phoxal::Result<Self>{Ok(Self)}}\nfn main()->phoxal::Result<()>{let _=(api::first::FRONT_ACTUATOR,api::second::REAR_ACTUATOR);phoxal::runtime::run::<Brain>()}").unwrap();
-    let document = "schema: phoxal/robot/v0\nrobot: {id: configured-output-robot}\nsupervisor: {source: {path: supervisor}}\nservices:\n  first: {source: {path: provider}, config: {wheels: {front: null}}}\n  second: {source: {path: provider}, config: {wheels: {rear: null}}}\nconnections: []\n";
+    let document = "schema: phoxal/robot/v0\nrobot:\n  id: configured-output-robot\nsupervisor:\n  source:\n    path: supervisor\nservices:\n  first:\n    source:\n      path: provider\n    config:\n      wheels:\n        front: null\n  second:\n    source:\n      path: provider\n    config:\n      wheels:\n        rear: null\n";
     fs::write(root.join("robot.yaml"), document).unwrap();
     assert_success(run(root, true, &["prepare", "--offline"]));
     assert_success(run(root, false, &["check", "--offline"]));
@@ -74,8 +74,7 @@ fn shared_executable_has_instance_bound_apis_and_stale_config_requires_prepare()
     let stale = run(root, false, &["check", "--offline"]);
     assert!(!stale.status.success());
     assert!(
-        String::from_utf8_lossy(&stale.stderr)
-            .contains("does not match its current configuration/template"),
+        String::from_utf8_lossy(&stale.stderr).contains("authored composition changed"),
         "{}",
         String::from_utf8_lossy(&stale.stderr)
     );
@@ -85,4 +84,106 @@ fn shared_executable_has_instance_bound_apis_and_stale_config_requires_prepare()
         .replace("FRONT_ACTUATOR", "NEW_FRONT_ACTUATOR");
     fs::write(root.join("src/main.rs"), source).unwrap();
     assert_success(run(root, false, &["check", "--offline"]));
+    // An explicit layer changes only the selected instance-expanded API.
+    fs::write(root.join("alternate.yaml"), "schema: phoxal/robot/v0\nservices: {second: {config: {wheels: !replace {alternate: null}}}}\n").unwrap();
+    let common_source = fs::read_to_string(root.join("src/main.rs")).unwrap();
+    fs::write(
+        root.join("src/main.rs"),
+        common_source.replace("REAR_ACTUATOR", "ALTERNATE_ACTUATOR"),
+    )
+    .unwrap();
+    assert_success(run(
+        root,
+        true,
+        &[
+            "prepare",
+            "--offline",
+            "-f",
+            "robot.yaml",
+            "-f",
+            "alternate.yaml",
+        ],
+    ));
+    assert_success(run(root, false, &["check", "--offline"]));
+    assert_success(run(
+        root,
+        true,
+        &[
+            "check",
+            "--offline",
+            "-f",
+            "robot.yaml",
+            "-f",
+            "alternate.yaml",
+        ],
+    ));
+    // A later default command must select the common file, never inherit the layer list.
+    fs::write(root.join("src/main.rs"), &common_source).unwrap();
+    assert_success(run(root, true, &["check", "--offline"]));
+    assert_success(run(root, false, &["check", "--offline"]));
+    // Concurrent tool commands refuse the project ownership lock before publication.
+    let path = root.join("target/phoxal/operation.lock");
+    let lock = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&path)
+        .unwrap();
+    fs4::FileExt::lock(&lock).unwrap();
+    let blocked = run(
+        root,
+        true,
+        &[
+            "prepare",
+            "--offline",
+            "-f",
+            "robot.yaml",
+            "-f",
+            "alternate.yaml",
+        ],
+    );
+    assert!(!blocked.status.success());
+    assert!(
+        String::from_utf8_lossy(&blocked.stderr)
+            .contains("another cargo phoxal operation owns this project")
+    );
+    // Ordinary Cargo remains able to consume the existing immutable snapshot.
+    assert_success(run(root, false, &["check", "--offline"]));
+    fs4::FileExt::unlock(&lock).unwrap();
+    // The brain's authored config is admitted against its actual compiled schema.
+    let manifest = root.join("Cargo.toml");
+    let text = fs::read_to_string(&manifest).unwrap();
+    fs::write(
+        &manifest,
+        text.replace(
+            "[dependencies]\n",
+            "[dependencies]\nserde={version=\"1\",features=[\"derive\"]}\n",
+        ),
+    )
+    .unwrap();
+    let configured_brain = common_source
+        .replace("fn init(_:())->", "fn init(config:BrainConfig)->")
+        .replace("{Ok(Self)}", "{let _=config.threshold;Ok(Self)}");
+    fs::write(root.join("src/main.rs"), format!("#[derive(serde::Deserialize,phoxal::Config)]struct BrainConfig{{threshold:u32}}\n{configured_brain}")).unwrap();
+    fs::write(
+        root.join("brain.yaml"),
+        "schema: phoxal/robot/v0\nbrain: {config: {threshold: 3}}\n",
+    )
+    .unwrap();
+    assert_success(run(
+        root,
+        true,
+        &["check", "--offline", "-f", "robot.yaml", "-f", "brain.yaml"],
+    ));
+    fs::write(
+        root.join("brain.yaml"),
+        "schema: phoxal/robot/v0\nbrain: {config: {threshold: invalid}}\n",
+    )
+    .unwrap();
+    let invalid = run(
+        root,
+        true,
+        &["check", "--offline", "-f", "robot.yaml", "-f", "brain.yaml"],
+    );
+    assert!(!invalid.status.success());
+    assert!(String::from_utf8_lossy(&invalid.stderr).contains("brain.config"));
 }

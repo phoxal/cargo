@@ -26,7 +26,10 @@ pub fn validate_prepared_endpoints(
             let RuntimeRecord::V0 { outputs, .. } = &contract.runtime;
             if outputs.iter().any(|output| output.family.is_some()) {
                 let RobotDocument::V0 {
-                    robot, services, ..
+                    robot,
+                    services,
+                    brain,
+                    ..
                 } = document;
                 let config = services
                     .get(instance)
@@ -36,7 +39,12 @@ pub fn validate_prepared_endpoints(
                             .components
                             .get(instance)
                             .and_then(|component| component.driver.as_ref())
-                            .and_then(|driver| driver.get("config"))
+                            .and_then(|driver| driver.config.as_ref())
+                    })
+                    .or_else(|| {
+                        (instance == "brain")
+                            .then(|| brain.as_ref().and_then(|brain| brain.config.as_ref()))
+                            .flatten()
                     })
                     .ok_or_else(|| {
                         Error::InvalidContract(format!(
@@ -68,9 +76,22 @@ pub fn validate_prepared_endpoints(
             let consumer = format!("{instance}.{}", input.name);
             if !connections.contains_key(&consumer) {
                 return Err(Error::InvalidConnection {
-                    consumer,
+                    consumer: document.binding_path(&consumer),
                     producer: String::new(),
-                    message: "required runtime input has no authored connection".into(),
+                    message: format!(
+                        "required runtime input has no authored connection; expected {:?}{}{}",
+                        input.delivery,
+                        input
+                            .request_fqn
+                            .as_ref()
+                            .map(|value| format!(" request {value}"))
+                            .unwrap_or_default(),
+                        input
+                            .response_fqn
+                            .as_ref()
+                            .map(|value| format!(" payload {value}"))
+                            .unwrap_or_default(),
+                    ),
                 });
             }
         }
@@ -78,7 +99,7 @@ pub fn validate_prepared_endpoints(
     for (consumer_text, sources) in &connections {
         let consumer =
             PortReference::parse(consumer_text).map_err(|error| Error::InvalidConnection {
-                consumer: consumer_text.clone(),
+                consumer: document.binding_path(consumer_text),
                 producer: String::new(),
                 message: error.to_string(),
             })?;
@@ -86,7 +107,7 @@ pub fn validate_prepared_endpoints(
             contracts
                 .get(&consumer.instance)
                 .ok_or_else(|| Error::InvalidConnection {
-                    consumer: consumer_text.clone(),
+                    consumer: document.binding_path(consumer_text),
                     producer: String::new(),
                     message: "consumer has no executable runtime artifact".into(),
                 })?;
@@ -98,7 +119,7 @@ pub fn validate_prepared_endpoints(
             .iter()
             .find(|input| input.name == consumer.port)
             .ok_or_else(|| Error::InvalidConnection {
-                consumer: consumer_text.clone(),
+                consumer: document.binding_path(consumer_text),
                 producer: String::new(),
                 message: "consumer input is absent from the runtime artifact".to_owned(),
             })?;
@@ -113,7 +134,7 @@ pub fn validate_prepared_endpoints(
             ) && sources.as_slice().len() != 1)
         {
             return Err(Error::InvalidConnection {
-                consumer: consumer_text.clone(),
+                consumer: document.binding_path(consumer_text),
                 producer: String::new(),
                 message: "input requires exactly one publisher or request target".into(),
             });
@@ -121,7 +142,7 @@ pub fn validate_prepared_endpoints(
         for producer_text in sources.as_slice() {
             let producer =
                 PortReference::parse(producer_text).map_err(|error| Error::InvalidConnection {
-                    consumer: consumer_text.clone(),
+                    consumer: document.binding_path(consumer_text),
                     producer: producer_text.clone(),
                     message: error.to_string(),
                 })?;
@@ -135,7 +156,7 @@ pub fn validate_prepared_endpoints(
                     continue;
                 }
                 return Err(Error::InvalidConnection {
-                    consumer: consumer_text.clone(),
+                    consumer: document.binding_path(consumer_text),
                     producer: producer_text.clone(),
                     message: "producer has no executable runtime artifact".into(),
                 });
@@ -163,7 +184,7 @@ pub fn validate_prepared_endpoints(
                     .and_then(|output| output.signature.as_ref())
             }
             .ok_or_else(|| Error::InvalidConnection {
-                consumer: consumer_text.clone(),
+                consumer: document.binding_path(consumer_text),
                 producer: producer_text.clone(),
                 message:
                     "producer port is absent or has no complete signature in its runtime artifact"
@@ -172,7 +193,7 @@ pub fn validate_prepared_endpoints(
             let expected_shape = input_method_shape(input.delivery);
             if expected_shape.is_some() && expected_shape != Some(signature.shape) {
                 return Err(Error::InvalidConnection {
-                    consumer: consumer_text.clone(),
+                    consumer: document.binding_path(consumer_text),
                     producer: producer_text.clone(),
                     message: format!(
                         "consumer {:?} requires {:?}, producer supplies {:?}",
@@ -206,7 +227,7 @@ pub fn validate_prepared_endpoints(
                         .is_none_or(|response| response == &signature.response)
             };
             if !payload_matches {
-                return Err(Error::InvalidConnection { consumer: consumer_text.clone(), producer: producer_text.clone(),
+                return Err(Error::InvalidConnection { consumer: document.binding_path(consumer_text), producer: producer_text.clone(),
                     message: "generated Protobuf request or response type differs from the consumer input".into() });
             }
             if let Some(input_signature) = &input.signature {
@@ -237,7 +258,7 @@ pub fn validate_prepared_endpoints(
                 };
                 if !compatible {
                     return Err(Error::InvalidConnection {
-                        consumer: consumer_text.clone(),
+                        consumer: document.binding_path(consumer_text),
                         producer: producer_text.clone(),
                         message: "request, response, service, or method identity differs"
                             .to_owned(),
@@ -279,15 +300,31 @@ mod tests {
             schemas: Vec::new(),
         }
     }
-    fn document(connections: serde_json::Value) -> RobotDocument {
-        serde_json::from_value(json!({
-            "schema": "phoxal/robot/v0",
-            "robot": {"id": "test"},
+    fn document(edges: serde_json::Value) -> RobotDocument {
+        let mut document: RobotDocument = serde_json::from_value(json!({
+            "schema": "phoxal/robot/v0", "robot": {"id": "test"},
             "supervisor": {"source": {"path": "supervisor"}},
-            "services": {},
-            "connections": connections,
+            "services": {"motion": {"source": {"path": "motion"}}},
         }))
-        .unwrap()
+        .unwrap();
+        let mut grouped: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        for edge in edges.as_array().unwrap() {
+            grouped
+                .entry(edge["to"].as_str().unwrap().into())
+                .or_default()
+                .push(edge["from"].as_str().unwrap().into());
+        }
+        for (consumer, sources) in grouped {
+            let (instance, _) = consumer.split_once('.').unwrap();
+            if instance != "brain" {
+                let RobotDocument::V0 { services, .. } = &mut document;
+                services.entry(instance.into()).or_insert_with(|| {
+                    serde_json::from_value(json!({"source": {"path": instance}})).unwrap()
+                });
+            }
+            assert!(document.set_binding(&consumer, sources));
+        }
+        document
     }
 
     #[test]
@@ -295,11 +332,18 @@ mod tests {
         let contracts = BTreeMap::from([(
             "motion".into(),
             contract(
-                json!([{"name":"samples", "delivery":"observation_history"}]),
+                json!([{"name":"samples", "delivery":"observation_history", "response_fqn":"fixture.Sample"}]),
                 json!([]),
             ),
         )]);
-        assert!(validate_connected_endpoints(&document(json!([])), &contracts).is_err());
+        let error = validate_connected_endpoints(&document(json!([])), &contracts)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("services.motion.bindings.samples"),
+            "{error}"
+        );
+        assert!(error.contains("fixture.Sample"), "{error}");
     }
 
     #[test]

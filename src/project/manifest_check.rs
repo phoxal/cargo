@@ -3,7 +3,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use phoxal::artifact::document::{PortReference, RobotDocument, Source};
+use phoxal::artifact::document::{RobotDocument, Source};
 
 use super::{Error, PreparedProject};
 pub(crate) fn validate_prepared_connections(
@@ -26,7 +26,15 @@ pub(crate) fn validate_prepared_connections(
                     .components
                     .get(instance)
                     .filter(|component| component.driver.is_some())
-                    .map(|component| (&component.source, component.binary.as_deref()))
+                    .map(|component| {
+                        (
+                            &component.source,
+                            component
+                                .driver
+                                .as_ref()
+                                .and_then(|driver| driver.binary.as_deref()),
+                        )
+                    })
             })
     };
 
@@ -92,22 +100,22 @@ pub(crate) fn validate_prepared_connections(
         })?;
         contracts.insert("brain".to_owned(), contract);
     }
+    let configurations = project
+        .assembly_targets()
+        .into_iter()
+        .filter_map(|(instance, target)| {
+            contracts.get(&instance).map(|contract| {
+                (
+                    (target.package_id.clone(), target.target.clone()),
+                    contract.clone(),
+                )
+            })
+        })
+        .collect();
+    super::validation::validate_configurations(project, &configurations)?;
     let brain_validated = true;
 
-    // Edges whose consumer is neither the brain nor a prepared participant
-    // stay deferred to bundle-time validation; edges to participants
-    // without prepared contracts defer their producer side.
-    let mut filtered = project.document.clone();
-    let RobotDocument::V0 {
-        connections: filtered_connections,
-        ..
-    } = &mut filtered;
-    filtered_connections.retain(|connection| {
-        let Ok(consumer) = PortReference::parse(&connection.to) else {
-            return true;
-        };
-        consumer.instance == "brain" || contracts.contains_key(&consumer.instance)
-    });
+    // Contracts not retained by preliminary preparation defer their producer side.
     let deferred_sources: Vec<String> = services
         .keys()
         .chain(
@@ -121,7 +129,7 @@ pub(crate) fn validate_prepared_connections(
         .cloned()
         .collect();
     let deferred_sources: Vec<&str> = deferred_sources.iter().map(String::as_str).collect();
-    super::artifact::validate_prepared_endpoints(&filtered, &contracts, &deferred_sources)
+    super::artifact::validate_prepared_endpoints(&project.document, &contracts, &deferred_sources)
         .map_err(|error| Error::DeclarationCheck {
             message: error.to_string(),
         })?;

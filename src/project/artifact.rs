@@ -750,11 +750,10 @@ supervisor:
 services:
   consumer:
     source: { path: ../consumer }
+    bindings:
+      input: producer.output
   producer:
     source: { path: ../producer }
-connections:
-  - from: producer.output
-    to: consumer.input
 "#,
         )
         .expect("document parses");

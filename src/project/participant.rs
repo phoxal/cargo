@@ -56,7 +56,10 @@ pub(crate) fn selected_installations(
                     &home,
                     &target,
                     SelectionRequest {
-                        binary: component.binary.as_deref(),
+                        binary: component
+                            .driver
+                            .as_ref()
+                            .and_then(|driver| driver.binary.as_deref()),
                         source: &component.source,
                     },
                     options,
@@ -210,35 +213,13 @@ fn package_selection(
         source: PackageSource::Local { manifest_path },
     })
 }
-/// Prepares the executable and API closure declared by `robot.yaml`.
+/// Prepares the exact selected executable contracts and configured output families.
 pub(crate) fn prepare(
     layout: &ProjectLayout,
     options: &CargoOptions,
-) -> Result<Vec<String>, Error> {
-    options.validate()?;
-    let text = fs::read_to_string(layout.robot_manifest()).map_err(|source| Error::ReadRobot {
-        path: layout.robot_manifest().to_owned(),
-        source,
-    })?;
-    let robot = super::document::parse_and_validate(&text, layout.robot_manifest())?;
-    prepare_graph(layout, options, &robot).map(|(changes, _)| changes)
-}
-/// Prepares selected binaries and returns the graph after robot-owned
-/// conversions have been lowered exactly once.
-pub(crate) fn prepare_graph(
-    layout: &ProjectLayout,
-    options: &CargoOptions,
     robot: &RobotDocument,
-) -> Result<(Vec<String>, RobotDocument), Error> {
-    options.validate()?;
-    let changes = prepare_robot(layout, options, robot.clone())?;
-    Ok((changes, robot.clone()))
-}
-fn prepare_robot(
-    layout: &ProjectLayout,
-    options: &CargoOptions,
-    robot: RobotDocument,
 ) -> Result<Vec<String>, Error> {
+    options.validate()?;
     let _lock = preparation_lock(layout.root())?;
     let home = phoxal_home()?;
     let _installation_lock = installation_lock(&home)?;
@@ -282,8 +263,14 @@ fn prepare_robot(
                         (
                             instance,
                             &component.source,
-                            component.binary.as_deref(),
-                            component.config.as_ref(),
+                            component
+                                .driver
+                                .as_ref()
+                                .and_then(|driver| driver.binary.as_deref()),
+                            component
+                                .driver
+                                .as_ref()
+                                .and_then(|driver| driver.config.as_ref()),
                         )
                     }),
             )
@@ -884,6 +871,31 @@ fn invalid(path: &Path, message: impl Into<String>) -> Error {
         message: message.into(),
     }
 }
+pub(crate) fn operation_lock(root: &Path) -> Result<ExclusiveFileLock, Error> {
+    let directory = root.join("target/phoxal");
+    fs::create_dir_all(&directory).map_err(|source| Error::ArtifactFile {
+        path: directory.clone(),
+        source,
+    })?;
+    let path = directory.join("operation.lock");
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&path)
+        .map_err(|source| Error::ArtifactFile {
+            path: path.clone(),
+            source,
+        })?;
+    ExclusiveFileLock::try_acquire(file).map_err(|error| {
+        invalid(
+            &path,
+            format!("another cargo phoxal operation owns this project: {error}"),
+        )
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

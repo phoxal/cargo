@@ -69,7 +69,16 @@ fn authored_configuration(
     role: &str,
 ) -> Result<(String, serde_json::Value), Error> {
     match role {
-        "brain" => Ok(("brain.config".to_owned(), serde_json::Value::Null)),
+        "brain" => {
+            let RobotDocument::V0 { brain, .. } = prepared.document();
+            Ok((
+                "brain.config".to_owned(),
+                brain
+                    .as_ref()
+                    .and_then(|brain| brain.config.clone())
+                    .unwrap_or_else(|| serde_json::Value::Object(serde_json::Map::new())),
+            ))
+        }
         "service" => {
             let RobotDocument::V0 { services, .. } = prepared.document();
             Ok((
@@ -86,9 +95,7 @@ fn authored_configuration(
                 .components
                 .get(instance)
                 .and_then(|component| component.driver.as_ref())
-                .and_then(serde_json::Value::as_object)
-                .and_then(|driver| driver.get("config"))
-                .cloned()
+                .and_then(|driver| driver.config.clone())
                 .unwrap_or_else(|| serde_json::Value::Object(serde_json::Map::new()));
             Ok((format!("robot.components.{instance}.driver.config"), value))
         }

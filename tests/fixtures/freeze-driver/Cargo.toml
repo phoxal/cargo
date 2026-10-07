@@ -5,8 +5,8 @@ edition = "2024"
 publish = false
 
 [dependencies]
-phoxal = { version = "0.70.0", default-features = false, features = ["runtime"] }
+phoxal = { version = "0.71.0", default-features = false, features = ["runtime"] }
 serde = { version = "1.0", features = ["derive"] }
 
 [build-dependencies]
-phoxal = { version = "0.70.0", default-features = false, features = ["build"] }
+phoxal = { version = "0.71.0", default-features = false, features = ["build"] }
