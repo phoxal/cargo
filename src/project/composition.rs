@@ -55,6 +55,7 @@ impl Composition {
             record_origins(&layer, path, "", &mut origins);
             merge(&mut resolved, layer, path, "")?;
         }
+        resolve_sources(&mut resolved, &origins, &inputs[0])?;
         let text = serde_yaml::to_string(&resolved).map_err(|source| Error::ParseRobot {
             path: root.join("robot.yaml"),
             source,
@@ -73,6 +74,7 @@ impl Composition {
                         let local = match &error {
                             super::error::ValidationError::EmptyRobotId => "robot.id",
                             super::error::ValidationError::InvalidIdentifier { field, .. }
+                            | super::error::ValidationError::InvalidSource { field, .. }
                             | super::error::ValidationError::ReservedNamespaceSeparator {
                                 field,
                                 ..
@@ -96,7 +98,7 @@ impl Composition {
                                 field,
                                 ..
                             } => field.as_str(),
-                            _ => "services",
+                            _ => "robot.services",
                         };
                         let origin = origins
                             .iter()
@@ -129,6 +131,136 @@ impl Composition {
             inputs: captured,
         })
     }
+}
+
+/// Authored indirection is tool-owned and never enters prepared/runtime records.
+#[derive(serde::Deserialize)]
+#[serde(untagged)]
+enum AuthoredSource {
+    Concrete(super::document::Source),
+    Reference(SourceReference),
+}
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SourceReference {
+    r#ref: String,
+}
+
+fn resolve_sources(
+    document: &mut Value,
+    origins: &BTreeMap<String, PathBuf>,
+    fallback: &Path,
+) -> Result<(), Error> {
+    let origin = |local: &str| {
+        origins
+            .iter()
+            .filter(|(key, _)| local == key.as_str() || local.starts_with(&format!("{key}.")))
+            .max_by_key(|(key, _)| key.len())
+            .map_or(fallback, |(_, file)| file.as_path())
+    };
+    let Some(root) = document.as_mapping_mut() else {
+        return Ok(());
+    };
+    let definitions = root
+        .remove(Value::String("sources".into()))
+        .unwrap_or_else(|| Value::Mapping(Mapping::new()));
+    let definitions = definitions.as_mapping().ok_or_else(|| {
+        invalid(
+            origin("sources"),
+            "sources",
+            "expected a named mapping of concrete sources",
+        )
+    })?;
+    let mut sources = BTreeMap::new();
+    for (name, value) in definitions {
+        let name = name
+            .as_str()
+            .filter(|name| super::document::is_identifier(name))
+            .ok_or_else(|| {
+                invalid(
+                    origin("sources"),
+                    "sources",
+                    "source names must be project identifiers",
+                )
+            })?;
+        let local = format!("sources.{name}");
+        let source: super::document::Source =
+            serde_yaml::from_value(value.clone()).map_err(|error| {
+                invalid(
+                    origin(&local),
+                    &local,
+                    &format!("expected a concrete path or Git selection, not a reference: {error}"),
+                )
+            })?;
+        let mut errors = Vec::new();
+        super::document::validate_source(&local, &source, &mut errors);
+        if !errors.is_empty() {
+            return Err(invalid(
+                origin(&local),
+                &local,
+                &errors
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join("; "),
+            ));
+        }
+        sources.insert(name.to_owned(), source);
+    }
+    let resolve = |value: &mut Value, local: &str| -> Result<(), Error> {
+        let source: AuthoredSource = serde_yaml::from_value(value.clone()).map_err(|error| {
+            invalid(
+                origin(local),
+                local,
+                &format!("expected a concrete selection or {{ref: name}}: {error}"),
+            )
+        })?;
+        let source = match source {
+            AuthoredSource::Concrete(source) => source,
+            AuthoredSource::Reference(reference) => {
+                sources.get(&reference.r#ref).cloned().ok_or_else(|| {
+                    invalid(
+                        origin(local),
+                        local,
+                        &format!("unknown source reference '{}'", reference.r#ref),
+                    )
+                })?
+            }
+        };
+        *value = serde_yaml::to_value(source)
+            .map_err(|error| invalid(origin(local), local, &error.to_string()))?;
+        Ok(())
+    };
+    if let Some(source) = root
+        .get_mut(Value::String("supervisor".into()))
+        .and_then(Value::as_mapping_mut)
+        .and_then(|map| map.get_mut(Value::String("source".into())))
+    {
+        resolve(source, "supervisor.source")?;
+    }
+    if let Some(robot) = root
+        .get_mut(Value::String("robot".into()))
+        .and_then(Value::as_mapping_mut)
+    {
+        for group in ["services", "components"] {
+            if let Some(instances) = robot
+                .get_mut(Value::String(group.into()))
+                .and_then(Value::as_mapping_mut)
+            {
+                for (name, instance) in instances {
+                    if let (Some(name), Some(source)) = (
+                        name.as_str(),
+                        instance
+                            .as_mapping_mut()
+                            .and_then(|map| map.get_mut(Value::String("source".into()))),
+                    ) {
+                        resolve(source, &format!("robot.{group}.{name}.source"))?;
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
 }
 fn record_origins(
     value: &Value,
@@ -235,6 +367,75 @@ fn merge(target: &mut Value, layer: Value, file: &Path, local: &str) -> Result<(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn references_resolve_after_ordered_composition_and_leave_no_alias_metadata() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let base = root.as_path().join("robot.yaml");
+        let layer = root.as_path().join("later.yaml");
+        std::fs::write(&base, "schema: phoxal/robot/v0\nsources:\n  motor: {path: ../old}\n  app: {path: ../supervisor}\nrobot:\n  id: rover\n  brain: {}\n  services:\n    motion: {source: {ref: motor}}\n  components:\n    wheel: {source: {ref: motor}, mount_site: Front.Left}\nsupervisor: {source: {ref: app}}\n").unwrap();
+        std::fs::write(
+            &layer,
+            "schema: phoxal/robot/v0\nsources:\n  motor: !replace {path: ../new}\n",
+        )
+        .unwrap();
+        let composition =
+            Composition::load(root.as_path(), &[base.clone(), layer.clone()]).unwrap();
+        let value = serde_json::to_value(&composition.document).unwrap();
+        assert!(value.get("sources").is_none());
+        assert_eq!(
+            value["robot"]["services"]["motion"]["source"],
+            serde_json::json!({"path":"../new"})
+        );
+        assert_eq!(
+            value["robot"]["components"]["wheel"]["source"],
+            value["robot"]["services"]["motion"]["source"]
+        );
+        assert_eq!(
+            value["supervisor"]["source"],
+            serde_json::json!({"path":"../supervisor"})
+        );
+        let inline = std::fs::read_to_string(&base)
+            .unwrap()
+            .replace("{ref: motor}", "{path: ../new}")
+            .replace("{ref: app}", "{path: ../supervisor}");
+        std::fs::write(root.as_path().join("inline.yaml"), inline).unwrap();
+        assert_eq!(
+            Composition::load(root.as_path(), &[root.as_path().join("inline.yaml")])
+                .unwrap()
+                .document,
+            composition.document
+        );
+        for declaration in [
+            "motor: !delete",
+            "motor: {ref: app}",
+            "motor: !replace {ref: app}",
+            "motor: {path: ../new, git: {name: bad}}",
+            "motor: {path: /absolute}",
+        ] {
+            std::fs::write(
+                &layer,
+                format!("schema: phoxal/robot/v0\nsources:\n  {declaration}\n"),
+            )
+            .unwrap();
+            let error = Composition::load(root.as_path(), &[base.clone(), layer.clone()])
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("source"), "{error}");
+            if declaration == "motor: !replace {ref: app}" {
+                assert!(error.contains("later.yaml:sources.motor"), "{error}");
+                assert!(error.contains("not a reference"), "{error}");
+            }
+        }
+        std::fs::write(&layer, "schema: phoxal/robot/v0\nrobot:\n  services:\n    motion:\n      source: !replace {ref: absent}\n").unwrap();
+        let error = Composition::load(root.as_path(), &[base, layer])
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("later.yaml:robot.services.motion.source") && error.contains("absent"),
+            "{error}"
+        );
+    }
     #[test]
     fn replacement_and_deletion_discard_descendant_origins() {
         let mut origins = BTreeMap::new();

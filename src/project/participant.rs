@@ -28,9 +28,8 @@ pub(crate) fn selected_installations(
 ) -> Result<BTreeMap<String, InstalledSelection>, Error> {
     let home = phoxal_home()?;
     let target = options.target.clone().map_or_else(host_target, Ok)?;
-    let RobotDocument::V0 {
-        robot, services, ..
-    } = document;
+    let RobotDocument::V0 { robot, .. } = document;
+    let phoxal::artifact::document::RobotSection { services, .. } = robot;
     let mut selected = BTreeMap::new();
     for (instance, selection) in services {
         selected.insert(
@@ -227,9 +226,8 @@ pub(crate) fn prepare(
         Some(target) => target.clone(),
         None => host_target()?,
     };
-    let RobotDocument::V0 {
-        robot, services, ..
-    } = robot;
+    let RobotDocument::V0 { robot, .. } = robot;
+    let phoxal::artifact::document::RobotSection { services, .. } = robot;
     let root = layout
         .root()
         .canonicalize()

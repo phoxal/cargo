@@ -270,7 +270,7 @@ fn two_binaries_of_one_package_keep_distinct_prepared_contracts()
     )?;
     fs::write(robot.join("src/main.rs"), BRAIN_MAIN)?;
     let robot_yaml = robot.join("robot.yaml");
-    let valid_wiring = "schema: phoxal/robot/v0\nrobot:\n  id: proof-multi-robot\nsupervisor:\n  source:\n    path: supervisor\nservices:\n  first:\n    source:\n      path: provider\n    binary: alpha\n  second:\n    source:\n      path: provider\n    binary: beta\n  third:\n    source:\n      path: provider\n    binary: sensor-a\n  fourth:\n    source:\n      path: provider\n    binary: sensor_a\nbrain:\n  bindings:\n    probe:\n    - first.probe\n";
+    let valid_wiring = "schema: phoxal/robot/v0\nrobot:\n  id: proof-multi-robot\n  services:\n    first:\n      source:\n        path: provider\n      binary: alpha\n    second:\n      source:\n        path: provider\n      binary: beta\n    third:\n      source:\n        path: provider\n      binary: sensor-a\n    fourth:\n      source:\n        path: provider\n      binary: sensor_a\n  brain:\n    bindings:\n      probe:\n      - first.probe\nsupervisor:\n  source:\n    path: supervisor\n";
     fs::write(&robot_yaml, valid_wiring)?;
 
     let prepare = invoke(&robot, &["prepare", "--offline"]);
@@ -627,7 +627,7 @@ fn git_rust_contract_participant_prepares_from_the_installed_artifact()
     fs::write(
         robot.join("robot.yaml"),
         format!(
-            "schema: phoxal/robot/v0\nrobot:\n  id: proof-git-rust-robot\nsupervisor:\n  source:\n    path: supervisor\nservices:\n  provider:\n    source:\n      git:\n        name: proof-git-rust-provider\n        url: file://{}\n        rev: {revision}\n",
+            "schema: phoxal/robot/v0\nrobot:\n  id: proof-git-rust-robot\n  services:\n    provider:\n      source:\n        git:\n          name: proof-git-rust-provider\n          url: file://{}\n          rev: {revision}\nsupervisor:\n  source:\n    path: supervisor\n",
             source.display()
         ),
     )?;

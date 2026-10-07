@@ -39,14 +39,15 @@ pub fn stage(fixture: &str) -> (tempfile::TempDir, PathBuf) {
             "phoxal = {{ path = {:?}, default-features = false }}",
             sdk::sdk_root()
         );
-        fs::write(
-            &supervisor,
-            manifest.replace(
-                "phoxal = { version = \"0.70.0\", default-features = false }",
-                &dependency,
-            ),
-        )
-        .unwrap_or_else(|error| panic!("selected SDK fixture dependency: {error}"));
+        let selected = "phoxal = { version = \"0.72.0\", default-features = false }";
+        assert_eq!(
+            manifest.matches(selected).count(),
+            1,
+            "fixture supervisor must contain exactly one selected SDK dependency: {}",
+            supervisor.display()
+        );
+        fs::write(&supervisor, manifest.replace(selected, &dependency))
+            .unwrap_or_else(|error| panic!("selected SDK fixture dependency: {error}"));
     }
     (destination, path)
 }

@@ -111,12 +111,12 @@ pub(crate) fn resolve_prepared_sources(
     metadata: &Metadata,
     options: &CargoOptions,
 ) -> Result<SourceSelection, Error> {
-    let RobotDocument::V0 {
+    let RobotDocument::V0 { robot, .. } = document;
+    let phoxal::artifact::document::RobotSection {
         brain: authored_brain,
         services: authored_services,
-        robot,
         ..
-    } = document;
+    } = robot;
     let root = metadata.root_package().ok_or(SourceError::MissingBrain)?;
     let brain = resolve_brain(root, authored_brain.as_ref(), metadata)?;
     let installed = participant::selected_installations(layout, document, options)?;

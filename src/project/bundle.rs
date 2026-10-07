@@ -823,12 +823,10 @@ pub(crate) fn assemble_with_inputs(
 /// The canonical absent form is the omitted field; an authored `null` is
 /// absent here as well, because a unit configuration carries no value.
 fn instance_config(prepared: &PreparedProject, instance: &str) -> InstanceConfig {
-    let RobotDocument::V0 {
-        robot,
-        services,
-        brain,
-        ..
-    } = prepared.document();
+    let RobotDocument::V0 { robot, .. } = prepared.document();
+    let phoxal::artifact::document::RobotSection {
+        services, brain, ..
+    } = robot;
     let value = if instance == "brain" {
         brain.as_ref().and_then(|brain| brain.config.clone())
     } else if let Some(service) = services.get(instance) {

@@ -13,9 +13,8 @@ pub(crate) fn validate_prepared_connections(
     use phoxal::artifact::RuntimeRecord;
 
     let root = project.layout.root();
-    let RobotDocument::V0 {
-        services, robot, ..
-    } = &project.document;
+    let RobotDocument::V0 { robot, .. } = &project.document;
+    let phoxal::artifact::document::RobotSection { services, .. } = robot;
 
     let selected = |instance: &str| -> Option<(&Source, Option<&str>)> {
         services

@@ -70,9 +70,10 @@ fn authored_configuration(
 ) -> Result<(String, serde_json::Value), Error> {
     match role {
         "brain" => {
-            let RobotDocument::V0 { brain, .. } = prepared.document();
+            let RobotDocument::V0 { robot, .. } = prepared.document();
+            let phoxal::artifact::document::RobotSection { brain, .. } = robot;
             Ok((
-                "brain.config".to_owned(),
+                "robot.brain.config".to_owned(),
                 brain
                     .as_ref()
                     .and_then(|brain| brain.config.clone())
@@ -80,9 +81,10 @@ fn authored_configuration(
             ))
         }
         "service" => {
-            let RobotDocument::V0 { services, .. } = prepared.document();
+            let RobotDocument::V0 { robot, .. } = prepared.document();
+            let phoxal::artifact::document::RobotSection { services, .. } = robot;
             Ok((
-                format!("services.{instance}.config"),
+                format!("robot.services.{instance}.config"),
                 services
                     .get(instance)
                     .and_then(|selection| selection.config.clone())

@@ -42,6 +42,38 @@ source:
     path: ddsm115
 ```
 
+Top-level `sources` names concrete selections that participants or the supervisor may reference with `source: {ref: name}`.
+This named-source syntax and nested robot grouping are implemented in this source revision and require SDK 0.72.0; released cargo-phoxal 0.3.0 does not implement them.
+Current source builds use the published SDK 0.72.0 and phoxal-build 0.72.0 without local SDK patches.
+The tool merges all selected files before resolving references once, so a later file can override a named source shared by several instances.
+Names do not chain or inherit, and every named entry must be a valid concrete path or Git selection even when unused.
+Changing source kind requires `!replace`; ordinary map merging never silently drops conflicting path/Git/ref fields.
+Configuration inspection and prepared API inputs contain concrete selections, with no alias metadata in bundles or runtimes.
+
+```yaml
+schema: phoxal/robot/v0
+sources:
+  wheel: {path: ../components/ddsm115}
+  motion: {path: ../services/motion}
+  supervisor: {path: ../supervisor}
+robot:
+  id: rover
+  brain: {}
+  services:
+    motion:
+      source: {ref: motion}
+  components:
+    wheel:
+      source: {ref: wheel}
+      mount_site: wheel_mount
+      driver: {}
+supervisor:
+  source: {ref: supervisor}
+```
+
+The `robot` section owns id, model, brain, services and components; supervisor and the optional named sources table stay top-level.
+This directly replaces the earlier authored V0 layout; instance and endpoint identities stay unchanged.
+
 Local paths are relative to the robot root and use the selected Cargo package's own version.
 Git selections require a package name and full commit revision, with an optional package path below the checkout; Cargo reads that package's version from the pinned checkout.
 Pinned Git runnable packages are installed into the managed Phoxal home.
@@ -82,11 +114,11 @@ robot:
       driver:
         bindings:
           actuator: motion.front_left_actuator
-services:
-  motion:
-    source: {path: ../services/motion}
-    bindings:
-      manual: gamepad.intent
+  services:
+    motion:
+      source: {path: ../services/motion}
+      bindings:
+        manual: gamepad.intent
 ```
 
 A component owns source and mount_site, while its optional typed driver owns binary, config, and bindings.
@@ -129,13 +161,14 @@ Resolved YAML/JSON contains no tags and remains interoperable.
 
 ```yaml
 schema: phoxal/robot/v0
-services:
-  gamepad: !delete
-  motion:
-    source: !replace
-      path: ../services/motion
-    bindings:
-      manual: !delete
+robot:
+  services:
+    gamepad: !delete
+    motion:
+      source: !replace
+        path: ../services/motion
+      bindings:
+        manual: !delete
 ```
 
 Prepare publishes the exact resolved composition alongside immutable snapshots of prepared contracts/descriptors.

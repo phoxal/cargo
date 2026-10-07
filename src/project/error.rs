@@ -115,11 +115,19 @@ pub enum ValidationError {
         instance: String,
     },
     /// A service entry used an unsupported field.
-    #[error("services.{service}: {message}")]
+    #[error("robot.services.{service}: {message}")]
     InvalidService {
         /// Service instance id.
         service: String,
         /// Specific service error.
+        message: String,
+    },
+    /// A concrete authored source selection is invalid.
+    #[error("{field}: {message}")]
+    InvalidSource {
+        /// Exact authored source path.
+        field: String,
+        /// Selection failure.
         message: String,
     },
 }
@@ -137,7 +145,7 @@ pub enum SourceError {
     },
     /// A root-local brain could not be identified from the root package.
     #[error(
-        "the robot root package has no eligible brain binary; add one binary target or set brain.binary"
+        "the robot root package has no eligible brain binary; add one binary target or set robot.brain.binary"
     )]
     MissingBrain,
     /// A requested brain binary is not an ordinary root-package binary.
@@ -148,7 +156,7 @@ pub enum SourceError {
     },
     /// More than one root-package binary could serve as the brain.
     #[error(
-        "the robot root package has multiple eligible brain binaries ({candidates}); set brain.binary"
+        "the robot root package has multiple eligible brain binaries ({candidates}); set robot.brain.binary"
     )]
     AmbiguousBrain {
         /// Candidate target names.

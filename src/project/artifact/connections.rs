@@ -25,12 +25,10 @@ pub fn validate_prepared_endpoints(
             let mut contract = contract.clone();
             let RuntimeRecord::V0 { outputs, .. } = &contract.runtime;
             if outputs.iter().any(|output| output.family.is_some()) {
-                let RobotDocument::V0 {
-                    robot,
-                    services,
-                    brain,
-                    ..
-                } = document;
+                let RobotDocument::V0 { robot, .. } = document;
+                let phoxal::artifact::document::RobotSection {
+                    services, brain, ..
+                } = robot;
                 let config = services
                     .get(instance)
                     .and_then(|selection| selection.config.as_ref())
@@ -302,9 +300,9 @@ mod tests {
     }
     fn document(edges: serde_json::Value) -> RobotDocument {
         let mut document: RobotDocument = serde_json::from_value(json!({
-            "schema": "phoxal/robot/v0", "robot": {"id": "test"},
+            "schema": "phoxal/robot/v0", "robot": {"id": "test", "services": {"motion": {"source": {"path": "motion"}}}},
             "supervisor": {"source": {"path": "supervisor"}},
-            "services": {"motion": {"source": {"path": "motion"}}},
+
         }))
         .unwrap();
         let mut grouped: BTreeMap<String, Vec<String>> = BTreeMap::new();
@@ -317,7 +315,8 @@ mod tests {
         for (consumer, sources) in grouped {
             let (instance, _) = consumer.split_once('.').unwrap();
             if instance != "brain" {
-                let RobotDocument::V0 { services, .. } = &mut document;
+                let RobotDocument::V0 { robot, .. } = &mut document;
+                let phoxal::artifact::document::RobotSection { services, .. } = robot;
                 services.entry(instance.into()).or_insert_with(|| {
                     serde_json::from_value(json!({"source": {"path": instance}})).unwrap()
                 });
@@ -340,7 +339,7 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(
-            error.contains("services.motion.bindings.samples"),
+            error.contains("robot.services.motion.bindings.samples"),
             "{error}"
         );
         assert!(error.contains("fixture.Sample"), "{error}");

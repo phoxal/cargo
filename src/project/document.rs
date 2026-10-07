@@ -83,9 +83,8 @@ impl ValidateComponentDocument for ComponentDocument {
 }
 fn validate_schema(_document: &RobotDocument, _errors: &mut Vec<ValidationError>) {}
 fn validate_robot(document: &RobotDocument, errors: &mut Vec<ValidationError>) {
-    let RobotDocument::V0 {
-        robot, services, ..
-    } = document;
+    let RobotDocument::V0 { robot, .. } = document;
+    let phoxal::artifact::document::RobotSection { services, .. } = robot;
     if robot.id.trim().is_empty() {
         errors.push(ValidationError::EmptyRobotId);
     } else if !is_identifier(&robot.id) {
@@ -141,18 +140,19 @@ fn validate_robot(document: &RobotDocument, errors: &mut Vec<ValidationError>) {
     }
 }
 fn validate_brain(document: &RobotDocument, errors: &mut Vec<ValidationError>) {
-    let RobotDocument::V0 { brain, .. } = document;
+    let RobotDocument::V0 { robot, .. } = document;
+    let phoxal::artifact::document::RobotSection { brain, .. } = robot;
     if let Some(brain) = brain
         && let Some(binary) = &brain.binary
         && (binary.trim().is_empty() || !is_identifier(binary))
     {
         errors.push(ValidationError::InvalidIdentifier {
-            field: "brain.binary".to_owned(),
+            field: "robot.brain.binary".to_owned(),
             value: binary.clone(),
         });
     }
     if let Some(config) = brain.as_ref().and_then(|brain| brain.config.as_ref()) {
-        push_config_errors(config, "brain.config", errors);
+        push_config_errors(config, "robot.brain.config", errors);
     }
 }
 /// Validates the authored supervisor selection.
@@ -160,18 +160,15 @@ fn validate_brain(document: &RobotDocument, errors: &mut Vec<ValidationError>) {
 /// The supervisor shares the participants' source type while remaining an
 /// application: it is never a service instance or connection participant.
 fn validate_supervisor(document: &RobotDocument, errors: &mut Vec<ValidationError>) {
-    let RobotDocument::V0 {
-        supervisor,
-        services,
-        ..
-    } = document;
+    let RobotDocument::V0 { robot, supervisor } = document;
+    let services = &robot.services;
     validate_source("supervisor.source", &supervisor.source, errors);
     if let Some(binary) = &supervisor.binary
         && (binary.trim().is_empty() || !is_identifier(binary))
     {
-        errors.push(ValidationError::InvalidService {
-            service: "supervisor".to_owned(),
-            message: format!("binary '{binary}' is not a valid target name"),
+        errors.push(ValidationError::InvalidIdentifier {
+            field: "supervisor.binary".to_owned(),
+            value: binary.clone(),
         });
     }
     if services.contains_key("supervisor") {
@@ -181,17 +178,18 @@ fn validate_supervisor(document: &RobotDocument, errors: &mut Vec<ValidationErro
     }
 }
 fn validate_services(document: &RobotDocument, errors: &mut Vec<ValidationError>) {
-    let RobotDocument::V0 { services, .. } = document;
+    let RobotDocument::V0 { robot, .. } = document;
+    let phoxal::artifact::document::RobotSection { services, .. } = robot;
     for (service, selection) in services {
-        push_identifier_error(&format!("services.{service}"), service, errors);
+        push_identifier_error(&format!("robot.services.{service}"), service, errors);
         validate_source(
-            &format!("services.{service}.source"),
+            &format!("robot.services.{service}.source"),
             &selection.source,
             errors,
         );
         if service == "brain" {
             errors.push(ValidationError::ReservedBrainId {
-                field: "services".to_owned(),
+                field: "robot.services".to_owned(),
             });
         }
         if let Some(binary) = &selection.binary
@@ -203,11 +201,11 @@ fn validate_services(document: &RobotDocument, errors: &mut Vec<ValidationError>
             });
         }
         if let Some(config) = &selection.config {
-            push_config_errors(config, &format!("services.{service}.config"), errors);
+            push_config_errors(config, &format!("robot.services.{service}.config"), errors);
         }
     }
 }
-fn validate_source(field: &str, source: &Source, errors: &mut Vec<ValidationError>) {
+pub(super) fn validate_source(field: &str, source: &Source, errors: &mut Vec<ValidationError>) {
     match source {
         Source::Path(path) => {
             if path.trim().is_empty() || !Path::new(path).is_relative() {
@@ -231,8 +229,8 @@ fn validate_source(field: &str, source: &Source, errors: &mut Vec<ValidationErro
                             .any(|part| !matches!(part, std::path::Component::Normal(_)))
                 })
             {
-                errors.push(ValidationError::InvalidService {
-                    service: field.to_owned(),
+                errors.push(ValidationError::InvalidSource {
+                    field: field.to_owned(),
                     message: "Git source needs a URL, full commit, and safe package path"
                         .to_owned(),
                 });
@@ -242,9 +240,8 @@ fn validate_source(field: &str, source: &Source, errors: &mut Vec<ValidationErro
 }
 fn validate_connections(document: &RobotDocument, errors: &mut Vec<ValidationError>) {
     let known = document.instance_ids();
-    let RobotDocument::V0 {
-        robot, services, ..
-    } = document;
+    let RobotDocument::V0 { robot, .. } = document;
+    let phoxal::artifact::document::RobotSection { services, .. } = robot;
     let connections = document.connection_sources();
     for (consumer_text, sources) in &connections {
         if sources.is_empty() {

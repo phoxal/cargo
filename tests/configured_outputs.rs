@@ -62,8 +62,19 @@ fn shared_executable_has_instance_bound_apis_and_stale_config_requires_prepare()
     )
     .unwrap();
     fs::write(root.join("src/main.rs"), "phoxal::api!();\n#[phoxal::endpoints]struct BrainApi{}\nstruct Brain;\n#[phoxal::runtime(contract=BrainApi,period_ms=20)]impl Brain{#[init]fn init(_:())->phoxal::Result<Self>{Ok(Self)}}\nfn main()->phoxal::Result<()>{let _=(api::first::FRONT_ACTUATOR,api::second::REAR_ACTUATOR);phoxal::runtime::run::<Brain>()}").unwrap();
-    let document = "schema: phoxal/robot/v0\nrobot:\n  id: configured-output-robot\nsupervisor:\n  source:\n    path: supervisor\nservices:\n  first:\n    source:\n      path: provider\n    config:\n      wheels:\n        front: null\n  second:\n    source:\n      path: provider\n    config:\n      wheels:\n        rear: null\n";
+    let document = "schema: phoxal/robot/v0\nsources:\n  provider: {path: provider}\nrobot:\n  id: configured-output-robot\n  services:\n    first:\n      source: {ref: provider}\n      config:\n        wheels:\n          front: null\n    second:\n      source: {ref: provider}\n      config:\n        wheels:\n          rear: null\nsupervisor:\n  source:\n    path: supervisor\n";
     fs::write(root.join("robot.yaml"), document).unwrap();
+    assert_success(run(root, true, &["prepare", "--offline"]));
+    assert_success(run(root, false, &["check", "--offline"]));
+    // Even a same-directory spelling change invalidates the selected authored inputs.
+    fs::write(
+        root.join("robot.yaml"),
+        document.replace("{path: provider}", "{path: ./provider}"),
+    )
+    .unwrap();
+    let stale_alias = run(root, false, &["check", "--offline"]);
+    assert!(!stale_alias.status.success());
+    assert!(String::from_utf8_lossy(&stale_alias.stderr).contains("authored composition changed"));
     assert_success(run(root, true, &["prepare", "--offline"]));
     assert_success(run(root, false, &["check", "--offline"]));
     fs::write(
@@ -85,7 +96,7 @@ fn shared_executable_has_instance_bound_apis_and_stale_config_requires_prepare()
     fs::write(root.join("src/main.rs"), source).unwrap();
     assert_success(run(root, false, &["check", "--offline"]));
     // An explicit layer changes only the selected instance-expanded API.
-    fs::write(root.join("alternate.yaml"), "schema: phoxal/robot/v0\nservices: {second: {config: {wheels: !replace {alternate: null}}}}\n").unwrap();
+    fs::write(root.join("alternate.yaml"), "schema: phoxal/robot/v0\nrobot:\n  services: {second: {config: {wheels: !replace {alternate: null}}}}\n").unwrap();
     let common_source = fs::read_to_string(root.join("src/main.rs")).unwrap();
     fs::write(
         root.join("src/main.rs"),
@@ -166,7 +177,7 @@ fn shared_executable_has_instance_bound_apis_and_stale_config_requires_prepare()
     fs::write(root.join("src/main.rs"), format!("#[derive(serde::Deserialize,phoxal::Config)]struct BrainConfig{{threshold:u32}}\n{configured_brain}")).unwrap();
     fs::write(
         root.join("brain.yaml"),
-        "schema: phoxal/robot/v0\nbrain: {config: {threshold: 3}}\n",
+        "schema: phoxal/robot/v0\nrobot:\n  brain: {config: {threshold: 3}}\n",
     )
     .unwrap();
     assert_success(run(
@@ -176,7 +187,7 @@ fn shared_executable_has_instance_bound_apis_and_stale_config_requires_prepare()
     ));
     fs::write(
         root.join("brain.yaml"),
-        "schema: phoxal/robot/v0\nbrain: {config: {threshold: invalid}}\n",
+        "schema: phoxal/robot/v0\nrobot:\n  brain: {config: {threshold: invalid}}\n",
     )
     .unwrap();
     let invalid = run(

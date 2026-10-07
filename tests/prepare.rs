@@ -127,7 +127,7 @@ fn local_participant_prepares_from_its_compiled_artifact() -> Result<(), Box<dyn
     fs::write(robot.join("src/main.rs"), "fn main() {}\n")?;
     fs::write(
         robot.join("robot.yaml"),
-        "schema: phoxal/robot/v0\nrobot: { id: proof-robot }\nsupervisor:\n  source: { path: supervisor }\nservices:\n  motion:\n    source: { path: provider }\n",
+        "schema: phoxal/robot/v0\nrobot:\n  id: proof-robot\n  services:\n    motion:\n      source: { path: provider }\nsupervisor:\n  source: { path: supervisor }\n",
     )?;
     write_rust_contract_provider(
         &provider,
@@ -303,7 +303,7 @@ fn exact_git_revision_prepares_the_alternate_binary_contract()
     fs::write(
         robot.join("robot.yaml"),
         format!(
-            "schema: phoxal/robot/v0\nrobot: {{ id: proof-robot }}\nsupervisor:\n  source: {{ path: supervisor }}\nservices:\n  provider:\n    binary: provider-daemon\n    source:\n      git:\n        name: {package}\n        url: file://{}\n        rev: {revision}\n",
+            "schema: phoxal/robot/v0\nrobot:\n  id: proof-robot\n  services:\n    provider:\n      binary: provider-daemon\n      source:\n        git:\n          name: {package}\n          url: file://{}\n          rev: {revision}\nsupervisor:\n  source: {{ path: supervisor }}\n",
             source.display()
         ),
     )?;

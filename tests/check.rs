@@ -29,6 +29,18 @@ use support::stage;
 #[test]
 fn check_passes_a_valid_robot_and_writes_a_lockfile() {
     let (_guard, root) = stage("check-valid");
+    let staged: toml::Value = toml::from_str(
+        &fs::read_to_string(root.join("supervisor/Cargo.toml"))
+            .unwrap_or_else(|error| panic!("staged supervisor manifest: {error}")),
+    )
+    .unwrap_or_else(|error| panic!("parse staged supervisor: {error}"));
+    let dependency = &staged["dependencies"]["phoxal"];
+    assert_eq!(
+        dependency["path"].as_str(),
+        support::sdk::sdk_root().to_str()
+    );
+    assert!(dependency.get("version").is_none());
+    assert_eq!(dependency["default-features"].as_bool(), Some(false));
     let populate = support::invoke(&root, &["check", "--offline"]);
     assert!(
         populate.status.success(),
@@ -114,7 +126,7 @@ fn independently_selected_participant_keeps_its_version_and_shared_artifact() {
     fs::copy(root.join("build.rs"), provider.join("build.rs")).expect("provider contract");
     fs::copy(root.join("src/main.rs"), provider.join("src/main.rs")).expect("provider main");
     let yaml = fs::read_to_string(root.join("robot.yaml")).expect("robot document");
-    fs::write(root.join("robot.yaml"), yaml.replace("services: {}", "services:\n  first: { source: { path: provider } }\n  second: { source: { path: provider } }"))
+    fs::write(root.join("robot.yaml"), yaml.replace("  services: {}", "  services:\n    first: { source: { path: provider } }\n    second: { source: { path: provider } }"))
         .expect("participant selections");
     let bundle = root.join("bundle");
     let output = std::process::Command::new(env!("CARGO_BIN_EXE_cargo-phoxal"))

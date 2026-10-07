@@ -39,12 +39,16 @@ fn scaffold_robot(
     services: &str,
     main_body: &str,
 ) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    let services = services
+        .lines()
+        .map(|line| format!("  {line}\n"))
+        .collect::<String>();
     let robot = directory.join("robot");
     fs::create_dir_all(robot.join("src"))?;
     fs::write(
         robot.join("robot.yaml"),
         format!(
-            "schema: phoxal/robot/v0\nrobot: {{ id: marker-proof }}\nsupervisor:\n  source: {{ path: supervisor }}\nservices:\n{services}"
+            "schema: phoxal/robot/v0\nrobot:\n  id: marker-proof\n  services:\n{services}supervisor:\n  source: {{ path: supervisor }}\n"
         ),
     )?;
     let sdk = sdk_root();
@@ -196,7 +200,7 @@ fn local_git_repository_acquisition_prepares_real_products()
     let robot = scaffold_robot(
         root,
         &format!(
-            "  pinned: {{ source: {{ git: {{ name: proof-git-provider, url: {:?}, rev: {rev} }} }} }}\n",
+            "    pinned: {{ source: {{ git: {{ name: proof-git-provider, url: {:?}, rev: {rev} }} }} }}\n",
             format!("file://{}", repo.canonicalize()?.display())
         ),
         "phoxal::api!();\n\nfn main() {\n    let _ = <api::operations::proof::gitreal::v1::Ask as phoxal::contracts::Operation>::METHOD;\n}\n",
