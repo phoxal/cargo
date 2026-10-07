@@ -117,34 +117,20 @@ fn validate_robot(document: &RobotDocument, errors: &mut Vec<ValidationError>) {
             &component.source,
             errors,
         );
-        if let Some(binary) = &component.binary {
-            push_identifier_error(
-                &format!("robot.components.{instance}.binary"),
-                binary,
-                errors,
-            );
-        }
         if component.mount_site.trim().is_empty() {
             errors.push(ValidationError::EmptySourceKey {
                 field: format!("robot.components.{instance}.mount_site"),
             });
         }
-        if let Some(config) = &component.config {
-            push_config_errors(
-                config,
-                &format!("robot.components.{instance}.config"),
-                errors,
-            );
-        }
         if let Some(driver) = &component.driver {
-            let Some(driver) = driver.as_object() else {
-                errors.push(ValidationError::InvalidDriver {
-                    component: instance.clone(),
-                    message: "must be a mapping when present".to_owned(),
-                });
-                continue;
-            };
-            if let Some(config) = driver.get("config") {
+            if let Some(binary) = &driver.binary {
+                push_identifier_error(
+                    &format!("robot.components.{instance}.driver.binary"),
+                    binary,
+                    errors,
+                );
+            }
+            if let Some(config) = &driver.config {
                 push_config_errors(
                     config,
                     &format!("robot.components.{instance}.driver.config"),
@@ -164,6 +150,9 @@ fn validate_brain(document: &RobotDocument, errors: &mut Vec<ValidationError>) {
             field: "brain.binary".to_owned(),
             value: binary.clone(),
         });
+    }
+    if let Some(config) = brain.as_ref().and_then(|brain| brain.config.as_ref()) {
+        push_config_errors(config, "brain.config", errors);
     }
 }
 /// Validates the authored supervisor selection.
@@ -258,11 +247,16 @@ fn validate_connections(document: &RobotDocument, errors: &mut Vec<ValidationErr
     } = document;
     let connections = document.connection_sources();
     for (consumer_text, sources) in &connections {
+        if sources.is_empty() {
+            errors.push(ValidationError::EmptySourceKey {
+                field: document.binding_path(consumer_text),
+            });
+        }
         let consumer = match PortReference::parse(consumer_text) {
             Ok(reference) => reference,
             Err(_) => {
                 errors.push(ValidationError::InvalidPortReference {
-                    field: "connections".to_owned(),
+                    field: document.binding_path(consumer_text),
                     value: consumer_text.clone(),
                 });
                 continue;
@@ -270,7 +264,7 @@ fn validate_connections(document: &RobotDocument, errors: &mut Vec<ValidationErr
         };
         if !known.contains(&consumer.instance) {
             errors.push(ValidationError::UnknownConnectionInstance {
-                field: format!("connections.{consumer_text}"),
+                field: document.binding_path(consumer_text),
                 instance: consumer.instance.clone(),
             });
         } else if consumer.instance != "brain"
@@ -281,7 +275,7 @@ fn validate_connections(document: &RobotDocument, errors: &mut Vec<ValidationErr
                 .is_none_or(|component| component.driver.is_none())
         {
             errors.push(ValidationError::InvalidConnectionConsumer {
-                field: format!("connections.{consumer_text}"),
+                field: document.binding_path(consumer_text),
                 instance: consumer.instance.clone(),
             });
         }
@@ -292,7 +286,7 @@ fn validate_connections(document: &RobotDocument, errors: &mut Vec<ValidationErr
                 Ok(reference) => reference,
                 Err(_) => {
                     errors.push(ValidationError::InvalidPortReference {
-                        field: format!("connections.{consumer_text}"),
+                        field: document.binding_path(consumer_text),
                         value: source_text.clone(),
                     });
                     continue;
@@ -300,13 +294,13 @@ fn validate_connections(document: &RobotDocument, errors: &mut Vec<ValidationErr
             };
             if !known.contains(&source.instance) {
                 errors.push(ValidationError::UnknownConnectionInstance {
-                    field: format!("connections.{consumer_text}"),
+                    field: document.binding_path(consumer_text),
                     instance: source.instance,
                 });
             }
             if !seen.insert(source_text) {
                 errors.push(ValidationError::DuplicateConnectionSource {
-                    field: format!("connections.{consumer_text}"),
+                    field: document.binding_path(consumer_text),
                     producer: source_text.clone(),
                 });
             }

@@ -10,6 +10,7 @@ pub mod artifact;
 mod bundle;
 mod cargo;
 mod component_assets;
+mod composition;
 mod conversions;
 mod discovery;
 mod document;
@@ -50,6 +51,7 @@ use std::process::Command;
 pub struct Project {
     layout: ProjectLayout,
     document: RobotDocument,
+    inputs: Vec<(PathBuf, Vec<u8>)>,
 }
 
 impl Project {
@@ -59,15 +61,82 @@ impl Project {
         Self::from_layout(layout)
     }
 
+    pub fn discover_files(start: &Path, files: &[PathBuf]) -> Result<Self, Error> {
+        if files.is_empty() {
+            Self::discover(start)
+        } else {
+            Self::from_layout_files(ProjectLayout::discover(start)?, files)
+        }
+    }
+
+    pub fn document(&self) -> &RobotDocument {
+        &self.document
+    }
+
+    pub fn prepare_inputs(&self, options: &CargoOptions) -> Result<Vec<String>, Error> {
+        let changes = participant::prepare(&self.layout, options, &self.document)?;
+        let RobotDocument::V0 {
+            robot, services, ..
+        } = &self.document;
+        let selections = services
+            .iter()
+            .map(|(instance, service)| {
+                (
+                    instance.as_str(),
+                    &service.source,
+                    service.binary.as_deref(),
+                )
+            })
+            .chain(robot.components.iter().filter_map(|(instance, component)| {
+                component.driver.as_ref().map(|driver| {
+                    (
+                        instance.as_str(),
+                        &component.source,
+                        driver.binary.as_deref(),
+                    )
+                })
+            }));
+        let mut products = std::collections::BTreeSet::new();
+        for (instance, source, binary) in selections {
+            let identity = manifest_check::selection_identity(source);
+            let path = phoxal_build::prepared_dir(self.layout.root(), &identity, binary)?;
+            let contract = phoxal_build::read_prepared_for(&path, &identity, binary)?;
+            let expanded = contract
+                .file
+                .runtime
+                .get("outputs")
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|outputs| {
+                    outputs
+                        .iter()
+                        .any(|output| output.get("family").is_some_and(|family| !family.is_null()))
+                });
+            products.insert(path);
+            if expanded {
+                products.insert(phoxal_build::prepared_instance_dir(
+                    self.layout.root(),
+                    instance,
+                )?);
+            }
+        }
+        phoxal_build::publish_composition(
+            self.layout.root(),
+            &serde_json::to_value(&self.document).map_err(|error| Error::DeclarationCheck {
+                message: error.to_string(),
+            })?,
+            &self.inputs,
+            &products.into_iter().collect::<Vec<_>>(),
+        )?;
+        Ok(changes)
+    }
+
     /// Loads a project from already discovered canonical paths.
     pub fn from_layout(layout: ProjectLayout) -> Result<Self, Error> {
-        let text = std::fs::read_to_string(layout.robot_manifest()).map_err(|source| {
-            Error::ReadRobot {
-                path: layout.robot_manifest().to_owned(),
-                source,
-            }
-        })?;
-        let document = document::parse_and_validate(&text, layout.robot_manifest())?;
+        Self::from_layout_files(layout, &[])
+    }
+    fn from_layout_files(layout: ProjectLayout, files: &[PathBuf]) -> Result<Self, Error> {
+        let composition = composition::Composition::load(layout.root(), files)?;
+        let document = composition.document;
         let manifest_text = std::fs::read_to_string(layout.cargo_manifest()).map_err(|source| {
             Error::ReadManifest {
                 path: layout.cargo_manifest().to_owned(),
@@ -85,7 +154,11 @@ impl Project {
                 path: layout.cargo_manifest().to_owned(),
             });
         }
-        Ok(Self { layout, document })
+        Ok(Self {
+            layout,
+            document,
+            inputs: composition.inputs,
+        })
     }
 
     /// Prepares the authored Cargo graph and resolves all explicit sources.
@@ -94,7 +167,8 @@ impl Project {
     /// is acquired separately when assembling a bundle, never inserted into
     /// the robot's Rust dependency graph.
     pub fn prepare(&self, options: &CargoOptions) -> Result<PreparedProject, Error> {
-        let (_, document) = participant::prepare_graph(&self.layout, options, &self.document)?;
+        self.prepare_inputs(options)?;
+        let document = self.document.clone();
         let metadata = cargo::load_metadata_at(
             self.layout.cargo_manifest(),
             self.layout.root(),

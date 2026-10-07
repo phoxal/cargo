@@ -36,7 +36,39 @@ fn cargo_arguments(arguments: impl IntoIterator<Item = OsString>) -> Vec<OsStrin
     {
         arguments.remove(1);
     }
-    arguments
+    // Clap propagates a global Vec from one level only. Lift file selections
+    // before parsing so occurrences around the subcommand retain total order.
+    let mut lifted = Vec::new();
+    let mut retained = Vec::new();
+    let mut iterator = arguments.into_iter();
+    let Some(program) = iterator.next() else {
+        return Vec::new();
+    };
+    let mut tail = false;
+    while let Some(argument) = iterator.next() {
+        if argument == "--" {
+            tail = true;
+        }
+        if !tail && (argument == "-f" || argument == "--file") {
+            lifted.push(argument);
+            if let Some(value) = iterator.next() {
+                lifted.push(value);
+            }
+        } else if !tail
+            && argument.to_str().is_some_and(|value| {
+                value.starts_with("--file=")
+                    || (value.starts_with("-f") && value.len() > 2 && !value.starts_with("--"))
+            })
+        {
+            lifted.push(argument);
+        } else {
+            retained.push(argument);
+        }
+    }
+    std::iter::once(program)
+        .chain(lifted)
+        .chain(retained)
+        .collect()
 }
 
 fn explicit_path(invocation: &std::path::Path, path: &std::path::Path) -> PathBuf {
@@ -53,33 +85,60 @@ fn run(mut cli: Cli) -> Result<(), crate::project::Error> {
         source,
     })?;
     cli.normalize_executable_paths(&invocation);
+    let files: Vec<_> = cli
+        .files
+        .iter()
+        .map(|file| explicit_path(&invocation, file))
+        .collect();
+    if matches!(&cli.command, Command::Simulation(arguments) if arguments.build.is_some())
+        && !files.is_empty()
+    {
+        return Err(project::Error::DeclarationCheck {
+            message: "simulation --build cannot be combined with --file".into(),
+        });
+    }
+    let _operation_lock = if matches!(&cli.command, Command::Simulation(arguments) if arguments.build.is_some())
+        || matches!(&cli.command, Command::Config(_))
+    {
+        None
+    } else {
+        Some(project::participant::operation_lock(
+            project::ProjectLayout::discover(&invocation)?.root(),
+        )?)
+    };
     let command = cli.command;
     match command {
-        Command::Simulation(arguments) => run_simulation(arguments),
+        Command::Simulation(arguments) => run_simulation(arguments, &files),
         Command::Prepare(arguments) => {
             let options = arguments.options.into_options(Vec::new(), Vec::new());
-            let start = std::env::current_dir().map_err(|source| {
-                crate::project::Error::Discovery(crate::project::DiscoveryError::Resolve {
-                    path: ".".into(),
-                    source,
-                })
-            })?;
-            let layout = crate::project::ProjectLayout::discover(&start)
-                .map_err(crate::project::Error::Discovery)?;
-            let changes = crate::project::participant::prepare(&layout, &options)?;
+            let project = Project::discover_files(&invocation, &files)?;
+            let changes = project.prepare_inputs(&options)?;
             for change in changes {
                 eprintln!("prepared {change}");
             }
             Ok(())
         }
         command => {
-            let project = Project::discover(std::env::current_dir().map_err(|source| {
-                crate::project::Error::Discovery(crate::project::DiscoveryError::Resolve {
-                    path: ".".into(),
-                    source,
-                })
-            })?)?;
+            let project = Project::discover_files(&invocation, &files)?;
             match command {
+                Command::Config(arguments) => {
+                    let output = if arguments.json {
+                        serde_json::to_string_pretty(project.document()).map_err(|error| {
+                            project::Error::DeclarationCheck {
+                                message: error.to_string(),
+                            }
+                        })?
+                    } else {
+                        serde_yaml::to_string(project.document()).map_err(|source| {
+                            project::Error::ParseRobot {
+                                path: "resolved config".into(),
+                                source,
+                            }
+                        })?
+                    };
+                    println!("{output}");
+                    Ok(())
+                }
                 Command::Check(arguments) => run_cargo(
                     &project,
                     CargoOperation::Check,
@@ -328,6 +387,9 @@ fn print_bytes(bytes: &[u8], stderr: bool) {
     about = "Validate and build a Phoxal robot project"
 )]
 struct Cli {
+    /// Compose exactly these robot files in order (default: robot.yaml).
+    #[arg(short = 'f', long = "file", global = true)]
+    files: Vec<PathBuf>,
     #[command(subcommand)]
     command: Command,
 }
@@ -335,6 +397,7 @@ struct Cli {
 impl Cli {
     fn normalize_executable_paths(&mut self, invocation: &std::path::Path) {
         let controls = match &mut self.command {
+            Command::Config(_) => return,
             Command::Check(arguments) => &mut arguments.options.build,
             Command::Test(arguments) => &mut arguments.options.build,
             Command::Prepare(arguments) => &mut arguments.options,
@@ -355,6 +418,7 @@ impl Cli {
 
     fn json_diagnostics(&self) -> bool {
         match &self.command {
+            Command::Config(_) => false,
             Command::Check(arguments) => json_common(&arguments.options, &arguments.cargo_args),
             Command::Build(arguments) => {
                 json_format(arguments.options.message_format.as_deref(), &[])
@@ -378,6 +442,8 @@ impl Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Print the composed, authored-validated configuration without compilation.
+    Config(ConfigArgs),
     /// Prepare selected contracts and generated APIs.
     Prepare(PrepareArgs),
     /// Validate the project and selected APIs, then Cargo-check requested code.
@@ -392,6 +458,12 @@ enum Command {
     Simulation(SimulationArgs),
     /// Execute a standalone Rust scenario declared under scenarios/.
     Scenario(ScenarioArgs),
+}
+
+#[derive(Debug, Args)]
+struct ConfigArgs {
+    #[arg(long)]
+    json: bool,
 }
 
 #[derive(Debug, Args)]
@@ -447,7 +519,7 @@ fn positive_duration(value: &str) -> Result<std::time::Duration, String> {
     Ok(duration)
 }
 
-fn run_simulation(mut arguments: SimulationArgs) -> Result<(), project::Error> {
+fn run_simulation(mut arguments: SimulationArgs, files: &[PathBuf]) -> Result<(), project::Error> {
     use std::os::unix::process::CommandExt as _;
     let invocation = std::env::current_dir().map_err(|source| project::Error::ArtifactFile {
         path: ".".into(),
@@ -467,7 +539,7 @@ fn run_simulation(mut arguments: SimulationArgs) -> Result<(), project::Error> {
                     source,
                 })
             })?;
-            let project = Project::discover(start)?;
+            let project = Project::discover_files(&start, files)?;
             let mut options = arguments.options.into_options(Vec::new(), Vec::new());
             options.release = arguments.release;
             let (bundle, scene) = project.build_simulation(&options, &arguments.scene, None)?;

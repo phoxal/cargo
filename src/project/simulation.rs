@@ -1207,7 +1207,7 @@ mod tests {
         fs::write(
             root.join("robot.yaml"),
             format!(
-                "schema: phoxal/robot/v0\nrobot:\n  id: freeze-proof-robot\n  model: model.xml\n  components:\n    d1:\n      source:\n        path: {}\n      mount_site: front_left_wheel_mount\n      driver:\n        connection: {{ type: serial, port: /dev/ttyUSB0, baud: 115200 }}\n        config: {{ id: 1 }}\nbrain: {{}}\nservices: {{}}\nconnections:\n  - from: brain.actuators\n    to: d1.actuator\n  - from: d1.encoder\n    to: brain.encoders\nsupervisor:\n  source: {{ path: .fixture-supervisor }}\n  binary: phoxal-supervisor\n",
+                "schema: phoxal/robot/v0\nrobot:\n  id: freeze-proof-robot\n  model: model.xml\n  components:\n    d1:\n      source:\n        path: {}\n      mount_site: front_left_wheel_mount\n      driver:\n        config: {{ id: 1 }}\n        bindings:\n          actuator: brain.actuators\nbrain:\n  bindings:\n    encoders: d1.encoder\nservices: {{}}\nsupervisor:\n  source: {{ path: .fixture-supervisor }}\n  binary: phoxal-supervisor\n",
                 ddsm.display()
             ),
         )

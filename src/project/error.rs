@@ -122,15 +122,6 @@ pub enum ValidationError {
         /// Specific service error.
         message: String,
     },
-    /// A component driver declaration is not a mapping or has an invalid
-    /// authored configuration value.
-    #[error("robot.components.{component}.driver: {message}")]
-    InvalidDriver {
-        /// Component instance id.
-        component: String,
-        /// Specific driver error.
-        message: String,
-    },
 }
 
 /// A source-selection failure after Cargo has resolved the project graph.

@@ -34,8 +34,8 @@ sha2 = { "version" = "0.10.9" }
 tempfile = { "version" = "3.27.0" }
 thiserror = { "version" = "2.0.18" }
 toml = { "version" = "1" }
-phoxal = { "version" = "0.70.0", "default-features" = false, "features" = ["scenario"] }
-phoxal-build = { "version" = "0.70.0" }
+phoxal = { "version" = "0.71.0", "default-features" = false, "features" = ["scenario"] }
+phoxal-build = { "version" = "0.71.0" }
 
 [lints]
 

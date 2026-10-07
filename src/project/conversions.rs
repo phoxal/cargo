@@ -1,7 +1,7 @@
 //! Consume the actual conversion endpoints retained by the compiled brain.
 use super::Error;
 use phoxal::artifact::RuntimeRecord;
-use phoxal::artifact::document::{Connection, RobotDocument};
+use phoxal::artifact::document::RobotDocument;
 
 pub(crate) fn lower(
     authored: &RobotDocument,
@@ -9,31 +9,30 @@ pub(crate) fn lower(
 ) -> Result<RobotDocument, Error> {
     let RuntimeRecord::V0 { conversions, .. } = compiled;
     let mut executable = authored.clone();
-    let RobotDocument::V0 { connections, .. } = &mut executable;
+    let connections = authored.connection_sources();
     let mut consumers = std::collections::BTreeSet::new();
     for route in conversions {
-        let matching = connections
-            .iter()
-            .enumerate()
-            .filter(|(_, edge)| edge.to == route.consumer)
-            .collect::<Vec<_>>();
         if !consumers.insert(route.consumer.as_str())
-            || matching.len() != 1
-            || matching[0].1.from != route.producer
+            || connections.get(&route.consumer) != Some(&vec![route.producer.clone()])
         {
             return Err(Error::DeclarationCheck {
                 message: format!(
-                    "compiled conversion for {} does not match robot.yaml",
+                    "compiled conversion for {} does not match authored bindings",
                     route.consumer
                 ),
             });
         }
-        let index = matching[0].0;
-        connections[index].from = format!("brain.{}", route.output_endpoint);
-        connections.push(Connection {
-            from: route.producer.clone(),
-            to: format!("brain.{}", route.input_endpoint),
-        });
+        if !executable.set_binding(
+            &route.consumer,
+            vec![format!("brain.{}", route.output_endpoint)],
+        ) || !executable.set_binding(
+            &format!("brain.{}", route.input_endpoint),
+            vec![route.producer.clone()],
+        ) {
+            return Err(Error::DeclarationCheck {
+                message: "compiled conversion has no consuming runtime".into(),
+            });
+        }
     }
     Ok(executable)
 }
@@ -47,7 +46,8 @@ mod tests {
         let authored: RobotDocument = serde_json::from_value(serde_json::json!({
             "schema": "phoxal/robot/v0", "robot": { "id": "proof" },
             "supervisor": { "source": { "path": "supervisor" } },
-            "connections": [{"from": "source.status", "to": "receiver.capture"}]
+            "services": {"receiver": {"source": {"path": "receiver"}, "bindings": {"capture": "source.status"}}}
+
         }))
         .unwrap();
         let compiled: RuntimeRecord = serde_json::from_value(serde_json::json!({
@@ -59,36 +59,23 @@ mod tests {
             }]
         })).unwrap();
         let executable = lower(&authored, &compiled).unwrap();
-        let RobotDocument::V0 { connections, .. } = executable;
+        let connections = executable.connection_sources();
         assert_eq!(
-            connections
-                .iter()
-                .find(|edge| edge.to == "brain.actual_generated_in_47")
-                .unwrap()
-                .from,
-            "source.status"
+            connections["brain.actual_generated_in_47"],
+            ["source.status"]
         );
         assert_eq!(
-            connections
-                .iter()
-                .find(|edge| edge.to == "receiver.capture")
-                .unwrap()
-                .from,
-            "brain.actual_generated_out_23"
+            connections["receiver.capture"],
+            ["brain.actual_generated_out_23"]
         );
-        assert!(
-            !connections
-                .iter()
-                .any(|edge| edge.to == "brain.phoxal_conversion_in_0")
-        );
+        assert!(!connections.contains_key("brain.phoxal_conversion_in_0"));
         let mut changed = authored;
-        let RobotDocument::V0 { connections, .. } = &mut changed;
-        connections[0].from = "other.status".into();
+        changed.set_binding("receiver.capture", vec!["other.status".into()]);
         assert!(
             lower(&changed, &compiled)
                 .unwrap_err()
                 .to_string()
-                .contains("does not match robot.yaml")
+                .contains("does not match authored bindings")
         );
     }
 }

@@ -829,21 +829,16 @@ fn instance_config(prepared: &PreparedProject, instance: &str) -> InstanceConfig
         brain,
         ..
     } = prepared.document();
-    let _ = brain;
     let value = if instance == "brain" {
-        None
+        brain.as_ref().and_then(|brain| brain.config.clone())
     } else if let Some(service) = services.get(instance) {
         service.config.clone().filter(|config| !config.is_null())
     } else {
-        // A component driver's runtime configuration is the authored driver
-        // document's inner `config` object; its `connection` wiring stays in
-        // the authored project domain and never enters the resolved bundle.
         robot
             .components
             .get(instance)
             .and_then(|component| component.driver.as_ref())
-            .and_then(|driver| driver.get("config"))
-            .cloned()
+            .and_then(|driver| driver.config.clone())
             .filter(|config| !config.is_null())
     };
     value.map_or_else(InstanceConfig::absent, |value| {

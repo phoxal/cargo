@@ -71,16 +71,80 @@ Each command discovers the nearest robot project, validates explicit composition
 Pinned Git runnable participant packages install through Cargo into the managed Phoxal home outside the robot's dependency graph.
 The root Cargo graph contains the robot application and its genuine Rust library dependencies.
 
-Author delivery edges as explicit records:
+Author each relationship at its consuming runtime:
 
 ```yaml
-connections:
-  - from: motion.front_left_actuator
-    to: front_left_drive.actuator
+robot:
+  components:
+    front_left_drive:
+      source: {path: ../components/ddsm115}
+      mount_site: front_left_wheel_mount
+      driver:
+        bindings:
+          actuator: motion.front_left_actuator
+services:
+  motion:
+    source: {path: ../services/motion}
+    bindings:
+      manual: gamepad.intent
 ```
 
-Endpoint spelling stays `instance.endpoint`.
-Compiled contracts determine producer/consumer and request/reply roles; repeated destinations retain fan-in where that input contract supports it.
+A component owns source and mount_site, while its optional typed driver owns binary, config, and bindings.
+Omitting driver selects a passive component; driver: {} explicitly selects a runtime with no configuration or bindings.
+Services own source, optional binary, config, and bindings.
+The brain owns optional binary, config, and bindings and runs the root Cargo package's executable.
+Endpoint spelling stays instance.endpoint, without a driver path segment.
+Scalar bindings and source lists normalize to the same source-vector representation.
+Compiled contracts determine endpoint existence, requiredness, cardinality, calls, payloads, and lease compatibility.
+Latest and leased inputs accept one source; lists work only on contracts with existing fan-in support.
+No global authored connections or generic driver.connection exist.
+
+### Compose robot files
+
+Repeated global -f/--file arguments select exactly those files in order, without an implicit base.
+No file arguments means robot.yaml only.
+Every file declares schema: phoxal/robot/v0 and rejects duplicate YAML keys.
+Files may be incomplete; composition precedes strict final validation.
+Command file paths resolve against the invocation directory, while authored source/model/resource paths resolve against the discovered robot root.
+There is no automatic discovery, profile, import, host selection, or second robot configuration.
+
+```sh
+cargo phoxal config
+cargo phoxal -f robot.yaml -f robot.manual.yaml config --json
+cargo phoxal check -f robot.yaml -f robot.manual.yaml
+cargo phoxal prepare -f robot.yaml -f robot.manual.yaml
+```
+
+Config prints deterministic plain YAML (or --json) after authored validation, without compiling or acquiring packages.
+Check additionally validates the real compiled contracts.
+Mappings recursively merge; scalars and sequences replace, including [] for an empty list.
+Ordinary null remains null and undergoes final schema validation.
+An ordinary {} merges nothing; !replace {} clears a mapping.
+!delete removes a mapping entry, with absent deletion a no-op; !replace VALUE replaces a whole subtree.
+Operators in sequence positions, unknown operators, and valued !delete operators fail.
+Required data removed by a layer must be restored by a later layer or final validation fails.
+Lists never concatenate and dangling bindings are never silently removed.
+These tags are Phoxal tool semantics, not Docker semantics or standard YAML merge syntax.
+Resolved YAML/JSON contains no tags and remains interoperable.
+
+```yaml
+schema: phoxal/robot/v0
+services:
+  gamepad: !delete
+  motion:
+    source: !replace
+      path: ../services/motion
+    bindings:
+      manual: !delete
+```
+
+Prepare publishes the exact resolved composition alongside immutable snapshots of prepared contracts/descriptors.
+Ordinary Cargo and IDE reads consume that composition without rereading or merging robot.yaml.
+Editing a selected file requires preparation again; build scripts reject stale authored inputs.
+Each tool command independently resolves its default or explicit files and never inherits the preceding command's file list.
+Concurrent tool operations for the same project fail admission while another operation owns the project lock.
+Ordinary Cargo readers retain one immutable snapshot even while a later tool command prepares another composition.
+Build scripts invoke neither acquisition nor nested Cargo.
 
 `cargo phoxal check` prepares exact selections, builds the brain, validates compiled contracts and connections, then checks the robot code.
 For differently typed latest observations, the single generated API attaches normal brain endpoints and executes the robot's ordinary `From` or `TryFrom` conversion during that runtime's invocation.
@@ -148,7 +212,7 @@ An existing runnable directory bypasses robot discovery, Cargo, and source acqui
 cargo phoxal simulation /path/to/scene.xml --build /path/to/build --headless --duration 250ms
 ```
 
-`--build` cannot be combined with `--release`.
+`--build` cannot be combined with `--release` or `-f/--file`.
 The explicitly selected external scene still undergoes simulator-owned native admission.
 MuJoCo is user-managed; see the [simulator README](https://github.com/phoxal/simulator#readme) for discovery and controls.
 
@@ -173,6 +237,7 @@ Normal builds and installations use public dependencies without sibling checkout
 
 | Command | Purpose | Defaults and key options |
 | --- | --- | --- |
+| `config` | Print authored-validated resolved configuration | Plain YAML; `--json` |
 | `prepare` | Prepare selected contracts and generated APIs | Authored graph; advanced acquisition controls |
 | `check` | Check selected Rust code and validate composition | Cargo package/target selectors |
 | `test` | Run ordinary Rust tests | Cargo selectors; `--` for test-harness arguments |
