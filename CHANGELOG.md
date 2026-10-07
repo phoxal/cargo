@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0](https://github.com/phoxal/cargo/compare/cargo-phoxal-v0.3.0...cargo-phoxal-v0.4.0) - 2026-10-07
+
+### Added
+
+- [**breaking**] resolve nested robot documents and named sources
+
+### Other
+
+- make native and process fixtures explicit ([#6](https://github.com/phoxal/cargo/pull/6))
+
 ## [0.3.0](https://github.com/phoxal/cargo/compare/cargo-phoxal-v0.2.0...cargo-phoxal-v0.3.0) - 2026-10-07
 
 ### Added
