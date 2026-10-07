@@ -976,7 +976,7 @@ fn simulation_error(message: impl Into<String>) -> Error {
 
 /// A native-free executable fixture carrying the interfaces actually used by its scripted probe.
 #[cfg(test)]
-fn simulator_fixture(script: &std::path::Path) -> PathBuf {
+fn simulator_fixture(script: &std::path::Path, live_scene: Option<&std::path::Path>) -> PathBuf {
     use phoxal::artifact::application::*;
     let record = ApplicationContract {
         bundle: Some(BUNDLE_CONTRACT),
@@ -993,15 +993,10 @@ fn simulator_fixture(script: &std::path::Path) -> PathBuf {
         .join(",");
     let source = script.with_extension("rs");
     let executable = script.with_extension("fixture");
+    let live_scene = live_scene.map(|path| path.to_str().unwrap());
     let code = format!(
-        r##"
-#[used]
-#[cfg_attr(target_os = "macos", unsafe(link_section = "__DATA,__phoxal_app"))]
-#[cfg_attr(target_os = "linux", unsafe(link_section = ".phoxal_app"))]
-static RECORD: [u8; 512] = [{data}];
-fn main() {{ let status = std::process::Command::new("sh").arg({script:?}).args(std::env::args_os().skip(1)).status().unwrap(); std::process::exit(status.code().unwrap_or(1)); }}
-"##,
-        script = script.to_str().unwrap()
+        "#[used]\n#[cfg_attr(target_os = \"macos\", unsafe(link_section = \"__DATA,__phoxal_app\"))]\n#[cfg_attr(target_os = \"linux\", unsafe(link_section = \".phoxal_app\"))]\nstatic RECORD: [u8; 512] = [{data}];\nconst LIVE_SCENE: Option<&str> = {live_scene:?};\n{}",
+        include_str!("../../tests/fixtures/process/native_probe.rs")
     );
     std::fs::write(&source, code).unwrap();
     let output = std::process::Command::new("rustc")
@@ -1224,14 +1219,7 @@ mod tests {
 
         // A fake simulator whose probe reports the scene's content digest as
         // the model identity and the one expected provider set.
-        let simulator = root.join("fake-simulator.sh");
-        fs::write(
-            &simulator,
-            "#!/bin/sh\nif [ \"$1\" = stage-scene ]; then\n  mkdir -p \"$5\"\n  cp \"$3\" \"$5/$(basename \"$3\")\"\n  if [ -f \"$(dirname \"$3\")/part.xml\" ]; then cp \"$(dirname \"$3\")/part.xml\" \"$5/part.xml\"; fi\n  exit 0\nfi\n# fake probe: identity = sha256 of the received (frozen) scene;\n# the probe then mutates the LIVE scene so a reread would differ.\nscene=\"$2\"\nidentity=$(shasum -a 256 \"$scene\" 2>/dev/null | cut -d' ' -f1)\nif [ -n \"$FAKE_LIVE_SCENE\" ]; then\n  printf '<mujoco model=\"probe-mutated\"/>' > \"$FAKE_LIVE_SCENE\"\nfi\nprintf '{\"model_identity\":\"%s\",\"quantum_ns\":10000000,\"providers\":[{\"rate_microhertz\":50000000,\"service_instance\":\"d1\",\"port\":\"encoder\",\"shape\":\"observation\",\"retained_latest\":false,\"lease_valid_for_ms\":null,\"input_fqn\":\"google.protobuf.Empty\",\"payload_fqn\":\"phoxal.robotics.v1.EncoderSample\"}],\"actuation_bindings\":[{\"service_instance\":\"brain\",\"port\":\"actuators\",\"payload_fqn\":\"phoxal.component.actuator.v1.ActuatorCommand\",\"actuator_ids\":[\"d1.motor\"]}]}' \"$identity\"\n",
-        )
-        .expect("write fake simulator");
-        make_executable(&simulator);
-
+        let simulator = root.join("fake-simulator");
         // A staged fixture supervisor source: the robot's authored
         // selection acquires it through the ordinary Cargo install path
         // during preparation, and its binary embeds the pinned application
@@ -1242,17 +1230,74 @@ mod tests {
         // forwarding to the underlying cargo.
         let log = root.join("cargo-invocations.log");
         let real_cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_owned());
-        let wrapper = root.join("cargo-wrapper.sh");
+        let wrapper = root.join("cargo-wrapper");
+        let source = wrapper.with_extension("rs");
         fs::write(
-            &wrapper,
+            &source,
             format!(
-                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"{log}\"\nexec \"{real_cargo}\" \"$@\"\n",
-                log = log.display()
+                "const LOG: &str = {log:?};\nconst REAL_CARGO: &str = {real_cargo:?};\n{}",
+                include_str!("../../tests/fixtures/process/cargo_wrapper.rs")
             ),
         )
         .expect("write cargo wrapper");
-        make_executable(&wrapper);
+        let output = std::process::Command::new("rustc")
+            .args(["--edition=2024", "--crate-name", "cargo_wrapper"])
+            .arg(&source)
+            .arg("-o")
+            .arg(&wrapper)
+            .output()
+            .expect("compile cargo wrapper");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
         (guard, scene, simulator, wrapper)
+    }
+
+    #[test]
+    fn native_fixture_staging_and_digest_preserve_special_paths() {
+        use sha2::{Digest, Sha256};
+        let root = tempfile::tempdir().expect("isolated fixture");
+        let executable = simulator_fixture(&root.path().join("probe"), None);
+        for name in [
+            "scene with spaces.xml",
+            "scene\"quote.xml",
+            r"scene\name.xml",
+            "scene\nname.xml",
+        ] {
+            let source_dir = root.path().join(name);
+            fs::create_dir(&source_dir).unwrap();
+            let scene = source_dir.join(name);
+            fs::write(&scene, b"test").unwrap();
+            fs::write(source_dir.join("part.xml"), b"included").unwrap();
+            let staged = source_dir.join("staged");
+            let output = std::process::Command::new(&executable)
+                .args(["stage-scene", "--scene"])
+                .arg(&scene)
+                .arg("--output")
+                .arg(&staged)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(fs::read(staged.join(name)).unwrap(), b"test");
+            assert_eq!(fs::read(staged.join("part.xml")).unwrap(), b"included");
+            let output = std::process::Command::new(&executable)
+                .arg("probe")
+                .arg(staged.join(name))
+                .output()
+                .unwrap();
+            assert!(output.status.success());
+            let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+            assert_eq!(
+                value["model_identity"],
+                format!("{:x}", Sha256::digest(b"test"))
+            );
+        }
     }
 
     /// One lexical relative path from `from` (a directory) to `to`.
@@ -1326,16 +1371,6 @@ mod tests {
         );
     }
 
-    #[cfg(test)]
-    fn make_executable(path: &Path) {
-        use std::os::unix::fs::PermissionsExt;
-        let mut permissions = fs::metadata(path)
-            .expect("stat fixture executable")
-            .permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(path, permissions).expect("chmod fixture executable");
-    }
-
     fn invocation_count(log: &Path) -> usize {
         fs::read_to_string(log)
             .map(|content| content.lines().filter(|line| !line.is_empty()).count())
@@ -1357,19 +1392,7 @@ mod tests {
         let options = freeze_options(&wrapper);
         // The probe mutates the live scene after the freeze: the frozen
         // bytes the probe measures and the closure finalizes must agree.
-        // The launched executable is a wrapper exporting the live path for
-        // the fake probe, keeping the test's own environment untouched.
-        let wrapper = root.join("fake-simulator-entry.sh");
-        fs::write(
-            &wrapper,
-            format!(
-                "#!/bin/sh\nexport FAKE_LIVE_SCENE=\"{scene}\"\nexec \"{simulator}\" \"$@\"\n",
-                scene = scene.display(),
-                simulator = simulator.display(),
-            ),
-        )
-        .expect("write simulator entry wrapper");
-        let wrapper = crate::project::simulation::simulator_fixture(&wrapper);
+        let wrapper = crate::project::simulation::simulator_fixture(&simulator, Some(&scene));
         let request = SimulationRunOptions::new(
             scene.clone(),
             SimulationPresentation::Headless,
@@ -1559,7 +1582,9 @@ mod tests {
             SimulationBound::Steps(4),
         )
         .expect("request")
-        .with_simulator_executable(crate::project::simulation::simulator_fixture(&simulator));
+        .with_simulator_executable(crate::project::simulation::simulator_fixture(
+            &simulator, None,
+        ));
         let second = prepare_simulation(&project, &options, &request)
             .expect("a fresh preparation sees the mutated inputs");
         assert_ne!(
