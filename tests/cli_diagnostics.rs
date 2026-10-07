@@ -18,11 +18,7 @@ fn nested_invocation_normalizes_cargo_paths_and_honors_json_diagnostics() {
     fs::write(root.join("src/main.rs"), "fn main() {}\n").unwrap();
     fs::write(root.join("robot.yaml"), "schema: phoxal/robot/v0\nrobot: { id: path-review }\nsupervisor: { source: { path: ../supervisor } }\n").unwrap();
     let wrapper = nested.join("my cargo");
-    fs::write(
-        &wrapper,
-        "#!/bin/sh\necho REVIEW_CARGO_EXECUTED >&2\nexit 19\n",
-    )
-    .unwrap();
+    fs::write(&wrapper, include_str!("fixtures/process/diagnostic.sh")).unwrap();
     fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o755)).unwrap();
     for command in [vec!["check"], vec!["scenario", "missing.rs"]] {
         let output = Command::new(env!("CARGO_BIN_EXE_cargo-phoxal"))
