@@ -104,7 +104,6 @@ fn nested_invocation_normalizes_cargo_paths_and_honors_json_diagnostics() {
 #[test]
 fn human_feedback_is_flushed_while_metadata_is_blocked_and_json_stays_unstyled() {
     use std::{
-        io::Write,
         os::unix::net::UnixStream,
         process::Stdio,
         time::{Duration, Instant},
@@ -172,10 +171,7 @@ fn human_feedback_is_flushed_while_metadata_is_blocked_and_json_stays_unstyled()
         } else {
             assert!(blocked.starts_with(b"Check: Starting.\n"));
         }
-        UnixStream::connect(root.path().join("release.sock"))
-            .unwrap()
-            .write_all(b"release")
-            .unwrap();
+        UnixStream::connect(root.path().join("release.sock")).unwrap();
         while child.0.try_wait().unwrap().is_none() {
             assert!(Instant::now() < deadline, "metadata failure did not reap");
             std::thread::sleep(Duration::from_millis(20));

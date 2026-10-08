@@ -63,7 +63,7 @@ impl Drop for Owned {
 }
 #[test]
 fn actual_pty_blocked_feedback_clears_before_error_and_resize_uses_plain_lines() {
-    use std::{io::Write, os::unix::net::UnixStream};
+    use std::os::unix::net::UnixStream;
     let root = tempfile::tempdir().unwrap();
     fs::write(
         root.path().join("Cargo.toml"),
@@ -132,10 +132,7 @@ fn actual_pty_blocked_feedback_clears_before_error_and_resize_uses_plain_lines()
             terminal.until("Check: Starting.", 3);
             assert!(!terminal.bytes.contains(&27));
         }
-        UnixStream::connect(root.path().join("release.sock"))
-            .unwrap()
-            .write_all(b"release")
-            .unwrap();
+        UnixStream::connect(root.path().join("release.sock")).unwrap();
         assert_eq!(owner.finish().code(), Some(1));
         terminal.drain();
         let text = String::from_utf8_lossy(&terminal.bytes);
@@ -156,6 +153,7 @@ fn actual_build_stdout_and_check_diagnostics_have_no_live_renderer_interleaving(
         command
             .current_dir(&root)
             .env_remove("CARGO_TARGET_DIR")
+            .env("CARGO_TERM_COLOR", "always")
             .args([operation, "--offline"]);
         let mut terminal = Pty::attach(&mut command, 100);
         let mut owner = Owned::spawn(&mut command);
@@ -185,10 +183,21 @@ fn actual_build_stdout_and_check_diagnostics_have_no_live_renderer_interleaving(
             .split(boundary)
             .nth(1)
             .unwrap_or_else(|| panic!("missing permanent result {boundary}: {text}"));
-        assert!(
-            !permanent.contains('\u{1b}'),
-            "live renderer crossed permanent stdout/stderr boundary"
-        );
+        assert_renderer_stopped(permanent);
+        if operation == "check" {
+            assert!(
+                permanent.contains("\x1b[0m"),
+                "delegated Cargo SGR was not retained: {permanent:?}"
+            );
+        }
+        // Mutate the actual captured child tail with an owned live frame;
+        // legitimate delegated ANSI must pass, but renderer revival must fail.
+        let plain = format!("{permanent}Check: Still working - 5s elapsed.\r\n");
+        assert_renderer_stopped(&plain);
+        for mutation in ["\r\x1b[2K", "Check: | Still working - 0s elapsed."] {
+            let revived = format!("{plain}{mutation}");
+            assert!(std::panic::catch_unwind(|| assert_renderer_stopped(&revived)).is_err());
+        }
         assert!(text.contains(&format!(
             "{}: Completed.",
             if operation == "build" {
@@ -199,4 +208,16 @@ fn actual_build_stdout_and_check_diagnostics_have_no_live_renderer_interleaving(
         )));
         println!("Actual shared Cargo PTY {operation}: {text:?}");
     }
+}
+
+fn assert_renderer_stopped(permanent: &str) {
+    assert!(
+        !permanent.contains("\x1b[2K")
+            && !["Build", "Check"].iter().any(|label| {
+                ['|', '/', '-', '\\']
+                    .iter()
+                    .any(|frame| permanent.contains(&format!("{label}: {frame} Still working -")))
+            }),
+        "owned live renderer crossed permanent boundary: {permanent:?}"
+    );
 }
