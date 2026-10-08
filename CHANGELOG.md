@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.1](https://github.com/phoxal/cargo/compare/cargo-phoxal-v0.4.0...cargo-phoxal-v0.4.1) - 2026-10-08
+
+### Added
+
+- report command progress without obscuring output
+
+### Other
+
+- include explicit native setup before simulation ([#11](https://github.com/phoxal/cargo/pull/11))
+- name published source-reference support
+
 ## [0.4.0](https://github.com/phoxal/cargo/compare/cargo-phoxal-v0.3.0...cargo-phoxal-v0.4.0) - 2026-10-07
 
 ### Added
