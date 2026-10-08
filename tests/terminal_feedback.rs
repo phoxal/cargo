@@ -41,7 +41,7 @@ impl Drop for Owned {
         }
         let group = format!("-{}", self.0.id());
         let _ = Command::new("/bin/kill")
-            .args(["-TERM", &group])
+            .args(["-TERM", "--", &group])
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status();
@@ -50,7 +50,7 @@ impl Drop for Owned {
             std::thread::park_timeout(Duration::from_millis(10));
         }
         let _ = Command::new("/bin/kill")
-            .args(["-KILL", &group])
+            .args(["-KILL", "--", &group])
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status();
@@ -153,7 +153,10 @@ fn actual_build_stdout_and_check_diagnostics_have_no_live_renderer_interleaving(
     let (_guard, root) = support::stage("check-valid");
     for operation in ["build", "check"] {
         let mut command = Command::new(env!("CARGO_BIN_EXE_cargo-phoxal"));
-        command.current_dir(&root).args([operation, "--offline"]);
+        command
+            .current_dir(&root)
+            .env_remove("CARGO_TARGET_DIR")
+            .args([operation, "--offline"]);
         let mut terminal = Pty::attach(&mut command, 100);
         let mut owner = Owned::spawn(&mut command);
         // Drain while the compiler runs, so its PTY cannot fill while reaping.

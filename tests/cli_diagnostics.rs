@@ -21,7 +21,9 @@ impl Drop for Owned {
     fn drop(&mut self) {
         use std::time::{Duration, Instant};
         let group = format!("-{}", self.0.id());
-        let _ = Command::new("/bin/kill").args(["-TERM", &group]).output();
+        let _ = Command::new("/bin/kill")
+            .args(["-TERM", "--", &group])
+            .output();
         let deadline = Instant::now() + Duration::from_secs(2);
         loop {
             match self.0.try_wait() {
@@ -30,7 +32,9 @@ impl Drop for Owned {
                     std::thread::sleep(Duration::from_millis(10))
                 }
                 _ => {
-                    let _ = Command::new("/bin/kill").args(["-KILL", &group]).output();
+                    let _ = Command::new("/bin/kill")
+                        .args(["-KILL", "--", &group])
+                        .output();
                     let _ = self.0.kill();
                     let forced_deadline = Instant::now() + Duration::from_secs(2);
                     while matches!(self.0.try_wait(), Ok(None)) && Instant::now() < forced_deadline
@@ -331,6 +335,9 @@ fn assertion_unwind_reaps_the_blocked_cli_and_metadata_process_group() {
         .unwrap()
         .parse()
         .unwrap();
+    assert_eq!(unsafe { libc::getpgid(parent as i32) }, parent as i32);
+    assert_eq!(unsafe { libc::getpgid(metadata as i32) }, parent as i32);
+    assert_ne!(unsafe { libc::getpgrp() }, parent as i32);
     let failure = std::panic::catch_unwind(move || {
         let _owned = owned;
         panic!("deliberate assertion-failure cleanup qualification");
