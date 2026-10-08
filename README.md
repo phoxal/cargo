@@ -203,6 +203,9 @@ Cargo package, workspace, and test-target selectors apply only to `check` and `t
 Whole-robot commands do not accept an arbitrary Cargo argument tail.
 `test -- <arguments>` passes ordinary Rust test-harness arguments.
 In JSON compiler-message mode, compiler JSON remains on stdout and Phoxal progress and structured project diagnostics remain on stderr.
+Owned human feedback uses a compact live line on supported interactive terminals, with plain feedback for CI, redirected, dumb or narrow terminals.
+Feedback switches to plain output before permanent results or forwarded diagnostics; commands that hand the terminal to another process use plain feedback throughout.
+Human live feedback is disabled in structured-output modes.
 
 The root project declares its ordinary `phoxal` SDK dependency; the supervisor is not a robot dependency.
 The required `supervisor.source` in `robot.yaml` uses the same local path or pinned Git selection as participants, with an optional binary selector.

@@ -370,10 +370,17 @@ fn probe_snapshot(
         probe_bundle.root(),
         request,
     )?;
-    eprintln!(
-        "cargo phoxal: simulation prepared from one native probe (model {}, quantum {} ns)",
-        facts.model_identity, facts.quantum_ns
-    );
+    if crate::json_requested(cargo_options) {
+        eprintln!(
+            "cargo phoxal: simulation prepared from one native probe (model {}, quantum {} ns)",
+            facts.model_identity, facts.quantum_ns
+        );
+    } else {
+        eprintln!(
+            "Simulation: Native model prepared (model {}, quantum {} ns).",
+            facts.model_identity, facts.quantum_ns
+        );
+    }
     Ok(PreparedSimulation {
         cargo_options: cargo_options.clone(),
         prepared,
@@ -428,7 +435,11 @@ pub(crate) fn finalize_prepared(
         Some(&snapshot.facts),
         scenario.map(|program| crate::project::bundle::SimulationRunInput { program }),
     )?;
-    eprintln!("cargo phoxal: finalizing the simulation bundle from the prepared snapshot");
+    if crate::json_requested(&snapshot.cargo_options) {
+        eprintln!("cargo phoxal: finalizing the simulation bundle from the prepared snapshot");
+    } else {
+        eprintln!("Simulation: Runnable build prepared.");
+    }
     Ok(bundle)
 }
 
