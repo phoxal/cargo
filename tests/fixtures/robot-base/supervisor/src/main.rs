@@ -7,4 +7,4 @@ const APPLICATION_CONTRACT: ApplicationContract = ApplicationContract { bundle: 
 #[cfg_attr(target_os = "macos", unsafe(link_section = "__DATA,__phoxal_app"))]
 #[cfg_attr(target_os = "linux", unsafe(link_section = ".phoxal_app"))]
 static EMBEDDED_APPLICATION_CONTRACT: [u8; APPLICATION_RECORD_BYTES] = encode_application_contract(&APPLICATION_CONTRACT);
-fn main() { println!("phoxal-supervisor 0.0.0-dev.8"); }
+fn main() { std::hint::black_box(&EMBEDDED_APPLICATION_CONTRACT); println!("phoxal-supervisor 0.0.0-dev.8"); }

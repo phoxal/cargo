@@ -7,6 +7,7 @@ use std::process::ExitCode;
 
 use clap::{Args, Parser, Subcommand};
 
+mod feedback;
 mod project;
 
 use project::{
@@ -18,7 +19,33 @@ fn main() -> ExitCode {
     let arguments = cargo_arguments(std::env::args_os());
     let cli = Cli::parse_from(arguments);
     let json_diagnostics = cli.json_diagnostics();
-    match run(cli) {
+    let label = if json_diagnostics {
+        None
+    } else {
+        match &cli.command {
+            Command::Config(_) | Command::Simulation(_) => None,
+            Command::Prepare(_) => Some("Prepare"),
+            Command::Check(_) => Some("Check"),
+            Command::Build(_) => Some("Build"),
+            Command::Run(_) => Some("Run"),
+            Command::Test(_) => Some("Test"),
+            Command::Scenario(_) => Some("Scenario"),
+        }
+    };
+    let result = match label {
+        Some(label) => {
+            // Run and Scenario can inherit child terminal output internally.
+            let live = !matches!(&cli.command, Command::Run(_) | Command::Scenario(_));
+            feedback::run(label, live, |progress| run(cli, Some(progress)))
+        }
+        None => run(cli, None),
+    };
+    if result.is_ok()
+        && let Some(label) = label
+    {
+        feedback::line(&format!("{label}: Completed."));
+    }
+    match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             print_error(&error, json_diagnostics);
@@ -79,7 +106,10 @@ fn explicit_path(invocation: &std::path::Path, path: &std::path::Path) -> PathBu
     }
 }
 
-fn run(mut cli: Cli) -> Result<(), crate::project::Error> {
+fn run(
+    mut cli: Cli,
+    progress: Option<&feedback::Progress<'_>>,
+) -> Result<(), crate::project::Error> {
     let invocation = std::env::current_dir().map_err(|source| project::Error::ArtifactFile {
         path: ".".into(),
         source,
@@ -113,8 +143,15 @@ fn run(mut cli: Cli) -> Result<(), crate::project::Error> {
             let options = arguments.options.into_options(Vec::new(), Vec::new());
             let project = Project::discover_files(&invocation, &files)?;
             let changes = project.prepare_inputs(&options)?;
+            if let Some(progress) = progress {
+                progress.suspend();
+            }
             for change in changes {
-                eprintln!("prepared {change}");
+                if json_requested(&options) {
+                    eprintln!("prepared {change}");
+                } else {
+                    feedback::line(&format!("Prepare: Updated {change}."));
+                }
             }
             Ok(())
         }
@@ -143,6 +180,7 @@ fn run(mut cli: Cli) -> Result<(), crate::project::Error> {
                     &project,
                     CargoOperation::Check,
                     arguments.into_options(Vec::new()),
+                    progress,
                 ),
                 Command::Build(arguments) => {
                     let invocation =
@@ -167,6 +205,9 @@ fn run(mut cli: Cli) -> Result<(), crate::project::Error> {
                             .join(format!("{}.zip", robot.id))
                     });
                     bundle.archive(&archive)?;
+                    if let Some(progress) = progress {
+                        progress.suspend();
+                    }
                     print_status(
                         &options,
                         &format!("runnable build: {}", bundle.root().display()),
@@ -185,7 +226,7 @@ fn run(mut cli: Cli) -> Result<(), crate::project::Error> {
                     );
                     Ok(())
                 }
-                Command::Test(arguments) => run_test(&project, arguments),
+                Command::Test(arguments) => run_test(&project, arguments, progress),
                 Command::Scenario(arguments) => {
                     let mut options = arguments.options.into_options(Vec::new(), Vec::new());
                     options.release = arguments.release;
@@ -217,6 +258,7 @@ fn run_cargo(
     project: &Project,
     operation: CargoOperation,
     options: CargoOptions,
+    progress: Option<&feedback::Progress<'_>>,
 ) -> Result<(), crate::project::Error> {
     let json = json_requested(&options);
     let mut preparation_options = options.clone();
@@ -226,9 +268,19 @@ fn run_cargo(
     }
     let prepared = project.prepare(&preparation_options)?;
     let outputs = match operation {
-        CargoOperation::Check => prepared.check(&options)?,
+        CargoOperation::Check => {
+            // Declaration validation emits permanent stderr before the final
+            // captured Cargo output. Yield the terminal before that boundary.
+            if let Some(progress) = progress {
+                progress.suspend();
+            }
+            prepared.check(&options)?
+        }
         CargoOperation::Test | CargoOperation::Build => prepared.run(operation, &options)?,
     };
+    if let Some(progress) = progress {
+        progress.suspend();
+    }
     for output in outputs {
         print_bytes(&output.stdout, false);
         print_bytes(&output.stderr, true);
@@ -239,7 +291,11 @@ fn run_cargo(
     Ok(())
 }
 
-fn run_test(project: &Project, arguments: TestArgs) -> Result<(), crate::project::Error> {
+fn run_test(
+    project: &Project,
+    arguments: TestArgs,
+    progress: Option<&feedback::Progress<'_>>,
+) -> Result<(), crate::project::Error> {
     let TestArgs {
         options,
         filter,
@@ -257,6 +313,7 @@ fn run_test(project: &Project, arguments: TestArgs) -> Result<(), crate::project
         project,
         CargoOperation::Test,
         options.into_options(cargo_args, test_args),
+        progress,
     )
 }
 
@@ -299,7 +356,21 @@ fn json_format(explicit: Option<&str>, arguments: &[OsString]) -> bool {
 
 fn print_error(error: &crate::project::Error, json: bool) {
     if !json {
-        eprintln!("error: {error:#}");
+        feedback::line(&format!("error: {error:#}"));
+        match error {
+            project::Error::Discovery(project::DiscoveryError::MissingRobot { .. }) => {
+                feedback::line(
+                    "Next: run this command from a robot project containing robot.yaml and Cargo.toml.",
+                )
+            }
+            project::Error::Discovery(project::DiscoveryError::MissingManifest { .. }) => {
+                feedback::line("Next: restore the robot's root Cargo.toml, then retry.")
+            }
+            project::Error::ReadRobot { .. } | project::Error::ParseRobot { .. } => feedback::line(
+                "Next: correct the selected robot file, then inspect it with cargo phoxal config.",
+            ),
+            _ => {}
+        }
         return;
     }
     let span = diagnostic_path(error).map(|path| {
@@ -542,7 +613,14 @@ fn run_simulation(mut arguments: SimulationArgs, files: &[PathBuf]) -> Result<()
             let project = Project::discover_files(&start, files)?;
             let mut options = arguments.options.into_options(Vec::new(), Vec::new());
             options.release = arguments.release;
-            let (bundle, scene) = project.build_simulation(&options, &arguments.scene, None)?;
+            let (bundle, scene) = if json_requested(&options) {
+                project.build_simulation(&options, &arguments.scene, None)?
+            } else {
+                feedback::run("Simulation", false, |_| {
+                    project.build_simulation(&options, &arguments.scene, None)
+                })?
+            };
+
             (bundle.root().to_owned(), scene)
         }
     };
