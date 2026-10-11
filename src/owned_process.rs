@@ -93,6 +93,9 @@ struct Process {
     parent: i32,
     group: i32,
     birth: String,
+    // Linux stat state is independent of ptrace-gated capability inspection.
+    state: Option<char>,
+    terminal: bool,
 }
 #[cfg(target_os = "macos")]
 fn processes() -> io::Result<BTreeMap<i32, Process>> {
@@ -143,6 +146,8 @@ fn processes() -> io::Result<BTreeMap<i32, Process>> {
                 parent: info.pbi_ppid as i32,
                 group: info.pbi_pgid as i32,
                 birth: format!("{}:{}", info.pbi_start_tvsec, info.pbi_start_tvusec),
+                state: None,
+                terminal: false,
             },
         );
     }
@@ -188,6 +193,8 @@ fn processes() -> io::Result<BTreeMap<i32, Process>> {
                     parent,
                     group,
                     birth: fields[19].to_owned(),
+                    state: fields[0].chars().next(),
+                    terminal: linux_terminal_group(pid, fields[0]),
                 },
             );
         }
@@ -198,6 +205,34 @@ fn processes() -> io::Result<BTreeMap<i32, Process>> {
         ));
     }
     Ok(table)
+}
+// A zombie group leader can still have executing sibling threads. Refuse to
+// infer terminal capability state unless every kernel task is terminal too.
+#[cfg(target_os = "linux")]
+fn linux_terminal_group(pid: i32, state: &str) -> bool {
+    if !matches!(state, "Z" | "X" | "x") {
+        return false;
+    }
+    let Ok(tasks) = std::fs::read_dir(format!("/proc/{pid}/task")) else {
+        return false;
+    };
+    let mut found = false;
+    for task in tasks {
+        let Ok(task) = task else {
+            return false;
+        };
+        let Ok(stat) = std::fs::read_to_string(task.path().join("stat")) else {
+            return false;
+        };
+        let Some((_, fields)) = stat.rsplit_once(") ") else {
+            return false;
+        };
+        if !matches!(fields.split_whitespace().next(), Some("Z" | "X" | "x")) {
+            return false;
+        }
+        found = true;
+    }
+    found
 }
 // Two independent inherited markers cover helpers that close inherited file
 // descriptors or rebuild their environment. Detaching and erasing both before
@@ -392,6 +427,12 @@ fn vanished(error: io::Error) -> io::Result<bool> {
         Err(error)
     }
 }
+// Only kernel-confirmed terminal tasks cannot retain or propagate a capability.
+// This is not absence: previously owned terminal identities still require reaping
+// and remain in Owner::known until finish verifies their disappearance.
+fn capability_inspection_required(process: &Process, current: Option<&Process>) -> bool {
+    current.is_some_and(|current| current.birth == process.birth && !current.terminal)
+}
 struct Owner {
     child: std::process::Child,
     group: i32,
@@ -426,10 +467,7 @@ impl Owner {
                 if ownership.is_ok() {
                     break;
                 }
-                if !processes()?
-                    .get(&pid)
-                    .is_some_and(|p| p.birth == process.birth)
-                {
+                if !capability_inspection_required(process, processes()?.get(&pid)) {
                     ownership = Ok(false);
                     break;
                 }
@@ -442,14 +480,14 @@ impl Owner {
                 }
                 Ok(false) => {}
                 Err(e) => {
-                    // procargs/fd inspection can race exit; a vanished or
-                    // replaced identity cannot retain this capability.
-                    if processes()?
-                        .get(&pid)
-                        .is_some_and(|p| p.birth == process.birth)
-                    {
+                    // Re-read kernel identity/state after failed inspection.
+                    // EACCES alone never establishes absence or ownership.
+                    let current = processes()?;
+                    if capability_inspection_required(process, current.get(&pid)) {
+                        let current = &current[&pid];
                         return Err(io::Error::other(format!(
-                            "cannot verify owned subprocess ownership for PID {pid}: {e}"
+                            "cannot verify owned subprocess ownership for PID {pid} (birth {}, state {:?}, parent {}, group {}): {e}",
+                            current.birth, current.state, current.parent, current.group
                         )));
                     }
                 }
@@ -875,6 +913,112 @@ fn capture(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn failed_capability_inspection_requires_live_birth_qualified_identity() {
+        let process = Process {
+            parent: 1,
+            group: 2,
+            birth: "original".into(),
+            state: Some('S'),
+            terminal: false,
+        };
+        assert!(capability_inspection_required(&process, Some(&process)));
+        for state in ['R', 'S', 'D', 'T', 't', 'I'] {
+            let current = Process {
+                state: Some(state),
+                terminal: matches!(state, 'Z' | 'X' | 'x'),
+                ..process.clone()
+            };
+            assert!(capability_inspection_required(&process, Some(&current)));
+        }
+        for state in ['Z', 'X', 'x'] {
+            let current = Process {
+                state: Some(state),
+                terminal: matches!(state, 'Z' | 'X' | 'x'),
+                ..process.clone()
+            };
+            assert!(!capability_inspection_required(&process, Some(&current)));
+        }
+        let live_threads = Process {
+            state: Some('Z'),
+            terminal: false,
+            ..process.clone()
+        };
+        assert!(capability_inspection_required(
+            &process,
+            Some(&live_threads)
+        ));
+        let replaced = Process {
+            birth: "replacement".into(),
+            ..process.clone()
+        };
+        assert!(!capability_inspection_required(&process, Some(&replaced)));
+        assert!(!capability_inspection_required(&process, None));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_terminal_task_is_not_confused_with_live_inspection_failure() {
+        // Keep an actual exited child unreaped so /proc still proves its birth
+        // and Z state, independently of environ/fd permission transitions.
+        let mut child = Command::new("/usr/bin/true").spawn().unwrap();
+        let pid = child.id() as i32;
+        let start = Instant::now();
+        let zombie = loop {
+            let table = processes().unwrap();
+            if let Some(process) = table.get(&pid)
+                && process.state == Some('Z')
+            {
+                break process.clone();
+            }
+            assert!(start.elapsed() < Duration::from_secs(3));
+            std::thread::sleep(Duration::from_millis(2));
+        };
+        assert!(!capability_inspection_required(
+            &zombie,
+            processes().unwrap().get(&pid)
+        ));
+        let capability = Capability::new().unwrap();
+        let inspection = capability.matches(pid);
+        eprintln!(
+            "unreaped child pid={pid} birth={} state={:?} terminal={} capability={inspection:?}",
+            zombie.birth, zombie.state, zombie.terminal
+        );
+        assert!(zombie.terminal);
+        let direct = Command::new("/bin/sleep")
+            .arg("10")
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let group = direct.id() as i32;
+        let mut owner = Owner {
+            child: direct,
+            group,
+            known: BTreeMap::new(),
+            done: false,
+            capability: Capability::new().unwrap(),
+            baseline: BTreeMap::new(),
+            cleanup_timeout: Duration::from_secs(2),
+            cleanup_started: None,
+        };
+        owner.observe(&processes().unwrap()).unwrap();
+        assert!(
+            !owner.known.contains_key(&pid),
+            "an unknown zombie is not adopted"
+        );
+        // A previously observed owned zombie must remain owned, and finish
+        // must reap it rather than declare it absent from its terminal state.
+        owner.known.insert(pid, zombie.birth.clone());
+        owner.observe(&processes().unwrap()).unwrap();
+        assert_eq!(owner.known.get(&pid), Some(&zombie.birth));
+        owner.finish().unwrap();
+        assert_eq!(child.wait().unwrap_err().raw_os_error(), Some(libc::ECHILD));
+        assert!(!processes().unwrap().contains_key(&pid));
+        let current = processes().unwrap();
+        let live = &current[&(std::process::id() as i32)];
+        assert!(capability_inspection_required(live, Some(live)));
+    }
     static PRIOR_CALLED: AtomicBool = AtomicBool::new(false);
     extern "C" fn prior_handler(_: libc::c_int) {
         PRIOR_CALLED.store(true, Ordering::SeqCst);
@@ -979,8 +1123,32 @@ mod tests {
             0
         );
         assert_eq!(before.sa_sigaction, after.sa_sigaction);
+        // glibc x86_64 adds its rt_sigreturn trampoline on every sigaction
+        // install, even when restoring a kernel default action with flags=0.
+        // Compare all public flags exactly and retain an existing restorer.
+        #[cfg(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64"))]
+        {
+            const SA_RESTORER: i32 = 0x04000000;
+            assert_eq!(
+                before.sa_flags & !SA_RESTORER,
+                after.sa_flags & !SA_RESTORER
+            );
+            assert_ne!(after.sa_flags & SA_RESTORER, 0);
+            assert!(after.sa_restorer.is_some());
+            if before.sa_flags & SA_RESTORER != 0 {
+                assert_eq!(
+                    before.sa_restorer.map(|restorer| restorer as usize),
+                    after.sa_restorer.map(|restorer| restorer as usize)
+                );
+            }
+        }
+        #[cfg(not(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64")))]
         assert_eq!(before.sa_flags, after.sa_flags);
-        for number in 1..32 {
+        #[cfg(target_os = "linux")]
+        let signal_limit = 65;
+        #[cfg(not(target_os = "linux"))]
+        let signal_limit = 32;
+        for number in 1..signal_limit {
             assert_eq!(
                 unsafe { libc::sigismember(&before.sa_mask, number) },
                 unsafe { libc::sigismember(&after.sa_mask, number) }
