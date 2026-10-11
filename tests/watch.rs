@@ -144,6 +144,30 @@ impl Watch {
     fn idle(&mut self, count: usize) {
         self.wait("Watching robot sources.", count);
     }
+    fn published_idle(&mut self) {
+        self.wait("Build published:", 1);
+        // Publication uses stdout and quiet feedback uses stderr. Do not
+        // infer emission order from the two reader threads' merged events.
+        // Each failed/stale initial attempt has its own idle; success needs
+        // one additional idle after those outcomes on the stderr channel.
+        let start = Instant::now();
+        while self.count("Watching robot sources.")
+            <= self.count("Inputs changed during build. Rebuilding.")
+                + self.count("No build published yet.")
+        {
+            assert!(
+                self.child.try_wait().unwrap().is_none(),
+                "watch exited before published idle: {:?}",
+                self.lines.lock().unwrap()
+            );
+            assert!(
+                start.elapsed() < Duration::from_secs(30),
+                "waiting for published idle: {:?}",
+                self.lines.lock().unwrap()
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
     fn exit(&mut self) -> std::process::ExitStatus {
         let start = Instant::now();
         let status = loop {
@@ -350,12 +374,62 @@ fn pinned_robot_and_cargo_target_changes_require_restart() {
         ("pin-config-env", true),
     ] {
         let (_guard, root) = fixture();
+        // Hold the initial compiler attempt at the existing build-script seam
+        // so a declared model edit deterministically makes that attempt stale.
+        if label == "pin-target" {
+            let build = fs::read_to_string(root.join("build.rs")).unwrap();
+            fs::write(root.join("build-gate"), "wait").unwrap();
+            fs::write(root.join("build.rs"), build.replace("fn main() {", "fn main() { let root=std::path::PathBuf::from(std::env::var_os(\"CARGO_MANIFEST_DIR\").unwrap()); if root.join(\"build-gate\").exists() { std::fs::write(root.join(\"build-started\"),b\"ready\").unwrap(); while root.join(\"build-gate\").exists() { std::thread::sleep(std::time::Duration::from_millis(20)); } } ")).unwrap();
+        }
         let mut w = Watch::start(
             &root,
             &["build", "--watch", "--offline", "--output", "publication"],
             label,
         );
-        w.idle(1);
+        if label == "pin-target" {
+            let start = Instant::now();
+            while !root.join("build-started").exists() {
+                assert!(
+                    w.child.try_wait().unwrap().is_none(),
+                    "watch exited: {:?}",
+                    w.lines.lock().unwrap()
+                );
+                assert!(
+                    start.elapsed() < Duration::from_secs(30),
+                    "waiting for initial compiler: {:?}",
+                    w.lines.lock().unwrap()
+                );
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            w.mark("model edited during initial compiler attempt");
+            fs::write(
+                root.join("model.xml"),
+                "<mujoco><worldbody><body name='initial-edit'/></worldbody></mujoco>\n",
+            )
+            .unwrap();
+            fs::remove_file(root.join("build-gate")).unwrap();
+            w.wait("Inputs changed during build. Rebuilding.", 1);
+        }
+        w.published_idle();
+        if label == "pin-target" {
+            let lines = w.lines.lock().unwrap();
+            let stale = lines
+                .iter()
+                .position(|(_, _, line)| line.contains("Inputs changed during build."))
+                .unwrap();
+            let quiet = lines
+                .iter()
+                .position(|(_, _, line)| line.contains("Watching robot sources."))
+                .unwrap();
+            assert!(
+                stale < quiet,
+                "stale initial attempt must reach quiet feedback: {lines:?}"
+            );
+            drop(lines);
+            assert_eq!(w.count("Build published:"), 1);
+            assert!(w.count("Watching robot sources.") >= 2);
+        }
+        w.mark("successful publication followed by quiet watching; snapshotting prior generation");
         let prior = selected(&root);
         if label == "pin-config-env" {
             fs::create_dir_all(root.join(".cargo")).unwrap();
