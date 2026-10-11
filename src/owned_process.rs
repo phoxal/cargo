@@ -962,8 +962,19 @@ mod tests {
     fn linux_terminal_task_is_not_confused_with_live_inspection_failure() {
         // Keep an actual exited child unreaped so /proc still proves its birth
         // and Z state, independently of environ/fd permission transitions.
-        let mut child = Command::new("/usr/bin/true").spawn().unwrap();
-        let pid = child.id() as i32;
+        // The retained child needs reaping even if an assertion unwinds before
+        // Owner adopts it. Never signal after an external reap (ECHILD).
+        struct ReapChild(std::process::Child);
+        impl Drop for ReapChild {
+            fn drop(&mut self) {
+                if matches!(self.0.try_wait(), Ok(None)) {
+                    let _ = self.0.kill();
+                    let _ = self.0.wait();
+                }
+            }
+        }
+        let mut child = ReapChild(Command::new("/usr/bin/true").spawn().unwrap());
+        let pid = child.0.id() as i32;
         let start = Instant::now();
         let zombie = loop {
             let table = processes().unwrap();
@@ -986,6 +997,15 @@ mod tests {
             zombie.birth, zombie.state, zombie.terminal
         );
         assert!(zombie.terminal);
+        // Match production capture: unrelated pre-existing identities are
+        // outside this attempt. Exclude only our retained zombie so observe
+        // must still classify its UNKNOWN terminal capability state.
+        let mut baseline: BTreeMap<_, _> = processes()
+            .unwrap()
+            .into_iter()
+            .map(|(pid, process)| (pid, process.birth))
+            .collect();
+        assert_eq!(baseline.remove(&pid), Some(zombie.birth.clone()));
         let direct = Command::new("/bin/sleep")
             .arg("10")
             .process_group(0)
@@ -997,12 +1017,16 @@ mod tests {
             group,
             known: BTreeMap::new(),
             done: false,
-            capability: Capability::new().unwrap(),
-            baseline: BTreeMap::new(),
+            capability,
+            baseline,
             cleanup_timeout: Duration::from_secs(2),
             cleanup_started: None,
         };
         owner.observe(&processes().unwrap()).unwrap();
+        assert!(
+            owner.known.contains_key(&group),
+            "the new direct child must be owned"
+        );
         assert!(
             !owner.known.contains_key(&pid),
             "an unknown zombie is not adopted"
@@ -1013,7 +1037,10 @@ mod tests {
         owner.observe(&processes().unwrap()).unwrap();
         assert_eq!(owner.known.get(&pid), Some(&zombie.birth));
         owner.finish().unwrap();
-        assert_eq!(child.wait().unwrap_err().raw_os_error(), Some(libc::ECHILD));
+        assert_eq!(
+            child.0.wait().unwrap_err().raw_os_error(),
+            Some(libc::ECHILD)
+        );
         assert!(!processes().unwrap().contains_key(&pid));
         let current = processes().unwrap();
         let live = &current[&(std::process::id() as i32)];
