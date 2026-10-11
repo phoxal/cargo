@@ -480,10 +480,75 @@ impl Inputs {
     }
 }
 
+#[derive(Default)]
+struct Admission {
+    inputs: Inputs,
+    paths: BTreeSet<PathBuf>,
+    directories: BTreeSet<PathBuf>,
+}
+impl Admission {
+    fn accepts(&self, event: &notify::Event) -> bool {
+        matches!(
+            event.kind,
+            notify::EventKind::Create(_)
+                | notify::EventKind::Modify(_)
+                | notify::EventKind::Remove(_)
+        ) && event.paths.iter().any(|path| {
+            !self.inputs.ignored(path)
+                && (self.paths.contains(path)
+                    || self.inputs.files.contains(path)
+                    || self.directories.contains(path)
+                    || self
+                        .inputs
+                        .resources
+                        .iter()
+                        .any(|root| path.starts_with(root))
+                    || self.inputs.packages.iter().any(|root| {
+                        path.starts_with(root)
+                            && (path.is_dir()
+                                || matches!(
+                                    event.kind,
+                                    notify::EventKind::Create(notify::event::CreateKind::Folder)
+                                        | notify::EventKind::Remove(
+                                            notify::event::RemoveKind::Folder
+                                        )
+                                )
+                                || path.extension().is_some_and(|ext| ext == "rs")
+                                || matches!(
+                                    path.file_name().and_then(|n| n.to_str()),
+                                    Some("Cargo.toml" | "Cargo.lock")
+                                ))
+                    }))
+        })
+    }
+}
+fn enqueue(
+    event: notify::Event,
+    admission: &std::sync::Mutex<Admission>,
+    sender: &mpsc::SyncSender<notify::Event>,
+    missed: &std::sync::atomic::AtomicBool,
+) {
+    // Access notifications from our own scans and Cargo reads must never
+    // consume the modification queue or manufacture a stale overflow.
+    if event.need_rescan() {
+        // A backend overflow has no trustworthy path list. Keep the existing
+        // conservative stale barrier and bounded directory rescan.
+        missed.store(true, std::sync::atomic::Ordering::SeqCst);
+    } else if admission
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .accepts(&event)
+        && sender.try_send(event).is_err()
+    {
+        missed.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
 struct Observation {
     inputs: Inputs,
     watcher: RecommendedWatcher,
-    events: Receiver<notify::Result<notify::Event>>,
+    events: Receiver<notify::Event>,
+    admission: std::sync::Arc<std::sync::Mutex<Admission>>,
     directories: BTreeMap<PathBuf, (u64, u64)>,
     selected: BTreeSet<PathBuf>,
     revision: u64,
@@ -496,13 +561,15 @@ impl Observation {
         let (tx, events) = mpsc::sync_channel(256);
         let missed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let backend_error = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let admission = std::sync::Arc::new(std::sync::Mutex::new(Admission::default()));
+        let callback_admission = std::sync::Arc::clone(&admission);
         let callback_missed = std::sync::Arc::clone(&missed);
         let callback_error = std::sync::Arc::clone(&backend_error);
         let watcher = notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
             if let Err(e) = event {
                 *callback_error.lock().unwrap_or_else(|e| e.into_inner()) = Some(e);
-            } else if tx.try_send(event).is_err() {
-                callback_missed.store(true, std::sync::atomic::Ordering::SeqCst);
+            } else if let Ok(event) = event {
+                enqueue(event, &callback_admission, &tx, &callback_missed);
             }
         })
         .map_err(|e| error(format!("cannot start source observation: {e}")))?;
@@ -510,6 +577,7 @@ impl Observation {
             inputs,
             watcher,
             events,
+            admission,
             directories: BTreeMap::new(),
             selected,
             revision: 0,
@@ -547,7 +615,18 @@ impl Observation {
         {
             return Err(error(format!("source watcher failed: {e}")));
         }
+        // Install the newly resolved policy before scanning or registering
+        // roots. The previous snapshot remains eligible during this scan.
+        self.admission
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .inputs = self.inputs.clone();
         let (snapshot, directories) = self.inputs.scan()?;
+        {
+            let mut admission = self.admission.lock().unwrap_or_else(|e| e.into_inner());
+            admission.paths = snapshot.keys().cloned().collect();
+            admission.directories = directories.clone();
+        }
         // Always maintain watches on real directories and selected-file
         // parents; replacement/missed events also get a bounded rescan.
         let identities: BTreeMap<_, _> = directories
@@ -576,29 +655,19 @@ impl Observation {
         }
         self.directories = registered;
         for event in self.events.try_iter() {
-            if let Ok(event) = &event
-                && matches!(
-                    event.kind,
-                    notify::EventKind::Create(_)
-                        | notify::EventKind::Modify(_)
-                        | notify::EventKind::Remove(_)
-                )
-                && event.paths.iter().any(|path| {
-                    snapshot.contains_key(path)
-                        && !self.inputs.ignored(path)
-                        && fs::symlink_metadata(path)
-                            .and_then(|m| m.modified())
-                            .map_or(true, |modified| modified > self.last_scan)
-                })
-            {
+            if matches!(
+                event.kind,
+                notify::EventKind::Create(_)
+                    | notify::EventKind::Modify(_)
+                    | notify::EventKind::Remove(_)
+            ) && event.paths.iter().any(|path| {
+                snapshot.contains_key(path)
+                    && !self.inputs.ignored(path)
+                    && fs::symlink_metadata(path)
+                        .and_then(|m| m.modified())
+                        .map_or(true, |modified| modified > self.last_scan)
+            }) {
                 self.revision = self.revision.wrapping_add(1);
-            }
-            if let Err(e) = event {
-                // A missing watched directory is repaired by the rescan;
-                // other backend failures are fatal rather than healthy idle.
-                if !matches!(e.kind, notify::ErrorKind::PathNotFound) {
-                    return Err(error(format!("source watcher failed: {e}")));
-                }
             }
         }
         self.last_scan = std::time::SystemTime::now();
@@ -857,6 +926,77 @@ fn run_inner(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn admission_preserves_eligible_overflow_without_read_or_generated_noise()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let source = directory.path().join("main.rs");
+        fs::write(&source, "old")?;
+        let mut inputs = Inputs::default();
+        inputs.packages.insert(directory.path().to_owned());
+        let mut observer = Observation::new(inputs, BTreeSet::new())?;
+        let before = observer.snapshot()?;
+        let revision = observer.revision;
+        let admission = std::sync::Arc::clone(&observer.admission);
+        let (sender, receiver) = mpsc::sync_channel(256);
+        observer.events = receiver;
+        let missed = std::sync::Arc::clone(&observer.missed);
+        for _ in 0..512 {
+            enqueue(
+                notify::Event::new(notify::EventKind::Access(notify::event::AccessKind::Read))
+                    .add_path(source.clone()),
+                &admission,
+                &sender,
+                &missed,
+            );
+            enqueue(
+                notify::Event::new(notify::EventKind::Modify(notify::event::ModifyKind::Any))
+                    .add_path(directory.path().join("target/generated.rs")),
+                &admission,
+                &sender,
+                &missed,
+            );
+            enqueue(
+                notify::Event::new(notify::EventKind::Create(notify::event::CreateKind::File))
+                    .add_path(directory.path().join("robot.unselected.yaml")),
+                &admission,
+                &sender,
+                &missed,
+            );
+        }
+        assert!(observer.events.try_recv().is_err());
+        assert!(!missed.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(before, observer.snapshot()?);
+        assert_eq!(revision, observer.revision);
+        // Same bytes after edit/revert cannot certify that compilation saw
+        // those bytes. Eligible overflow must still invalidate the attempt.
+        for _ in 0..512 {
+            enqueue(
+                notify::Event::new(notify::EventKind::Modify(notify::event::ModifyKind::Data(
+                    notify::event::DataChange::Any,
+                )))
+                .add_path(source.clone()),
+                &admission,
+                &sender,
+                &missed,
+            );
+        }
+        assert!(missed.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(before, observer.snapshot()?);
+        assert_ne!(revision, observer.revision);
+        fs::write(&source, "edited")?;
+        assert_ne!(before, observer.snapshot()?);
+        let revision = observer.revision;
+        enqueue(
+            notify::Event::new(notify::EventKind::Other).set_flag(notify::event::Flag::Rescan),
+            &admission,
+            &sender,
+            &missed,
+        );
+        observer.snapshot()?;
+        assert_ne!(revision, observer.revision);
+        Ok(())
+    }
     #[test]
     fn snapshots_follow_replacement_symlinks_and_skip_generated_unselected_inputs()
     -> Result<(), Box<dyn std::error::Error>> {

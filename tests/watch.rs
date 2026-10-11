@@ -55,6 +55,7 @@ struct Watch {
     started: Instant,
     evidence: Option<PathBuf>,
     edits: Vec<(f64, String)>,
+    initial_idle_offset: usize,
 }
 impl Watch {
     fn start(root: &Path, args: &[&str], label: &str) -> Self {
@@ -97,10 +98,11 @@ impl Watch {
                     if let Some(log) = &mut log {
                         writeln!(log, "{line}").unwrap();
                     }
-                    lines
-                        .lock()
-                        .unwrap()
-                        .push((started.elapsed().as_secs_f64(), stderr, line));
+                    lines.lock().unwrap_or_else(|e| e.into_inner()).push((
+                        started.elapsed().as_secs_f64(),
+                        stderr,
+                        line,
+                    ));
                 }
             }));
         }
@@ -111,16 +113,18 @@ impl Watch {
             started,
             evidence,
             edits: Vec::new(),
+            initial_idle_offset: 0,
         }
     }
     fn mark(&mut self, label: &str) {
         self.edits
             .push((self.started.elapsed().as_secs_f64(), label.to_owned()));
     }
+    fn transcript(&self) -> Vec<(f64, bool, String)> {
+        self.lines.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
     fn count(&self, text: &str) -> usize {
-        self.lines
-            .lock()
-            .unwrap()
+        self.transcript()
             .iter()
             .filter(|(_, _, s)| s.contains(text))
             .count()
@@ -131,18 +135,18 @@ impl Watch {
             assert!(
                 self.child.try_wait().unwrap().is_none(),
                 "watch exited: {:?}",
-                self.lines.lock().unwrap()
+                self.transcript()
             );
             assert!(
                 start.elapsed() < Duration::from_secs(30),
                 "waiting for {text}: {:?}",
-                self.lines.lock().unwrap()
+                self.transcript()
             );
             std::thread::sleep(Duration::from_millis(20));
         }
     }
     fn idle(&mut self, count: usize) {
-        self.wait("Watching robot sources.", count);
+        self.wait("Watching robot sources.", self.initial_idle_offset + count);
     }
     fn published_idle(&mut self) {
         self.wait("Build published:", 1);
@@ -158,15 +162,16 @@ impl Watch {
             assert!(
                 self.child.try_wait().unwrap().is_none(),
                 "watch exited before published idle: {:?}",
-                self.lines.lock().unwrap()
+                self.transcript()
             );
             assert!(
                 start.elapsed() < Duration::from_secs(30),
                 "waiting for published idle: {:?}",
-                self.lines.lock().unwrap()
+                self.transcript()
             );
             std::thread::sleep(Duration::from_millis(20));
         }
+        self.initial_idle_offset = self.count("Watching robot sources.") - 1;
     }
     fn exit(&mut self) -> std::process::ExitStatus {
         let start = Instant::now();
@@ -177,7 +182,7 @@ impl Watch {
             assert!(
                 start.elapsed() < Duration::from_secs(6),
                 "watch did not stop: {:?}",
-                self.lines.lock().unwrap()
+                self.transcript()
             );
             std::thread::sleep(Duration::from_millis(20));
         };
@@ -187,7 +192,7 @@ impl Watch {
         if let Some(e) = &self.evidence {
             fs::write(
                 e.join("events.json"),
-                serde_json::to_vec_pretty(&*self.lines.lock().unwrap()).unwrap(),
+                serde_json::to_vec_pretty(&self.transcript()).unwrap(),
             )
             .unwrap();
             fs::write(
@@ -219,26 +224,82 @@ impl Watch {
 }
 impl Drop for Watch {
     fn drop(&mut self) {
-        if self.child.try_wait().unwrap().is_none() {
-            unsafe {
-                libc::kill(self.child.id() as i32, libc::SIGINT);
+        let mut failures = Vec::new();
+        match self.child.try_wait() {
+            Ok(None) => {
+                unsafe {
+                    libc::kill(self.child.id() as i32, libc::SIGINT);
+                }
+                let start = Instant::now();
+                loop {
+                    match self.child.try_wait() {
+                        Ok(Some(_)) => break,
+                        Ok(None) if start.elapsed() < Duration::from_secs(6) => {
+                            std::thread::sleep(Duration::from_millis(20))
+                        }
+                        Ok(None) => {
+                            failures.push(
+                                "watch required harness kill after cancellation deadline"
+                                    .to_owned(),
+                            );
+                            if let Err(e) = self
+                                .child
+                                .kill()
+                                .and_then(|()| self.child.wait().map(|_| ()))
+                            {
+                                failures.push(format!("watch reap failed: {e}"));
+                            }
+                            break;
+                        }
+                        Err(e) => {
+                            failures.push(format!("watch wait failed: {e}"));
+                            break;
+                        }
+                    }
+                }
             }
-            let start = Instant::now();
-            while self.child.try_wait().unwrap().is_none()
-                && start.elapsed() < Duration::from_secs(6)
-            {
-                std::thread::sleep(Duration::from_millis(20));
-            }
-            if self.child.try_wait().unwrap().is_none() {
-                self.child.kill().unwrap();
-                self.child.wait().unwrap();
-            }
+            Ok(Some(_)) => {}
+            Err(e) => failures.push(format!("watch wait failed: {e}")),
         }
         for reader in self.readers.drain(..) {
-            reader.join().unwrap();
+            if let Err(failure) = reader.join() {
+                failures.push(format!("watch reader failed: {failure:?}"));
+            }
+        }
+        if let Some(evidence) = &self.evidence {
+            // Cleanup and channels survive an original assertion unwind.
+            // A cleanup/reader failure still fails a passing journey.
+            let events = serde_json::to_vec_pretty(&self.transcript());
+            match events {
+                Ok(events) => {
+                    if let Err(e) = fs::write(evidence.join("drop-events.json"), events) {
+                        failures.push(e.to_string());
+                    }
+                }
+                Err(e) => failures.push(e.to_string()),
+            }
+            if let Err(e) = fs::write(
+                evidence.join("drop-status.txt"),
+                format!(
+                    "pid={} status={:?} unwinding={} failures={failures:?}\n",
+                    self.child.id(),
+                    self.child.try_wait(),
+                    std::thread::panicking()
+                ),
+            ) {
+                failures.push(e.to_string());
+            }
+        }
+        if !failures.is_empty() {
+            if std::thread::panicking() {
+                eprintln!("watch cleanup failures during original assertion: {failures:?}");
+            } else {
+                panic!("watch cleanup failures: {failures:?}");
+            }
         }
     }
 }
+
 fn selected(root: &Path) -> PathBuf {
     root.join("publication").canonicalize().unwrap()
 }
@@ -275,7 +336,7 @@ fn immediate_edits_recovery_noop_atomic_replacement_and_idle_ownership() {
         &["build", "--watch", "--offline", "--output", "publication"],
         "editing",
     );
-    w.idle(1);
+    w.published_idle();
     assert_eq!(w.count("Build published:"), 1);
     let first = selected(&root);
     let old_manifest = fs::read(first.join("manifest.json")).unwrap();
@@ -326,11 +387,17 @@ fn immediate_edits_recovery_noop_atomic_replacement_and_idle_ownership() {
     let revision = selected(&root);
     fs::write(&model, fs::read(&model).unwrap()).unwrap();
     std::thread::sleep(Duration::from_millis(1100));
-    assert_eq!(w.count("Watching robot sources."), 2);
+    assert_eq!(
+        w.count("Watching robot sources."),
+        w.initial_idle_offset + 2
+    );
     assert_eq!(selected(&root), revision);
     fs::write(root.join("robot.unselected.yaml"), "broken: [\n").unwrap();
     std::thread::sleep(Duration::from_millis(1100));
-    assert_eq!(w.count("Watching robot sources."), 2);
+    assert_eq!(
+        w.count("Watching robot sources."),
+        w.initial_idle_offset + 2
+    );
     let main = fs::read_to_string(root.join("src/main.rs")).unwrap();
     fs::write(
         root.join("src/replacement"),
@@ -392,12 +459,12 @@ fn pinned_robot_and_cargo_target_changes_require_restart() {
                 assert!(
                     w.child.try_wait().unwrap().is_none(),
                     "watch exited: {:?}",
-                    w.lines.lock().unwrap()
+                    w.transcript()
                 );
                 assert!(
                     start.elapsed() < Duration::from_secs(30),
                     "waiting for initial compiler: {:?}",
-                    w.lines.lock().unwrap()
+                    w.transcript()
                 );
                 std::thread::sleep(Duration::from_millis(20));
             }
@@ -412,7 +479,7 @@ fn pinned_robot_and_cargo_target_changes_require_restart() {
         }
         w.published_idle();
         if label == "pin-target" {
-            let lines = w.lines.lock().unwrap();
+            let lines = w.transcript();
             let stale = lines
                 .iter()
                 .position(|(_, _, line)| line.contains("Inputs changed during build."))
@@ -464,7 +531,7 @@ fn pinned_robot_and_cargo_target_changes_require_restart() {
         assert!(
             w.count("restart cargo phoxal build --watch") > 0,
             "{:?}",
-            w.lines.lock().unwrap()
+            w.transcript()
         );
         assert_eq!(selected(&root), prior);
         preserve(&root, &w);
@@ -518,7 +585,7 @@ fn independent_transitive_topology_and_local_supervisor_graph_edits() {
         ],
         "independent-graph",
     );
-    w.wait("Build published:", 1);
+    w.published_idle();
     let execute = |root: &Path| {
         let executable = fs::read_dir(selected(root).join("bin"))
             .unwrap()
@@ -627,7 +694,7 @@ fn independent_transitive_topology_and_local_supervisor_graph_edits() {
     w.wait("Build published:", 6);
     let before = selected(&root);
     fs::write(missing.join("src/lib.rs"), "pub fn value()->u64 { 6 }\n").unwrap();
-    w.idle(8);
+    w.wait("Build published:", 7);
     assert_ne!(selected(&root), before);
     let supervisor_exec = selected(&root).join("bin/supervisor");
     assert_eq!(
@@ -677,7 +744,7 @@ fn cancellation_reaps_resistant_group_and_observed_detached_descendants() {
             &format!("cancel-{operation}"),
         );
         let previous = if operation == "build" {
-            w.idle(1);
+            w.published_idle();
             let previous = selected(&root);
             fs::write(root.join("owned-gate"), operation).unwrap();
             let source = fs::read_to_string(root.join("src/main.rs")).unwrap();
@@ -800,7 +867,7 @@ fn stale_work_publication_failure_and_selected_overlay_recover_without_false_suc
         ],
         "stale-overlay-publication",
     );
-    w.idle(1);
+    w.published_idle();
     let initial = selected(&root);
     let initial_bytes = fs::read(initial.join("manifest.json")).unwrap();
     let build = fs::read_to_string(root.join("build.rs")).unwrap();
@@ -827,7 +894,7 @@ fn stale_work_publication_failure_and_selected_overlay_recover_without_false_suc
         w.count("Build published:"),
         2,
         "stale attempt must not report publication: {:?}",
-        w.lines.lock().unwrap()
+        w.transcript()
     );
     assert_eq!(
         fs::read(initial.join("manifest.json")).unwrap(),
@@ -915,7 +982,7 @@ fn fast_daemonization_cleanup_boundary() {
             ],
             mode,
         );
-        w.idle(1);
+        w.published_idle();
         let pids = fs::read_to_string(root.join("owned-pids.log"))
             .unwrap()
             .lines()
@@ -976,13 +1043,13 @@ fn compiler_json_channels_remain_nonempty_clean_and_unduplicated() {
         ],
         "compiler-json",
     );
-    w.idle(1);
+    w.published_idle();
     let first = selected(&root);
     fs::write(root.join("src/main.rs"), "invalid rust\n").unwrap();
     w.idle(2);
     assert_eq!(selected(&root), first);
     w.stop();
-    let lines = w.lines.lock().unwrap();
+    let lines = w.transcript();
     let records = lines
         .iter()
         .filter(|(_, stderr, _)| !*stderr)
@@ -1012,6 +1079,37 @@ fn compiler_json_channels_remain_nonempty_clean_and_unduplicated() {
     );
     drop(lines);
     preserve(&root, &w);
+    let mut unwind = Watch::start(
+        &root,
+        &[
+            "build",
+            "--watch",
+            "--offline",
+            "--output",
+            "unwind-publication",
+        ],
+        "assertion-unwind",
+    );
+    unwind.wait("No build published yet.", 1);
+    let pid = unwind.child.id();
+    let lines = Arc::clone(&unwind.lines);
+    let failure = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+        let _owner = unwind;
+        panic!("intentional observer assertion: {:?}", _owner.transcript());
+    }))
+    .expect_err("original observer assertion must survive cleanup");
+    assert!(
+        failure
+            .downcast_ref::<String>()
+            .unwrap()
+            .contains("intentional observer assertion")
+    );
+    assert!(!lines.is_poisoned());
+    assert_eq!(unsafe { libc::kill(pid as i32, 0) }, -1);
+    assert_eq!(
+        std::io::Error::last_os_error().raw_os_error(),
+        Some(libc::ESRCH)
+    );
 }
 
 #[test]
@@ -1027,7 +1125,7 @@ fn measured_code_yaml_model_noop_and_retained_history() {
         &["build", "--watch", "--offline", "--output", "publication"],
         "measured-editing",
     );
-    w.idle(1);
+    w.published_idle();
     let cold = selected(&root);
     let reader = fs::read(cold.join("manifest.json")).unwrap();
     let main = fs::read_to_string(root.join("src/main.rs")).unwrap();
@@ -1063,7 +1161,10 @@ fn measured_code_yaml_model_noop_and_retained_history() {
     let model_bytes = fs::read(root.join("model-two.xml")).unwrap();
     fs::write(root.join("model-two.xml"), model_bytes).unwrap();
     std::thread::sleep(Duration::from_millis(1100));
-    assert_eq!(w.count("Watching robot sources."), 4);
+    assert_eq!(
+        w.count("Watching robot sources."),
+        w.initial_idle_offset + 4
+    );
     assert_eq!(selected(&root), model);
     for i in 0..5 {
         w.mark(&format!("history-model-{i}"));
@@ -1127,6 +1228,7 @@ fn watch_pty_work_idle_resize_plain_environments_and_child_output() {
             started,
             evidence: None,
             edits: Vec::new(),
+            initial_idle_offset: 0,
         };
         let deadline = Instant::now() + Duration::from_secs(20);
         while !root.join("pty-ready").exists() {
@@ -1199,7 +1301,7 @@ fn public_directory_replacement_and_symlink_target_edits_rebuild_actual_bytes() 
         &["build", "--watch", "--offline", "--output", "publication"],
         "directory-symlink",
     );
-    w.idle(1);
+    w.published_idle();
     fs::rename(root.join("src"), root.join("old-src")).unwrap();
     fs::create_dir(root.join("src")).unwrap();
     fs::write(
