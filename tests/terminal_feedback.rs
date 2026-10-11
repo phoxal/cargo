@@ -132,6 +132,10 @@ fn actual_pty_blocked_feedback_clears_before_error_and_resize_uses_plain_lines()
             terminal.until("Check: Starting.", 3);
             assert!(!terminal.bytes.contains(&27));
         }
+        // The blocked fixture stalls inside real source resolution, and the
+        // owning phase is named while it owns the wait; plain and live
+        // terminals both keep the claim.
+        terminal.until("Check: resolving selected sources.", 3);
         UnixStream::connect(root.path().join("release.sock")).unwrap();
         assert_eq!(owner.finish().code(), Some(1));
         terminal.drain();
@@ -175,7 +179,7 @@ fn actual_build_stdout_and_check_diagnostics_have_no_live_renderer_interleaving(
         terminal.drain();
         let text = String::from_utf8_lossy(&terminal.bytes);
         let boundary = if operation == "build" {
-            "runnable build:"
+            "Build published:"
         } else {
             "cargo phoxal: declaration check validated"
         };
@@ -198,14 +202,42 @@ fn actual_build_stdout_and_check_diagnostics_have_no_live_renderer_interleaving(
             let revived = format!("{plain}{mutation}");
             assert!(std::panic::catch_unwind(|| assert_renderer_stopped(&revived)).is_err());
         }
-        assert!(text.contains(&format!(
-            "{}: Completed.",
-            if operation == "build" {
-                "Build"
-            } else {
-                "Check"
-            }
-        )));
+        // Real owning phases are named through the actual compilation
+        // without hiding any forwarded diagnostic: the brain build and the
+        // delegated project compilation, plus publication for builds.
+        let label = operation
+            .char_indices()
+            .next()
+            .map(|(index, first)| format!("{}{}", first.to_uppercase(), &operation[index + 1..]))
+            .unwrap_or_else(|| operation.to_owned());
+        assert!(
+            text.contains(&format!("{label}: compiling the robot brain.")),
+            "brain phase missing: {text:?}"
+        );
+        if operation == "build" {
+            assert!(
+                text.contains("Build: selecting the supervisor.")
+                    && text.contains("Build: building the supervisor.")
+                    && text.contains("Build: building selected executables.")
+                    && !text.contains("compiling selected participants")
+                    && text.contains("Build: staging model resources.")
+                    && text.contains("Build: assembling the runnable directory.")
+                    && text.contains("Build: publishing."),
+                "build phases missing: {text:?}"
+            );
+        } else {
+            assert!(
+                text.contains("Check: checking the robot project."),
+                "checking wording missing: {text:?}"
+            );
+        }
+        // Build reports its own typed publication outcome and stays silent
+        // for the generic completion footer; Check keeps it.
+        if operation == "check" {
+            assert!(text.contains("Check: Completed."));
+        } else {
+            assert!(!text.contains("Build: Completed."));
+        }
         println!("Actual shared Cargo PTY {operation}: {text:?}");
     }
 }

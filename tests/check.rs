@@ -9,19 +9,20 @@
 mod support;
 
 use std::fs;
-use std::io::Read;
 
-#[allow(clippy::expect_used, reason = "acceptance archive assertions")]
-fn archive_manifest(path: &std::path::Path) -> serde_json::Value {
-    let mut archive =
-        zip::ZipArchive::new(fs::File::open(path).expect("build archive")).expect("valid ZIP");
-    let mut bytes = Vec::new();
-    archive
-        .by_name("manifest.json")
-        .expect("manifest entry")
-        .read_to_end(&mut bytes)
-        .expect("manifest bytes");
-    serde_json::from_slice(&bytes).expect("resolved manifest")
+#[allow(
+    clippy::expect_used,
+    clippy::unwrap_used,
+    reason = "acceptance publication assertions"
+)]
+fn published_manifest(path: &std::path::Path) -> serde_json::Value {
+    // The published root is the stable symlink; resolve it once like a
+    // reader and read the selected generation's manifest.
+    let manifest = std::fs::read_link(path)
+        .map(|target| path.parent().unwrap().join(target).join("manifest.json"))
+        .unwrap_or_else(|_| path.join("manifest.json"));
+    serde_json::from_slice(&fs::read(manifest).expect("published manifest"))
+        .expect("resolved manifest")
 }
 
 use support::stage;
@@ -142,7 +143,7 @@ fn independently_selected_participant_keeps_its_version_and_shared_artifact() {
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
-    let manifest = archive_manifest(&bundle);
+    let manifest = published_manifest(&bundle);
     let artifacts = manifest["artifacts"].as_array().expect("artifacts");
     let provider = artifacts
         .iter()
@@ -192,7 +193,7 @@ fn passive_path_component_does_not_require_a_robot_rust_dependency() {
         "{}",
         String::from_utf8_lossy(&built.stderr)
     );
-    let manifest = archive_manifest(&root.join("passive-bundle"));
+    let manifest = published_manifest(&root.join("passive-bundle"));
     assert_eq!(manifest["components"][0]["instance"], "caster");
     assert_eq!(manifest["components"][0]["driver"], false);
     assert_eq!(

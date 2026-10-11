@@ -360,3 +360,63 @@ fn assertion_unwind_reaps_the_blocked_cli_and_metadata_process_group() {
         "Actual unwind cleanup: parent {parent}, metadata {metadata}, both absent after bounded group cleanup."
     );
 }
+
+#[test]
+fn help_and_structured_errors_survive_a_deleted_invocation_directory() {
+    let directory = tempfile::tempdir().expect("evidence directory");
+    let evidence = directory.path();
+    let source = evidence.join("deleted_cwd_exec.rs");
+    fs::write(
+        &source,
+        include_str!("fixtures/process/deleted_cwd_exec.rs"),
+    )
+    .expect("fixture source");
+    let helper = evidence.join("deleted_cwd_exec");
+    let compiled = Command::new("rustc")
+        .arg("--edition=2024")
+        .arg(&source)
+        .arg("-o")
+        .arg(&helper)
+        .output()
+        .expect("compile the deleted-cwd helper");
+    assert!(
+        compiled.status.success(),
+        "{}",
+        String::from_utf8_lossy(&compiled.stderr)
+    );
+
+    let run = |name: &str, arguments: &[&str]| {
+        let case = evidence.join(name);
+        fs::create_dir(&case).expect("case directory");
+        let mut owned = Owned::spawn(
+            Command::new(&helper)
+                .arg(&case)
+                .arg(env!("CARGO_BIN_EXE_cargo-phoxal"))
+                .args(arguments),
+        );
+        let status = owned.0.wait().expect("helper exits");
+        let stdout = fs::read_to_string(case.join("stdout")).expect("captured stdout");
+        let stderr = fs::read_to_string(case.join("stderr")).expect("captured stderr");
+        let recorded = fs::read_to_string(case.join("status")).expect("recorded status");
+        assert!(status.success(), "helper {name} failed: {stderr}");
+        (recorded, stdout, stderr)
+    };
+
+    // Terminal parsing answers before filesystem discovery.
+    let (status, stdout, stderr) = run("help", &["--help"]);
+    assert!(status.trim() == "0", "status {status}: {stderr}");
+    assert!(stdout.contains("Usage: cargo phoxal"), "{stdout}");
+    assert!(stderr.is_empty(), "{stderr}");
+
+    // A deleted invocation directory keeps the resolved JSON diagnostics
+    // policy: the structured Phoxal diagnostic reaches stderr.
+    let (status, _stdout, stderr) = run("json", &["check", "--message-format=json"]);
+    assert!(status.trim() == "1", "status {status}");
+    assert!(stderr.contains("phoxal-diagnostic"), "{stderr}");
+
+    // Plain mode keeps the human channel for the same condition.
+    let (status, _stdout, stderr) = run("plain", &["check"]);
+    assert!(status.trim() == "1", "status {status}");
+    assert!(stderr.contains("error: "), "{stderr}");
+    assert!(!stderr.contains("phoxal-diagnostic"), "{stderr}");
+}

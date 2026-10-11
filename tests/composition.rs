@@ -39,12 +39,12 @@ fn explicit_files_order_operators_nested_paths_and_plain_roundtrip() {
     let value = config(
         &root.join("src/nested"),
         &[
-            "-f",
+            "-r",
             "../../robot.yaml",
             "config",
-            "-f",
+            "-r",
             "../../one.yaml",
-            "-f",
+            "-r",
             "../../two.yaml",
             "--json",
         ],
@@ -68,11 +68,11 @@ fn explicit_files_order_operators_nested_paths_and_plain_roundtrip() {
         &[
             "config",
             "--json",
-            "-f",
+            "-r",
             "robot.yaml",
-            "-f",
+            "-r",
             "two.yaml",
-            "-f",
+            "-r",
             "one.yaml",
         ],
     );
@@ -83,19 +83,19 @@ fn explicit_files_order_operators_nested_paths_and_plain_roundtrip() {
     );
     let standalone = "schema: phoxal/robot/v0\nrobot:\n  id: alone\nsupervisor: {source: {path: ../unavailable}}\n";
     fs::write(root.join("alone.yaml"), standalone).unwrap_or_else(|error| panic!("{error}"));
-    let alone = config(root, &["config", "--json", "-f", "alone.yaml"]);
+    let alone = config(root, &["config", "--json", "-r", "alone.yaml"]);
     assert_eq!(alone["robot"]["id"], "alone");
     assert_eq!(alone["robot"]["services"], serde_json::json!({}));
     assert_eq!(config(root, &["config", "--json"])["robot"]["id"], "common");
-    let plain = invoke(root, &["config", "-f", "robot.yaml", "-f", "one.yaml"]);
+    let plain = invoke(root, &["config", "-r", "robot.yaml", "-r", "one.yaml"]);
     assert!(plain.status.success());
     assert!(!String::from_utf8_lossy(&plain.stdout).contains('!'));
     fs::write(root.join("resolved.yaml"), plain.stdout).unwrap_or_else(|error| panic!("{error}"));
     assert_eq!(
-        config(root, &["config", "--json", "-f", "resolved.yaml"]),
+        config(root, &["config", "--json", "-r", "resolved.yaml"]),
         config(
             root,
-            &["config", "--json", "-f", "robot.yaml", "-f", "one.yaml"]
+            &["config", "--json", "-r", "robot.yaml", "-r", "one.yaml"]
         )
     );
 }
@@ -116,7 +116,7 @@ fn invalid_compositions_fail_without_acquisition_and_build_rejects_files() {
         "schema: phoxal/robot/v0\nrobot:\n  services: {motion: {config: !delete 4}}\n",
     ] {
         fs::write(root.join("invalid.yaml"), text).unwrap_or_else(|error| panic!("{error}"));
-        let output = invoke(root, &["config", "-f", "robot.yaml", "-f", "invalid.yaml"]);
+        let output = invoke(root, &["config", "-r", "robot.yaml", "-r", "invalid.yaml"]);
         assert!(!output.status.success(), "invalid layer accepted: {text}");
         assert!(String::from_utf8_lossy(&output.stderr).contains("invalid.yaml"));
         if text.contains("id: duplicate") {
@@ -132,12 +132,12 @@ fn invalid_compositions_fail_without_acquisition_and_build_rejects_files() {
             "scene.xml",
             "--build",
             "build",
-            "-f",
+            "-r",
             "robot.yaml",
         ],
     );
     assert!(!output.status.success());
-    assert!(String::from_utf8_lossy(&output.stderr).contains("cannot be combined with --file"));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("cannot be combined with --robot"));
     assert!(!root.join("target").exists());
 }
 
@@ -149,7 +149,7 @@ fn native_mount_names_and_diagnostic_origins_follow_resolved_values() {
     fs::write(root.join("mount.yaml"), "schema: phoxal/robot/v0\nrobot:\n  components:\n    motor: {source: {path: ../motor}, mount_site: Front.LeftMount}\n").unwrap_or_else(|error| panic!("{error}"));
     let value = config(
         root,
-        &["config", "--json", "-f", "robot.yaml", "-f", "mount.yaml"],
+        &["config", "--json", "-r", "robot.yaml", "-r", "mount.yaml"],
     );
     assert_eq!(
         value["robot"]["components"]["motor"]["mount_site"],
@@ -157,7 +157,7 @@ fn native_mount_names_and_diagnostic_origins_follow_resolved_values() {
     );
     for name in ["", "   "] {
         fs::write(root.join("mount.yaml"), format!("schema: phoxal/robot/v0\nrobot:\n  components:\n    motor: {{source: {{path: ../motor}}, mount_site: '{name}'}}\n")).unwrap_or_else(|error| panic!("{error}"));
-        let output = invoke(root, &["config", "-f", "robot.yaml", "-f", "mount.yaml"]);
+        let output = invoke(root, &["config", "-r", "robot.yaml", "-r", "mount.yaml"]);
         assert!(!output.status.success());
         assert!(String::from_utf8_lossy(&output.stderr).contains("mount_site must not be empty"));
     }
@@ -168,7 +168,7 @@ fn native_mount_names_and_diagnostic_origins_follow_resolved_values() {
         "schema: phoxal/robot/v0\nrobot:\n  id: later\n",
     )
     .unwrap_or_else(|error| panic!("{error}"));
-    let output = invoke(root, &["config", "-f", "bad.yaml", "-f", "later.yaml"]);
+    let output = invoke(root, &["config", "-r", "bad.yaml", "-r", "later.yaml"]);
     let error = String::from_utf8_lossy(&output.stderr);
     assert!(
         error.contains("resolved composition (selected inputs:"),
@@ -176,7 +176,7 @@ fn native_mount_names_and_diagnostic_origins_follow_resolved_values() {
     );
     assert!(error.contains("bad.yaml") && error.contains("later.yaml"));
     fs::write(root.join("base.yaml"), "schema: phoxal/robot/v0\nrobot:\n  id: common\n  services:\n    motion:\n      source: {path: ../motion}\n      bindings: {manual: absent.intent}\nsupervisor: {source: {path: ../supervisor}}\n").unwrap_or_else(|error| panic!("{error}"));
-    let output = invoke(root, &["config", "-f", "base.yaml", "-f", "later.yaml"]);
+    let output = invoke(root, &["config", "-r", "base.yaml", "-r", "later.yaml"]);
     let error = String::from_utf8_lossy(&output.stderr);
     assert!(
         error.contains("base.yaml: robot.services.motion.bindings.manual"),
@@ -187,11 +187,11 @@ fn native_mount_names_and_diagnostic_origins_follow_resolved_values() {
         root,
         &[
             "config",
-            "-f",
+            "-r",
             "base.yaml",
-            "-f",
+            "-r",
             "replace.yaml",
-            "-f",
+            "-r",
             "later.yaml",
         ],
     );
@@ -210,11 +210,11 @@ fn native_mount_names_and_diagnostic_origins_follow_resolved_values() {
             root,
             &[
                 "config",
-                "-f",
+                "-r",
                 "base.yaml",
-                "-f",
+                "-r",
                 "replace.yaml",
-                "-f",
+                "-r",
                 "delete.yaml"
             ]
         )
@@ -235,7 +235,7 @@ fn binary_selection_diagnostics_identify_the_owning_authored_path() {
     .unwrap_or_else(|error| panic!("{error}"));
     let output = invoke(
         root,
-        &["config", "-f", "robot.yaml", "-f", "supervisor.yaml"],
+        &["config", "-r", "robot.yaml", "-r", "supervisor.yaml"],
     );
     assert!(!output.status.success());
     let error = String::from_utf8_lossy(&output.stderr);
@@ -250,7 +250,7 @@ fn binary_selection_diagnostics_identify_the_owning_authored_path() {
         "schema: phoxal/robot/v0\nrobot:\n  services:\n    motion:\n      binary: invalid target\n",
     )
     .unwrap_or_else(|error| panic!("{error}"));
-    let output = invoke(root, &["config", "-f", "robot.yaml", "-f", "service.yaml"]);
+    let output = invoke(root, &["config", "-r", "robot.yaml", "-r", "service.yaml"]);
     assert!(!output.status.success());
     let error = String::from_utf8_lossy(&output.stderr);
     assert!(

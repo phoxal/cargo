@@ -6,29 +6,38 @@
 //! types and adds the project-side validation logic that the inert
 //! framework module intentionally does not own.
 //!
-//! Authored YAML parsing is owned here; tool callers use [`parse_and_validate`]
-//! to combine parsing and validation.
+//! Composed robot documents enter through [`compose_and_validate`], which
+//! deserializes an already-composed YAML value into the typed document once
+//! and validates it; authored text stays with the composition owner so
+//! malformed layers keep their real parser locations.
 #![deny(unsafe_code)]
 use crate::project::error::{ValidationError, ValidationErrors};
 pub use phoxal::artifact::document::{
     BrainSelection, ComponentDocument, PortReference, RobotDocument, Source,
 };
-use serde_json::Value;
+use serde_json::Value as ConfigValue;
+use serde_yaml::Value;
 use std::collections::BTreeSet;
 use std::path::Path;
-/// Parses and validates a `robot.yaml` document with its authored path
-/// attached to errors. The YAML parse and the validation belong
-/// together at this boundary because a malformed file must surface both
-/// structural and semantic errors in one round-trip.
-pub(crate) fn parse_and_validate(
-    text: &str,
+/// Deserializes an already-composed robot-document value into the typed
+/// document and validates it.
+///
+/// The composition owner merges authored layers and resolves source
+/// references as YAML values; this boundary converts the composed value
+/// into the typed document once, without a serialize/reparse round trip.
+/// Deserialization failures carry no source location: the composed value
+/// belongs to no single file, so callers attach their own provenance
+/// instead of a fabricated position.
+pub(crate) fn compose_and_validate(
+    value: Value,
     path: &Path,
 ) -> Result<RobotDocument, crate::project::error::Error> {
-    let document: RobotDocument =
-        serde_yaml::from_str(text).map_err(|source| crate::project::error::Error::ParseRobot {
+    let document: RobotDocument = serde_yaml::from_value(value).map_err(|source| {
+        crate::project::error::Error::ParseRobot {
             path: path.to_owned(),
             source,
-        })?;
+        }
+    })?;
     document
         .validate()
         .map_err(|errors| crate::project::error::Error::InvalidRobot {
@@ -49,7 +58,6 @@ pub trait ValidateDocument {
 impl ValidateDocument for RobotDocument {
     fn validate(&self) -> Result<(), Vec<ValidationError>> {
         let mut errors = Vec::new();
-        validate_schema(self, &mut errors);
         validate_robot(self, &mut errors);
         validate_brain(self, &mut errors);
         validate_supervisor(self, &mut errors);
@@ -81,7 +89,6 @@ impl ValidateComponentDocument for ComponentDocument {
         }
     }
 }
-fn validate_schema(_document: &RobotDocument, _errors: &mut Vec<ValidationError>) {}
 fn validate_robot(document: &RobotDocument, errors: &mut Vec<ValidationError>) {
     let RobotDocument::V0 { robot, .. } = document;
     let phoxal::artifact::document::RobotSection { services, .. } = robot;
@@ -347,12 +354,12 @@ fn push_identifier_error(field: &str, value: &str, errors: &mut Vec<ValidationEr
         });
     }
 }
-fn push_config_errors(value: &Value, field: &str, errors: &mut Vec<ValidationError>) {
+fn push_config_errors(value: &ConfigValue, field: &str, errors: &mut Vec<ValidationError>) {
     match value {
-        Value::Null => errors.push(ValidationError::NullConfiguration {
+        ConfigValue::Null => errors.push(ValidationError::NullConfiguration {
             field: field.to_owned(),
         }),
-        Value::Object(_) => {}
+        ConfigValue::Object(_) => {}
         _ => errors.push(ValidationError::NonMappingConfiguration {
             field: field.to_owned(),
         }),
@@ -365,7 +372,7 @@ pub(crate) fn is_identifier(value: &str) -> bool {
 mod tests {
     use super::*;
     #[test]
-    fn parse_and_validate_accepts_a_minimal_document() {
+    fn compose_and_validate_accepts_a_minimal_document() {
         let yaml = r#"
 schema: phoxal/robot/v0
 robot:
@@ -373,12 +380,13 @@ robot:
 supervisor:
   source: { path: supervisor }
 "#;
-        let doc = parse_and_validate(yaml, Path::new("robot.yaml")).expect("valid");
+        let value: serde_yaml::Value = serde_yaml::from_str(yaml).expect("composed value");
+        let doc = compose_and_validate(value, Path::new("robot.yaml")).expect("valid");
         let RobotDocument::V0 { robot, .. } = &doc;
         assert_eq!(robot.id, "rover");
     }
     #[test]
-    fn parse_and_validate_collects_identifier_errors() {
+    fn compose_and_validate_collects_identifier_errors() {
         let yaml = r#"
 schema: phoxal/robot/v0
 robot:
@@ -386,12 +394,37 @@ robot:
 supervisor:
   source: { path: supervisor }
 "#;
+        let value: serde_yaml::Value = serde_yaml::from_str(yaml).expect("composed value");
         let err =
-            parse_and_validate(yaml, Path::new("robot.yaml")).expect_err("invalid identifier");
+            compose_and_validate(value, Path::new("robot.yaml")).expect_err("invalid identifier");
         assert!(matches!(
             err,
             crate::project::error::Error::InvalidRobot { .. }
         ));
+    }
+    #[test]
+    fn compose_and_validate_reports_type_errors_without_a_fabricated_location() {
+        let yaml = r#"
+schema: phoxal/robot/v0
+robot:
+  id: 123
+  services: {}
+supervisor:
+  source: { path: supervisor }
+"#;
+        let value: serde_yaml::Value = serde_yaml::from_str(yaml).expect("composed value");
+        let err = compose_and_validate(value, Path::new("robot.yaml")).expect_err("non-string id");
+        match err {
+            crate::project::error::Error::ParseRobot { source, .. } => {
+                let message = source.to_string();
+                assert!(message.contains("invalid type"), "{message}");
+                assert!(
+                    !message.contains("line"),
+                    "a composed value has no source location: {message}"
+                );
+            }
+            other => panic!("expected a deserialization error, got {other:?}"),
+        }
     }
     #[test]
     fn component_validation_accepts_explicit_native_capabilities_and_refuses_bad_root() {

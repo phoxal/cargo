@@ -8,6 +8,8 @@ use std::path::{Path, PathBuf};
 pub(crate) struct Composition {
     pub(crate) document: RobotDocument,
     pub(crate) inputs: Vec<(PathBuf, Vec<u8>)>,
+    /// The selected robot files in order, canonically resolved.
+    pub(crate) canonical_files: Vec<PathBuf>,
 }
 impl Composition {
     pub(crate) fn load(root: &Path, files: &[PathBuf]) -> Result<Self, Error> {
@@ -18,6 +20,7 @@ impl Composition {
         };
         let mut origins = BTreeMap::new();
         let mut captured = Vec::new();
+        let mut canonical_files = Vec::new();
         let mut resolved = Value::Mapping(Mapping::new());
         for path in &inputs {
             let canonical = path.canonicalize().map_err(|source| Error::ReadRobot {
@@ -36,6 +39,7 @@ impl Composition {
                 source,
             })?;
             captured.push((path.clone(), text.as_bytes().to_vec()));
+            canonical_files.push(canonical.clone());
             // The Value deserializer rejects repeated mapping keys, including nested keys.
             let layer: Value = serde_yaml::from_str(&text).map_err(|source| Error::ParseRobot {
                 path: path.clone(),
@@ -56,12 +60,8 @@ impl Composition {
             merge(&mut resolved, layer, path, "")?;
         }
         resolve_sources(&mut resolved, &origins, &inputs[0])?;
-        let text = serde_yaml::to_string(&resolved).map_err(|source| Error::ParseRobot {
-            path: root.join("robot.yaml"),
-            source,
-        })?;
-        let document = super::document::parse_and_validate(
-            &text,
+        let document = super::document::compose_and_validate(
+            resolved,
             inputs.last().unwrap_or(&root.join("robot.yaml")),
         )
         .map_err(|error| match error {
@@ -129,10 +129,10 @@ impl Composition {
         Ok(Self {
             document,
             inputs: captured,
+            canonical_files,
         })
     }
 }
-
 /// Authored indirection is tool-owned and never enters prepared/runtime records.
 #[derive(serde::Deserialize)]
 #[serde(untagged)]
@@ -495,5 +495,50 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn composed_type_errors_keep_selection_provenance_without_locations() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let base = root.join("robot.yaml");
+        std::fs::write(
+            &base,
+            "schema: phoxal/robot/v0\nrobot:\n  id: rover\n  services: {}\nsupervisor: {source: {path: supervisor}}\n",
+        )
+        .unwrap();
+        let overlay = root.join("overlay.yaml");
+        std::fs::write(&overlay, "schema: phoxal/robot/v0\nrobot:\n  id: 123\n").unwrap();
+        let error = Composition::load(root.as_path(), &[base, overlay])
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("resolved composition (selected inputs:"),
+            "{error}"
+        );
+        assert!(error.contains("invalid type"), "{error}");
+        assert!(
+            !error.contains("line"),
+            "a composed value has no source location: {error}"
+        );
+    }
+
+    #[test]
+    fn validation_errors_keep_their_originating_layer() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let base = root.join("robot.yaml");
+        std::fs::write(
+            &base,
+            "schema: phoxal/robot/v0\nrobot:\n  id: rover\n  services: {}\nsupervisor: {source: {path: supervisor}}\n",
+        )
+        .unwrap();
+        let overlay = root.join("overlay.yaml");
+        std::fs::write(&overlay, "schema: phoxal/robot/v0\nrobot:\n  id: Rover\n").unwrap();
+        let error = Composition::load(root.as_path(), &[base, overlay])
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("overlay.yaml: "), "{error}");
+        assert!(error.contains("robot.id"), "{error}");
     }
 }

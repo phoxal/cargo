@@ -5,7 +5,6 @@
 //! or native simulator implementations.
 
 mod application;
-mod archive;
 pub mod artifact;
 mod bundle;
 mod cargo;
@@ -19,17 +18,18 @@ mod file_lock;
 pub(crate) mod manifest_check;
 pub(crate) mod participant;
 mod passive;
+pub(crate) mod publish;
+pub(crate) use publish::slot_path;
 pub mod scenario;
 mod selection;
 mod simulation;
 pub(crate) use simulation::selected_simulator_executable;
 mod supervisor;
 mod validation;
+pub(crate) mod watch;
 
 #[cfg(test)]
 mod test_support;
-#[cfg(test)]
-mod tests;
 
 pub use bundle::{CompiledBundle, SimulationModelFacts};
 pub use cargo::{CargoOperation, CargoOptions, CargoOutput, CargoSelection, LockMode};
@@ -39,12 +39,31 @@ pub use error::{DiscoveryError, Error, SourceError};
 pub(crate) use participant::phoxal_home;
 
 pub use selection::{SelectedTarget, SourceSelection};
-pub use simulation::{
-    SimulationBound, SimulationPresentation, SimulationRunOptions, SimulationRunReport,
-};
+pub use simulation::{SimulationBound, SimulationPresentation, SimulationRunOptions};
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
+
+/// Narrow command-owned reporting of real workflow phases.
+///
+/// Implementations record one claim when the owning operation actually
+/// enters source resolution, preparation, compilation, assembly, or
+/// publication; nothing polls progress or invents percentages.
+pub(crate) trait PhaseReporter {
+    /// Reports entering one owning workflow phase.
+    fn phase(&self, phase: &str);
+    /// Checks command-owned source/cancellation guards at publication.
+    fn before_publication(&self) -> Result<(), Error> {
+        Ok(())
+    }
+}
+
+/// Reports nothing; the reporter for callers without live feedback.
+pub(crate) struct NoPhases;
+
+impl PhaseReporter for NoPhases {
+    fn phase(&self, _phase: &str) {}
+}
 
 /// A discovered project with its authored document and root Cargo manifest.
 #[derive(Debug, Clone)]
@@ -52,6 +71,7 @@ pub struct Project {
     layout: ProjectLayout,
     document: RobotDocument,
     inputs: Vec<(PathBuf, Vec<u8>)>,
+    canonical_files: Vec<PathBuf>,
 }
 
 impl Project {
@@ -73,8 +93,37 @@ impl Project {
         &self.document
     }
 
-    pub fn prepare_inputs(&self, options: &CargoOptions) -> Result<Vec<String>, Error> {
-        let changes = participant::prepare(&self.layout, options, &self.document)?;
+    /// The authored robot identity.
+    #[must_use]
+    pub fn robot_id(&self) -> String {
+        let RobotDocument::V0 { robot, .. } = &self.document;
+        robot.id.clone()
+    }
+
+    /// The selected robot files in canonical order.
+    #[must_use]
+    pub fn robot_files(&self) -> &[PathBuf] {
+        &self.canonical_files
+    }
+
+    /// Resolves Cargo's target directory for this project without
+    /// dependency acquisition or artifact creation.
+    pub fn resolve_target_directory(&self, options: &CargoOptions) -> Result<PathBuf, Error> {
+        cargo::resolve_target_directory(self.layout.cargo_manifest(), self.layout.root(), options)
+    }
+
+    /// Resolves the effective toolchain identity in the Cargo owner's
+    /// robot-root context, the same context metadata and builds use.
+    pub fn resolve_toolchain(&self, options: &CargoOptions) -> Result<String, Error> {
+        cargo::effective_toolchain(options, self.layout.root())
+    }
+
+    pub fn prepare_inputs(
+        &self,
+        options: &CargoOptions,
+        phases: &dyn PhaseReporter,
+    ) -> Result<Vec<String>, Error> {
+        let changes = participant::prepare(&self.layout, options, &self.document, phases)?;
         let RobotDocument::V0 { robot, .. } = &self.document;
         let phoxal::artifact::document::RobotSection { services, .. } = robot;
         let selections = services
@@ -156,6 +205,7 @@ impl Project {
         Ok(Self {
             layout,
             document,
+            canonical_files: composition.canonical_files,
             inputs: composition.inputs,
         })
     }
@@ -165,8 +215,12 @@ impl Project {
     /// Participant selections come from the authored document. The supervisor
     /// is acquired separately when assembling a bundle, never inserted into
     /// the robot's Rust dependency graph.
-    pub fn prepare(&self, options: &CargoOptions) -> Result<PreparedProject, Error> {
-        self.prepare_inputs(options)?;
+    pub fn prepare(
+        &self,
+        options: &CargoOptions,
+        phases: &dyn PhaseReporter,
+    ) -> Result<PreparedProject, Error> {
+        self.prepare_inputs(options, phases)?;
         let document = self.document.clone();
         let metadata = cargo::load_metadata_at(
             self.layout.cargo_manifest(),
@@ -186,8 +240,10 @@ impl Project {
             cargo_metadata: metadata,
             cargo_root_package,
             cargo_sources,
+            robot_files: self.canonical_files.clone(),
         };
         let target = &prepared.cargo_sources.brain;
+        phases.phase("compiling the robot brain");
         let output = cargo::build_target(&prepared, target, options)?;
         let executable = cargo::artifact_path(&output.stdout, target)?;
         match artifact::inspect_file(&executable) {
@@ -243,6 +299,8 @@ pub struct PreparedProject {
     cargo_metadata: cargo_metadata::Metadata,
     cargo_root_package: cargo_metadata::Package,
     cargo_sources: SourceSelection,
+    /// The selected robot files in canonical order, keying the publication slot.
+    robot_files: Vec<PathBuf>,
 }
 
 impl PreparedProject {
@@ -308,8 +366,9 @@ impl PreparedProject {
         &self,
         options: &CargoOptions,
         output: impl AsRef<Path>,
+        phases: &dyn PhaseReporter,
     ) -> Result<CompiledBundle, Error> {
-        bundle::assemble_with_inputs(self, options, output, true, None, None)
+        bundle::assemble_with_inputs(self, options, output, true, None, None, phases)
     }
 
     /// Builds an immutable bundle and launches its selected supervisor in the
@@ -318,14 +377,18 @@ impl PreparedProject {
         &self,
         options: &CargoOptions,
         output: impl AsRef<Path>,
+        phases: &dyn PhaseReporter,
     ) -> Result<CompiledBundle, Error> {
-        let bundle = self.build_bundle(options, output)?;
+        let bundle = self.build_bundle(options, output, phases)?;
         let supervisor = bundle.executable("supervisor");
         let state_dir = bundle.root().parent().unwrap_or(Path::new(".")).join("run");
         std::fs::create_dir_all(&state_dir).map_err(|source| Error::BundleDirectory {
             path: state_dir.clone(),
             source,
         })?;
+        // The publication phases end here: the owned runtime owns the
+        // terminal until the supervisor exits.
+        phases.phase("running the robot");
         let status = Command::new(&supervisor)
             .arg(bundle.root())
             .arg("--state-dir")
@@ -347,22 +410,19 @@ impl PreparedProject {
         Ok(bundle)
     }
 
-    /// Returns the default bundle path under Cargo's target directory.
-    #[must_use]
-    pub fn default_bundle_path(&self, options: &CargoOptions) -> PathBuf {
+    /// The default publication slot under Cargo's resolved target directory.
+    ///
+    /// One resolver serves the path query and the real build: the slot keys
+    /// the complete ordered robot selection and effective build settings.
+    pub fn default_bundle_path(&self, options: &CargoOptions) -> Result<PathBuf, Error> {
         let RobotDocument::V0 { robot, .. } = &self.document;
-        self.cargo_metadata
-            .target_directory
-            .as_std_path()
-            .join("phoxal")
-            .join(&robot.id)
-            .join(cargo::effective_target(options))
-            .join(options.profile.as_deref().unwrap_or(if options.release {
-                "release"
-            } else {
-                "dev"
-            }))
-            .join("build")
+        Ok(bundle::slot_path(
+            self.cargo_metadata.target_directory.as_std_path(),
+            &robot.id,
+            &self.robot_files,
+            options,
+            &cargo::effective_toolchain(options, self.layout.root())?,
+        ))
     }
 
     pub(crate) fn assembly_targets(&self) -> Vec<(String, &SelectedTarget)> {

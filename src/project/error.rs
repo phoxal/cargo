@@ -175,6 +175,23 @@ pub enum SourceError {
 /// The top-level error returned by project discovery, preparation, and Cargo commands.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
+    /// A fatal watch error with separately qualified preservation state.
+    #[error("{source}")]
+    WatchFailure {
+        /// The original authored or watcher diagnostic.
+        source: Box<Error>,
+        /// Known previous build state, or unknown when cleanup failed.
+        preserved: Option<bool>,
+    },
+    /// A watch startup, observation or pin failure requiring restart.
+    #[error("{message}")]
+    Watch { message: String },
+    /// Sources changed while an attempt owned private staging.
+    #[error("inputs changed during build")]
+    StaleBuild,
+    /// The owner requested bounded cancellation.
+    #[error("build watch cancelled")]
+    WatchCancelled,
     /// Shared prepared-input configuration or publication failed.
     #[error(transparent)]
     PreparedInput(#[from] phoxal_build::Error),
@@ -406,8 +423,20 @@ pub enum Error {
         /// Filesystem failure.
         source: std::io::Error,
     },
-    /// Another process is already constructing the same bundle output.
-    #[error("another cargo phoxal command is publishing compiled bundle {path}")]
+    /// Another cargo phoxal operation already owns this project's admission.
+    #[error(
+        "another cargo phoxal operation owns this project at {path}: {cause}; let that operation finish or stop that command, then retry"
+    )]
+    ProjectBusy {
+        /// Contended project admission lock.
+        path: PathBuf,
+        /// Lock acquisition cause.
+        cause: String,
+    },
+    /// Another command owns the bundle output, including an idle watcher.
+    #[error(
+        "another cargo phoxal command owns this output {path}; let that command exit or stop its watcher, then retry"
+    )]
     BundleBusy {
         /// Contended complete bundle output.
         path: PathBuf,

@@ -7,6 +7,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
+use phoxal::artifact::simulation::SimulationRunReport;
 use phoxal::scenario::fixture_protocol::{
     self, ClientMessage, HostMessage, PROTOCOL_VERSION, RunFailure,
 };
@@ -91,22 +92,28 @@ pub(crate) fn run_scenario(
     for output in &outputs {
         forward_compilation(options, &output.stdout, &output.stderr);
     }
-    let executable = outputs
-        .iter()
-        .flat_map(|output| output.stdout.split(|byte| *byte == b'\n'))
-        .filter_map(|line| serde_json::from_slice::<cargo_metadata::Message>(line).ok())
-        .find_map(|message| match message {
-            cargo_metadata::Message::CompilerArtifact(artifact)
-                if artifact.target.name == target.name
-                    && artifact.package_id == prepared.cargo_root_package().id =>
-            {
-                artifact.executable
+    let root_package_id = prepared.cargo_root_package().id.to_string();
+    let selector = crate::project::cargo::ExecutableSelector {
+        package_id: Some(root_package_id.as_str()),
+        manifest_path: None,
+        binary: &target.name,
+        bin_only: false,
+    };
+    let mut selected = None;
+    for output in &outputs {
+        let messages = crate::project::cargo::parse_message_stream(&output.stdout)
+            .map_err(|message| Error::InvalidOptions { message })?;
+        match crate::project::cargo::select_executable(&messages, &selector) {
+            crate::project::cargo::SelectedExecutable::Found(executable) => {
+                selected = Some(executable);
+                break;
             }
-            _ => None,
-        })
-        .ok_or_else(|| Error::InvalidOptions {
-            message: "Cargo did not emit the selected scenario executable".into(),
-        })?;
+            crate::project::cargo::SelectedExecutable::Missing => {}
+        }
+    }
+    let executable = selected.ok_or_else(|| Error::InvalidOptions {
+        message: "Cargo did not emit the selected scenario executable".into(),
+    })?;
     let host = TestHostOptions {
         simulator: None,
         headless: !desktop,
@@ -171,7 +178,7 @@ pub(crate) fn run_scenario(
                     server_stop,
                 )
             });
-            let cargo = Command::new(executable.as_std_path())
+            let cargo = Command::new(&executable)
                 .current_dir(&project_root)
                 .envs(environment.iter().cloned())
                 .output()
@@ -216,8 +223,8 @@ fn forward_compilation(options: &CargoOptions, stdout: &[u8], stderr: &[u8]) {
             .as_deref()
             .is_some_and(|format| format.starts_with("json")),
     );
-    crate::print_bytes(&output.stdout, false);
-    crate::print_bytes(&output.stderr, true);
+    crate::output::bytes(&output.stdout, false);
+    crate::output::bytes(&output.stderr, true);
 }
 
 fn compilation_diagnostics(stdout: &[u8], stderr: &[u8], json: bool) -> CargoOutput {
@@ -399,7 +406,7 @@ fn serve_request(
     );
     match lifecycle {
         Ok(report) => {
-            let crate::project::SimulationRunReport::V0 {
+            let SimulationRunReport::V0 {
                 simulator_exit_code,
                 cleanup,
                 supervisor_ready,

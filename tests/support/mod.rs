@@ -55,7 +55,7 @@ pub fn stage(fixture: &str) -> (tempfile::TempDir, PathBuf) {
 #[allow(dead_code)]
 pub(crate) fn copy_tree(source: &Path, destination: &Path) -> std::io::Result<()> {
     let metadata = fs::symlink_metadata(source)?;
-    if metadata.is_file() {
+    if metadata.is_file() || (metadata.is_symlink() && source.is_file()) {
         if let Some(parent) = destination.parent() {
             fs::create_dir_all(parent)?;
         }

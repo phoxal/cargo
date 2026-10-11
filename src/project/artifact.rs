@@ -37,6 +37,9 @@ const DESCRIPTOR_SECTION_NAMES: [&str; 2] = [".phoxal_desc", "__phoxal_desc"];
 const SCHEMA_SECTION_NAMES: [&str; 2] = [".phoxal_schema", "__phoxal_schema"];
 const ARTIFACT_MAGIC: &[u8; 8] = b"PHXART0\n";
 const DESCRIPTOR_MAGIC: &[u8; 8] = &phoxal::contracts::DESCRIPTOR_FRAME_MAGIC;
+/// Magic plus the u64 length header preceding every native descriptor
+/// payload inside its section.
+const DESCRIPTOR_FRAME_OVERHEAD: usize = DESCRIPTOR_MAGIC.len() + 8;
 const MAX_SECTION_BYTES: usize = 8 * 1024 * 1024;
 const MAX_RECORD_BYTES: usize = 65_536;
 const MAX_RECORDS: usize = 64;
@@ -224,66 +227,51 @@ pub fn inspect_bytes(bytes: &[u8]) -> Result<ArtifactContract, Error> {
     // Rust-authored schema records assemble into one additional standard
     // descriptor closure for this artifact, exactly like a compiled
     // descriptor set would be retained.
-    let assembled_descriptors = if schemas.is_empty() {
-        Vec::new()
+    let assembled_payload = if schemas.is_empty() {
+        None
     } else {
         let set = phoxal::schema::assemble_file_descriptors(&schemas)
             .map_err(|error| Error::InvalidContract(error.to_string()))?;
-        let raw = prost::Message::encode_to_vec(&set);
-        let pool = DescriptorPool::decode(raw.as_slice())?;
-        let files = pool
-            .files()
-            .map(|file| file.name().to_owned())
-            .collect::<Vec<_>>();
-        vec![DescriptorInfo {
-            sha256: {
-                let mut hasher = Sha256::new();
-                hasher.update(&raw);
-                format!("{:x}", hasher.finalize())
-            },
-            bytes: raw.len() as u64,
-            files,
-            raw,
-        }]
+        let payload = prost::Message::encode_to_vec(&set);
+        // The assembled closure occupies the same effective section bound a
+        // framed native descriptor section would: magic, length header, and
+        // payload bytes together.
+        let effective = payload
+            .len()
+            .checked_add(DESCRIPTOR_FRAME_OVERHEAD)
+            .ok_or_else(|| Error::MalformedFrame {
+                kind: "descriptor",
+                message: "descriptor length overflow".to_owned(),
+            })?;
+        if effective > MAX_SECTION_BYTES {
+            return Err(Error::SectionTooLarge {
+                section: ".phoxal_desc",
+                bytes: effective,
+            });
+        }
+        Some(payload)
     };
-    let assembled_sections = assembled_descriptors_into_sections(assembled_descriptors);
-    descriptor_sections.extend(assembled_sections.iter().map(|bytes| bytes.as_slice()));
-    let descriptors =
+    let mut payloads =
         descriptor_sections
             .iter()
-            .try_fold(Vec::new(), |mut descriptors, section| {
+            .try_fold(Vec::new(), |mut payloads, section| {
                 if section.len() > MAX_SECTION_BYTES {
                     return Err(Error::SectionTooLarge {
                         section: ".phoxal_desc",
                         bytes: section.len(),
                     });
                 }
-                descriptors.extend(parse_descriptor_frames(section)?);
-                Ok(descriptors)
+                payloads.extend(parse_descriptor_frames(section)?);
+                Ok(payloads)
             })?;
-    let descriptors = descriptors
+    // The assembled closure enters the same payload validation as native
+    // frames, after every native descriptor section.
+    if let Some(payload) = assembled_payload {
+        payloads.push(payload);
+    }
+    let descriptors = payloads
         .into_iter()
-        .map(|raw| {
-            let pool = DescriptorPool::decode(raw.as_slice())?;
-            let files = pool
-                .files()
-                .map(|file| file.name().to_owned())
-                .collect::<Vec<_>>();
-            if files.len() > MAX_DESCRIPTOR_FILES {
-                return Err(Error::InvalidContract(format!(
-                    "descriptor closure contains {} files, limit is {MAX_DESCRIPTOR_FILES}",
-                    files.len()
-                )));
-            }
-            let mut hasher = Sha256::new();
-            hasher.update(&raw);
-            Ok(DescriptorInfo {
-                sha256: format!("{:x}", hasher.finalize()),
-                bytes: raw.len() as u64,
-                files,
-                raw,
-            })
-        })
+        .map(descriptor_payload_info)
         .collect::<Result<Vec<_>, Error>>()?;
     Ok(ArtifactContract {
         runtime,
@@ -292,18 +280,31 @@ pub fn inspect_bytes(bytes: &[u8]) -> Result<ArtifactContract, Error> {
     })
 }
 
-/// Wraps assembled descriptor bytes as pseudo-sections for the shared
-/// descriptor-frame fold.
-fn assembled_descriptors_into_sections(infos: Vec<DescriptorInfo>) -> Vec<Vec<u8>> {
-    infos
-        .into_iter()
-        .map(|info| {
-            let mut section = phoxal::contracts::DESCRIPTOR_FRAME_MAGIC.to_vec();
-            section.extend_from_slice(&(info.bytes.to_le_bytes()));
-            section.extend_from_slice(&info.raw);
-            section
-        })
-        .collect()
+/// Validates one descriptor payload and retains it unchanged.
+///
+/// Both native frames and assembled Rust schema closures enter here: the
+/// payload is decoded once, bounded by the file limit, and digested for its
+/// identity. Original payload bytes and their order are preserved.
+fn descriptor_payload_info(payload: Vec<u8>) -> Result<DescriptorInfo, Error> {
+    let pool = DescriptorPool::decode(payload.as_slice())?;
+    let files = pool
+        .files()
+        .map(|file| file.name().to_owned())
+        .collect::<Vec<_>>();
+    if files.len() > MAX_DESCRIPTOR_FILES {
+        return Err(Error::InvalidContract(format!(
+            "descriptor closure contains {} files, limit is {MAX_DESCRIPTOR_FILES}",
+            files.len()
+        )));
+    }
+    let mut hasher = Sha256::new();
+    hasher.update(&payload);
+    Ok(DescriptorInfo {
+        sha256: format!("{:x}", hasher.finalize()),
+        bytes: payload.len() as u64,
+        files,
+        raw: payload,
+    })
 }
 
 fn parse_artifact_records(section: &[u8]) -> Result<Vec<&[u8]>, Error> {
@@ -707,6 +708,64 @@ mod tests {
         section.extend_from_slice(&descriptor.raw);
         let parsed = parse_descriptor_frames(&section).expect("SDK descriptor frame parses");
         assert_eq!(parsed, vec![descriptor.raw]);
+    }
+
+    fn descriptor_frame(raw: &[u8]) -> Vec<u8> {
+        let mut section = phoxal::contracts::DESCRIPTOR_FRAME_MAGIC.to_vec();
+        section.extend_from_slice(&(raw.len() as u64).to_le_bytes());
+        section.extend_from_slice(raw);
+        section
+    }
+
+    fn artifact_with_descriptors(section: &[u8]) -> Vec<u8> {
+        let mut object = Object::new(BinaryFormat::Elf, Architecture::X86_64, Endianness::Little);
+        let runtime = object.add_section(
+            Vec::new(),
+            b".phoxal_art".to_vec(),
+            SectionKind::ReadOnlyData,
+        );
+        object.append_section_data(runtime, &frame(EMPTY_RUNTIME), 1);
+        let descriptors = object.add_section(
+            Vec::new(),
+            b".phoxal_desc".to_vec(),
+            SectionKind::ReadOnlyData,
+        );
+        object.append_section_data(descriptors, section, 1);
+        object.write().expect("synthetic object")
+    }
+
+    #[test]
+    fn native_descriptor_payloads_keep_order_bytes_and_deduplicate() {
+        let first = descriptor("first.proto", field_descriptor_proto::Type::String);
+        let second = descriptor("second.proto", field_descriptor_proto::Type::Uint64);
+        let mut section = descriptor_frame(&first.raw);
+        section.extend_from_slice(&descriptor_frame(&first.raw));
+        section.extend_from_slice(&descriptor_frame(&second.raw));
+        let contract =
+            inspect_bytes(&artifact_with_descriptors(&section)).expect("descriptor payloads");
+        assert_eq!(contract.descriptors.len(), 2);
+        assert_eq!(contract.descriptors[0].raw_bytes(), first.raw_bytes());
+        assert_eq!(contract.descriptors[0].sha256, first.sha256);
+        assert_eq!(
+            contract.descriptors[0].files,
+            vec!["first.proto".to_owned()]
+        );
+        assert_eq!(contract.descriptors[1].raw_bytes(), second.raw_bytes());
+        assert_eq!(contract.descriptors[1].bytes, second.bytes);
+    }
+
+    #[test]
+    fn descriptor_payload_validation_enforces_the_file_limit() {
+        let mut files = Vec::new();
+        for index in 0..=MAX_DESCRIPTOR_FILES {
+            files.push(FileDescriptorProto {
+                name: Some(format!("file{index}.proto")),
+                ..Default::default()
+            });
+        }
+        let raw = FileDescriptorSet { file: files }.encode_to_vec();
+        let error = descriptor_payload_info(raw).expect_err("file limit enforced");
+        assert!(error.to_string().contains("limit is"), "{error}");
     }
 
     #[test]

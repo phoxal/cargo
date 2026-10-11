@@ -3,7 +3,7 @@
 use std::path::{Path, PathBuf};
 
 use phoxal::artifact::simulation::{
-    ScenarioExecutionReport, ScenarioStepEvidence, SimulatorTerminalEvidence,
+    ScenarioExecutionReport, ScenarioStepEvidence, SimulationRunReport, SimulatorTerminalEvidence,
 };
 use phoxal::scenario::fixture_protocol::{
     CaptureRecordRef, CommandReplyRef, LifecycleReport, NativeBodyRef, StepOutcomeRecord,
@@ -12,9 +12,7 @@ use phoxal::scenario::plan_support::{
     Action, Capture, CaptureRecord, CapturedObservation, Program, StepOutcome,
 };
 
-use crate::project::simulation::{
-    SimulationBound, SimulationPresentation, SimulationRunOptions, SimulationRunReport,
-};
+use crate::project::simulation::{SimulationBound, SimulationPresentation, SimulationRunOptions};
 use crate::project::{Error, SimulationModelFacts};
 
 pub(super) fn build_probe_request(

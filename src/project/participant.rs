@@ -84,7 +84,7 @@ pub(crate) fn installation_store(
     let selection = serde_json::to_vec(&(
         source,
         binary,
-        super::cargo::BuildSelection::for_source(options),
+        super::cargo::BuildSelection::participant(options),
     ))
     .map_err(|error| invalid(root, error.to_string()))?;
     Ok(home
@@ -217,15 +217,12 @@ pub(crate) fn prepare(
     layout: &ProjectLayout,
     options: &CargoOptions,
     robot: &RobotDocument,
+    phases: &dyn super::PhaseReporter,
 ) -> Result<Vec<String>, Error> {
     options.validate()?;
     let _lock = preparation_lock(layout.root())?;
     let home = phoxal_home()?;
     let _installation_lock = installation_lock(&home)?;
-    let target = match &options.target {
-        Some(target) => target.clone(),
-        None => host_target()?,
-    };
     let RobotDocument::V0 { robot, .. } = robot;
     let phoxal::artifact::document::RobotSection { services, .. } = robot;
     let root = layout
@@ -241,6 +238,7 @@ pub(crate) fn prepare(
             .canonicalize().is_ok_and(| resolved | resolved == root)
         )
     };
+    phases.phase("resolving selected sources");
     let mut selections: Vec<(&String, &Source, Option<&str>, Option<&serde_json::Value>)> =
         services
             .iter()
@@ -279,7 +277,7 @@ pub(crate) fn prepare(
     for (instance, source, binary, config) in selections {
         if seen.insert(format!("{source:?}:{binary:?}"))
             && let Some(change) =
-                prepare_selection(layout, options, &home, &target, instance, source, binary)?
+                prepare_selection(layout, options, &home, instance, source, binary, phases)?
         {
             changes.push(change);
         }
@@ -328,6 +326,7 @@ fn prepare_local_contract(
     path: &Path,
     declared_binary: Option<&str>,
     selection: &InstalledSelection,
+    phases: &dyn super::PhaseReporter,
 ) -> Result<(), Error> {
     let selection_identity = phoxal_build::PreparedSelection::Path {
         path: path.to_string_lossy().into_owned(),
@@ -340,6 +339,7 @@ fn prepare_local_contract(
         &selection_identity,
         declared_binary,
         &contract_dir,
+        phases,
     )
     .map(|_| ())
 }
@@ -354,6 +354,7 @@ fn prepare_selection_products(
     selection_identity: &phoxal_build::PreparedSelection,
     selection_binary: Option<&str>,
     contract_dir: &Path,
+    phases: &dyn super::PhaseReporter,
 ) -> Result<bool, Error> {
     let manifest_path = selection
         .manifest_path
@@ -367,44 +368,53 @@ fn prepare_selection_products(
             message: "local participant manifest has no parent".to_owned(),
         })?
         .to_owned();
-    let mut command = Command::new(options.cargo_program());
-    command
-        .current_dir(&workdir)
-        .args(["build", "--manifest-path"]);
-    command.arg(&manifest_path);
-    let mut local_options = options.clone();
-    local_options.features.clear();
-    local_options.all_features = false;
-    local_options.no_default_features = false;
-    local_options.cargo_args.clear();
-    local_options.append_common(&mut command, false, false);
-    command.args([
-        "--package",
+    phases.phase("compiling selected contracts");
+    let mut command = super::cargo::local_package_build(
+        &workdir,
+        &manifest_path,
         &selection.package,
-        "--bin",
         &selection.binary,
-        "--message-format",
         "json",
-    ]);
-    let output = command.output().map_err(|source| Error::ArtifactFile {
-        path: options.cargo_program(),
-        source,
-    })?;
+        options,
+    )?;
+    let output =
+        crate::owned_process::output(&mut command).map_err(|source| Error::ArtifactFile {
+            path: options.cargo_program(),
+            source,
+        })?;
+    super::cargo::forward_compiler_stream(&output, options);
     if !output.status.success() {
-        return Err(Error::CargoCommand {
-            operation: "build".to_owned(),
-            status: output.status.to_string(),
-            stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
-        });
+        return Err(super::cargo::cargo_command_failure(
+            "build",
+            output.status.to_string(),
+            &output,
+            options,
+        ));
     }
-    let executable = artifact_executable(&output.stdout, &selection.binary).ok_or_else(|| {
+    let messages = super::cargo::parse_message_stream(&output.stdout).map_err(|message| {
         Error::ArtifactCapture {
             package: selection.package.clone(),
             target: selection.binary.clone(),
-            message: "cargo reported no executable for the Rust-contract participant".to_owned(),
+            message,
         }
     })?;
+    let selector = super::cargo::ExecutableSelector {
+        package_id: Some(&selection.package_id),
+        manifest_path: None,
+        binary: &selection.binary,
+        bin_only: true,
+    };
+    let executable = match super::cargo::select_executable(&messages, &selector) {
+        super::cargo::SelectedExecutable::Found(executable) => executable,
+        super::cargo::SelectedExecutable::Missing => {
+            return Err(Error::ArtifactCapture {
+                package: selection.package.clone(),
+                target: selection.binary.clone(),
+                message: "cargo reported no executable for the Rust-contract participant"
+                    .to_owned(),
+            });
+        }
+    };
     let executable = workdir.join(executable.strip_prefix(&workdir).unwrap_or(&executable));
     prepare_executable_contract(
         &executable,
@@ -448,21 +458,6 @@ fn prepare_executable_contract(
         message: error.to_string(),
     })
 }
-/// Extracts the executable path of one binary from Cargo's JSON messages.
-fn artifact_executable(stdout: &[u8], binary: &str) -> Option<PathBuf> {
-    for line in String::from_utf8_lossy(stdout).lines() {
-        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
-            continue;
-        };
-        if value["reason"] == "compiler-artifact"
-            && value["target"]["name"] == binary
-            && value["executable"].is_string()
-        {
-            return Some(PathBuf::from(value["executable"].as_str()?));
-        }
-    }
-    None
-}
 /// Folds every retained descriptor closure of one artifact into a single
 /// standard descriptor set, collapsing identical files and rejecting
 /// conflicting definitions.
@@ -503,10 +498,10 @@ fn prepare_selection(
     layout: &ProjectLayout,
     options: &CargoOptions,
     home: &Path,
-    _target: &str,
     instance: &str,
     source: &Source,
     binary: Option<&str>,
+    phases: &dyn super::PhaseReporter,
 ) -> Result<Option<String>, Error> {
     let manifest = layout.robot_manifest();
     if !identifier(instance) || binary.is_some_and(|binary| !identifier(binary)) {
@@ -524,7 +519,7 @@ fn prepare_selection(
             ));
         }
         let selection = local_selection(layout, path, binary, options)?;
-        prepare_local_contract(layout, options, path, binary, &selection)?;
+        prepare_local_contract(layout, options, path, binary, &selection, phases)?;
         return Ok(None);
     }
     let selection_identity = match source {
@@ -583,25 +578,25 @@ fn prepare_selection(
     let cache_key = store
         .file_name()
         .ok_or_else(|| invalid(&store, "selection store has no build-cache key"))?;
-    command.env(
-        "CARGO_TARGET_DIR",
-        home.join("cache/participant-build").join(cache_key),
+    super::cargo::installation_cache(
+        &mut command,
+        &home.join("cache/participant-build").join(cache_key),
     );
     let operation = format!("install {package}");
-    let output = command.output().map_err(|source| Error::CargoSpawn {
-        operation: operation.clone(),
-        source,
-    })?;
+    let output =
+        crate::owned_process::output(&mut command).map_err(|source| Error::CargoSpawn {
+            operation: operation.clone(),
+            source,
+        })?;
+    super::cargo::forward_compiler_stream(&output, options);
     if !output.status.success() {
-        return Err(Error::CargoCommand {
-            operation,
-            status: output
-                .status
-                .code()
-                .map_or_else(|| "signal".into(), |code| code.to_string()),
-            stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
-        });
+        let status = output
+            .status
+            .code()
+            .map_or_else(|| "signal".into(), |code| code.to_string());
+        return Err(super::cargo::cargo_command_failure(
+            &operation, status, &output, options,
+        ));
     }
     let (source_root, package_id, version) =
         captured_source(&output.stdout, binary, package, expected_version, options)?;
@@ -675,6 +670,8 @@ fn prepare_selection(
     })?;
     Ok(Some(format!("{instance} {package} {version}")))
 }
+/// Extracts the captured source root of one installed binary from Cargo's
+/// JSON messages.
 pub(crate) fn captured_source(
     output: &[u8],
     binary: &str,
@@ -682,26 +679,20 @@ pub(crate) fn captured_source(
     expected_version: Option<&str>,
     options: &CargoOptions,
 ) -> Result<(PathBuf, String, String), Error> {
-    for line in output.split(|byte| *byte == b'\n') {
-        let Ok(value) = serde_json::from_slice::<serde_json::Value>(line) else {
+    // The whole install stream is validated before any record is used, so
+    // a malformed line after the selected artifact cannot pass unnoticed.
+    let messages = super::cargo::parse_message_stream(output)
+        .map_err(|message| invalid(Path::new("Cargo.toml"), message))?;
+    for message in &messages {
+        let cargo_metadata::Message::CompilerArtifact(artifact) = message else {
             continue;
         };
-        if value["reason"] != "compiler-artifact" || value["target"]["name"] != binary {
+        if artifact.target.name != binary || !artifact.target.is_bin() {
             continue;
         }
-        if !value["target"]["kind"]
-            .as_array()
-            .is_some_and(|kinds| kinds.iter().any(|kind| kind == "bin"))
-        {
-            continue;
-        }
-        let Some(source) = value["target"]["src_path"].as_str() else {
-            continue;
-        };
-        let Some(reported_id) = value["package_id"].as_str() else {
-            continue;
-        };
-        for directory in Path::new(source).ancestors().skip(1) {
+        let source = artifact.target.src_path.as_std_path();
+        let reported_id = artifact.package_id.to_string();
+        for directory in source.ancestors().skip(1) {
             let manifest = directory.join("Cargo.toml");
             if !manifest.is_file() {
                 continue;
@@ -725,7 +716,7 @@ pub(crate) fn captured_source(
                 if options.offline || matches!(options.lock, super::cargo::LockMode::Frozen) {
                     command.other_options(vec!["--offline".to_owned()]);
                 }
-                let metadata = command.exec().map_err(|error| {
+                let metadata = super::cargo::metadata_output(&command).map_err(|error| {
                     invalid(
                         &manifest,
                         format!("cannot read Cargo package information: {error}"),
@@ -841,12 +832,12 @@ pub(crate) fn phoxal_home() -> Result<PathBuf, Error> {
     }
 }
 fn host_target() -> Result<String, Error> {
-    let output = Command::new("rustc")
-        .arg("-vV")
-        .output()
-        .map_err(|source| Error::CargoSpawn {
-            operation: "read rustc host target".into(),
-            source,
+    let output =
+        crate::owned_process::output(Command::new("rustc").arg("-vV")).map_err(|source| {
+            Error::CargoSpawn {
+                operation: "read rustc host target".into(),
+                source,
+            }
         })?;
     if !output.status.success() {
         return Err(invalid(Path::new("rustc"), "cannot read the host target"));
@@ -886,12 +877,14 @@ pub(crate) fn operation_lock(root: &Path) -> Result<ExclusiveFileLock, Error> {
             path: path.clone(),
             source,
         })?;
-    ExclusiveFileLock::try_acquire(file).map_err(|error| {
-        invalid(
-            &path,
-            format!("another cargo phoxal operation owns this project: {error}"),
-        )
-    })
+    match ExclusiveFileLock::try_acquire(file) {
+        Ok(lock) => Ok(lock),
+        Err(TryLockError::WouldBlock) => Err(Error::ProjectBusy {
+            path,
+            cause: "the project admission lock is held".to_owned(),
+        }),
+        Err(TryLockError::Error(error)) => Err(invalid(&path, error.to_string())),
+    }
 }
 
 #[cfg(test)]
@@ -925,8 +918,14 @@ mod tests {
         fs::write(&source, "fn main() {}\n").expect("provider source");
         let message = serde_json::json!(
             { "reason" : "compiler-artifact", "package_id" :
-            "path+file:///proof-provider#1.2.3", "target" : { "name" : "proof-provider",
-            "kind" : ["bin"], "src_path" : source } }
+            "path+file:///proof-provider#1.2.3", "target" : { "name" :
+            "proof-provider", "kind" : ["bin"], "crate_types" : ["bin"],
+            "src_path" : source, "edition" : "2024", "doc" : false,
+            "doctest" : false, "test" : false }, "profile" : {
+            "opt_level" : "0", "debug_assertions" : true,
+            "overflow_checks" : true, "test" : false }, "features" : [],
+            "filenames" : [], "executable" : "/tmp/proof-provider",
+            "fresh" : false }
         )
         .to_string();
         let options = CargoOptions {
@@ -944,6 +943,48 @@ mod tests {
         assert_eq!(captured, provider);
         assert_eq!(package_id, "path+file:///proof-provider#1.2.3");
         assert_eq!(version, "1.2.3");
+    }
+    #[test]
+    fn captured_source_rejects_malformed_output_after_the_selected_artifact() {
+        let directory = tempfile::tempdir().expect("temporary workspace");
+        let root = directory.path();
+        let provider = root.join("provider");
+        fs::create_dir_all(provider.join("src")).expect("provider source directory");
+        fs::write(
+            provider.join("Cargo.toml"),
+            "[package]\nname = \"proof-provider\"\nversion = \"1.2.3\"\nedition = \"2024\"\n",
+        )
+        .expect("provider manifest");
+        let source = provider.join("src/main.rs");
+        fs::write(&source, "fn main() {}\n").expect("provider source");
+        let valid = serde_json::json!(
+            { "reason" : "compiler-artifact", "package_id" :
+            "path+file:///proof-provider#1.2.3", "target" : { "name" :
+            "proof-provider", "kind" : ["bin"], "crate_types" : ["bin"],
+            "src_path" : source, "edition" : "2024", "doc" : false,
+            "doctest" : false, "test" : false }, "profile" : {
+            "opt_level" : "0", "debug_assertions" : true,
+            "overflow_checks" : true, "test" : false }, "features" : [],
+            "filenames" : [], "executable" : "/tmp/proof-provider",
+            "fresh" : false }
+        )
+        .to_string();
+        let options = CargoOptions {
+            offline: true,
+            ..CargoOptions::default()
+        };
+        // A valid prefix must not let a trailing non-protocol line pass:
+        // the whole install stream is validated before success.
+        let error = captured_source(
+            format!("{valid}\nDownloaded proof-provider\n").as_bytes(),
+            "proof-provider",
+            "proof-provider",
+            Some("1.2.3"),
+            &options,
+        )
+        .expect_err("malformed suffix");
+        let message = format!("{error:#}");
+        assert!(message.contains("invalid Cargo JSON message"), "{message}");
     }
     #[test]
     fn retained_component_contains_runtime_resources_without_package_source() {

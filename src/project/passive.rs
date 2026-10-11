@@ -115,11 +115,9 @@ fn select_git(
             vec!["fetch", "--quiet", "--depth", "1", "--", &git.url, &git.rev],
             vec!["checkout", "--quiet", "--detach", "FETCH_HEAD"],
         ] {
-            let output = Command::new("git")
-                .current_dir(&checkout)
-                .args(args)
-                .output()
-                .map_err(|e| invalid(&checkout, e.to_string()))?;
+            let output =
+                crate::owned_process::output(Command::new("git").current_dir(&checkout).args(args))
+                    .map_err(|e| invalid(&checkout, e.to_string()))?;
             if !output.status.success() {
                 return Err(invalid(
                     &checkout,
@@ -130,11 +128,12 @@ fn select_git(
                 ));
             }
         }
-        let revision = Command::new("git")
-            .current_dir(&checkout)
-            .args(["rev-parse", "HEAD"])
-            .output()
-            .map_err(|e| invalid(&checkout, e.to_string()))?;
+        let revision = crate::owned_process::output(
+            Command::new("git")
+                .current_dir(&checkout)
+                .args(["rev-parse", "HEAD"]),
+        )
+        .map_err(|e| invalid(&checkout, e.to_string()))?;
         if !revision.status.success() || String::from_utf8_lossy(&revision.stdout).trim() != git.rev
         {
             return Err(invalid(
