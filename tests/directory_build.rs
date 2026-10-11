@@ -797,21 +797,142 @@ fn phase_claims_match_the_work_that_actually_runs() {
 
 #[test]
 fn changed_payload_publishes_a_new_generation_and_retains_the_old_reader_snapshot() {
+    fn snapshot(root: &Path) -> std::collections::BTreeMap<PathBuf, (u32, Vec<u8>)> {
+        let mut entries = std::collections::BTreeMap::new();
+        let mut pending = vec![root.to_owned()];
+        while let Some(path) = pending.pop() {
+            let metadata = fs::symlink_metadata(&path).unwrap();
+            let bytes = if metadata.is_dir() {
+                pending.extend(
+                    fs::read_dir(&path)
+                        .unwrap()
+                        .map(|entry| entry.unwrap().path()),
+                );
+                Vec::new()
+            } else if metadata.is_symlink() {
+                fs::read_link(&path)
+                    .unwrap()
+                    .as_os_str()
+                    .as_encoded_bytes()
+                    .to_vec()
+            } else {
+                fs::read(&path).unwrap()
+            };
+            entries.insert(
+                path.strip_prefix(root).unwrap().to_owned(),
+                (metadata.permissions().mode(), bytes),
+            );
+        }
+        entries
+    }
+    let brain = |generation: &Path| {
+        fs::read_dir(generation.join("bin"))
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| {
+                path.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with("check-valid-robot-")
+            })
+            .unwrap()
+    };
     let (_guard, root) = stage("check-valid");
-    assert_success(&build(&root, &[]), "first build");
+    let main = fs::read_to_string(root.join("src/main.rs")).unwrap();
+    let anchor = "std::hint::black_box(&PHOXAL_ARTIFACT);";
+    assert_eq!(main.matches(anchor).count(), 1);
+    let old_source = main.replace(
+        anchor,
+        &format!("{anchor} println!(\"DIRECTORY_PAYLOAD_OLD\");"),
+    );
+    fs::write(root.join("src/main.rs"), &old_source).unwrap();
+    let first = build(&root, &[]);
+    assert_success(&first, "first build");
     let stable = default_slot(&root);
     let first_generation = generation(&stable);
+    let first_brain = brain(&first_generation);
+    let first_bytes = fs::read(&first_brain).unwrap();
+    let first_run = Command::new(&first_brain).output().unwrap();
+    assert_success(&first_run, "old inert brain");
+    assert_eq!(
+        stdout(&first_run),
+        "DIRECTORY_PAYLOAD_OLD\n",
+        "old brain stdout={} stderr={}",
+        stdout(&first_run),
+        stderr(&first_run)
+    );
+    let old_snapshot = snapshot(&first_generation);
 
-    // A real source edit changes the payload, not the slot.
-    let main = fs::read_to_string(root.join("src/main.rs")).unwrap();
-    fs::write(root.join("src/main.rs"), format!("{main}\n// edited\n")).unwrap();
+    // An observable executable edit changes the payload, not source/slot identity.
+    fs::write(
+        root.join("src/main.rs"),
+        old_source.replace("DIRECTORY_PAYLOAD_OLD", "DIRECTORY_PAYLOAD_NEW"),
+    )
+    .unwrap();
     let second = build(&root, &[]);
     assert_success(&second, "changed build");
-    assert!(stdout(&second).contains("Build published: "));
+    let diagnostics = format!(
+        "changed build stdout:\n{}\nstderr:\n{}",
+        stdout(&second),
+        stderr(&second)
+    );
+    assert!(
+        stdout(&second).contains("Build published: "),
+        "{diagnostics}"
+    );
+    assert!(
+        !stdout(&second).contains("Build unchanged: "),
+        "{diagnostics}"
+    );
+    assert_eq!(
+        default_slot(&root),
+        stable,
+        "payload edits keep the resolved slot: {diagnostics}"
+    );
     let second_generation = generation(&stable);
-    assert_ne!(second_generation, first_generation);
-    // The old reader snapshot stays complete.
-    assert!(first_generation.join("manifest.json").is_file());
+    assert_ne!(second_generation, first_generation, "{diagnostics}");
+    let second_brain = brain(&second_generation);
+    let second_bytes = fs::read(&second_brain).unwrap();
+    assert!(
+        second_bytes != first_bytes,
+        "selected brain bytes must change: {diagnostics}"
+    );
+    let second_run = Command::new(&second_brain).output().unwrap();
+    assert_success(&second_run, "new inert brain");
+    assert_eq!(
+        stdout(&second_run),
+        "DIRECTORY_PAYLOAD_NEW\n",
+        "new brain stdout={} stderr={}; {diagnostics}",
+        stdout(&second_run),
+        stderr(&second_run)
+    );
+
+    // Every old reader entry retains its exact bytes, paths and modes.
+    assert!(
+        snapshot(&first_generation) == old_snapshot,
+        "complete old reader snapshot changed: {diagnostics}"
+    );
+    let old_reader = Command::new(&first_brain).output().unwrap();
+    assert_success(&old_reader, "retained old brain reader");
+    assert_eq!(
+        stdout(&old_reader),
+        "DIRECTORY_PAYLOAD_OLD\n",
+        "retained brain stdout={} stderr={}; {diagnostics}",
+        stdout(&old_reader),
+        stderr(&old_reader)
+    );
+    use sha2::Digest;
+    eprintln!(
+        "payload proof: old_brain={first_brain:?} new_brain={second_brain:?} old_sha={:x} new_sha={:x} old_reader_entries={} modes_and_bytes_preserved=true\nold marker={}new marker={}retained old marker={}\nfirst build stdout:\n{}\nstderr:\n{}\n{diagnostics}",
+        sha2::Sha256::digest(&first_bytes),
+        sha2::Sha256::digest(&second_bytes),
+        old_snapshot.len(),
+        stdout(&first_run),
+        stdout(&second_run),
+        stdout(&old_reader),
+        stdout(&first),
+        stderr(&first)
+    );
 }
 
 #[test]
