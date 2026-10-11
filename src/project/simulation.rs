@@ -20,6 +20,9 @@ use sha2::{Digest, Sha256};
 use crate::project::cargo::CargoOptions;
 use crate::project::{CompiledBundle, Error, Project, SimulationModelFacts};
 use phoxal::artifact::bundle::BundleManifest;
+use phoxal::artifact::simulation::SimulationRunReport;
+#[cfg(test)]
+use phoxal::artifact::simulation::SimulatorTerminalEvidence;
 use phoxal::artifact::simulation_run::{
     SimulationApplicationReference, SimulationBundleReference, SimulationCapturePolicy,
     SimulationCaptureRequirement, SimulationExecutionBounds, SimulationModelReference,
@@ -178,105 +181,8 @@ impl SimulationRunOptions {
     }
 }
 
-pub use phoxal::artifact::installation::SimulatorArtifactSummary;
+use phoxal::artifact::installation::SimulatorArtifactSummary;
 
-/// Bounded cleanup evidence for a local simulation process pair.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct SimulationCleanup {
-    /// Whether the supervisor was asked to stop.
-    pub supervisor_stop_requested: bool,
-    /// Whether the supervisor exited before the cleanup deadline.
-    pub supervisor_exited: bool,
-    /// Whether a forced kill was required.
-    pub supervisor_killed: bool,
-    /// Human-readable cleanup diagnostic, if cleanup was incomplete.
-    pub error: Option<String>,
-}
-
-/// Terminal evidence retained by one local finite simulation run.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "schema")]
-pub enum SimulationRunReport {
-    /// The first simulation-run report generation.
-    #[serde(rename = "phoxal/simulation-run/v0")]
-    V0 {
-        /// Canonical scene resource path.
-        scene: PathBuf,
-        /// Exact simulator artifact used.
-        simulator: SimulatorArtifactSummary,
-        /// Compiled simulation bundle path.
-        bundle: PathBuf,
-        /// Explicit router namespace.
-        scope: String,
-        /// Explicit supervisor identity.
-        supervisor_id: String,
-        /// Explicit finite run identity.
-        run_id: String,
-        /// Whether the supervisor survived startup readiness.
-        supervisor_ready: bool,
-        /// Whether the simulator emitted the required provider-contract terminal
-        /// evidence for the finite run.
-        provider_contract_verified: bool,
-        /// Simulator exit code, or none when it terminated by signal.
-        simulator_exit_code: Option<i32>,
-        /// Wall time spent inside the simulator process for this finite run.
-        simulator_wall_time_ns: u64,
-        /// Complete simulator standard output.
-        simulator_stdout: String,
-        /// Complete simulator standard error.
-        simulator_stderr: String,
-        /// Bounded supervisor cleanup evidence.
-        cleanup: SimulationCleanup,
-        /// Runtime-observed scenario evidence, when this was a scenario run.
-        scenario: Option<ScenarioExecutionReport>,
-        /// Parsed terminal evidence emitted by the native simulator.
-        terminal: Option<SimulatorTerminalEvidence>,
-    },
-}
-
-/// Evidence observed by the supervisor while executing one scenario program.
-///
-/// Re-exported from `phoxal::artifact::simulation`. The framework module is
-/// the source of truth; this alias keeps every existing
-/// internal call site compiling unchanged.
-pub use phoxal::artifact::simulation::ScenarioExecutionReport;
-
-/// One runtime-acknowledged scenario action.
-///
-/// Re-exported from `phoxal::artifact::simulation`.
-#[allow(unused_imports)]
-pub use phoxal::artifact::simulation::ScenarioStepEvidence;
-
-/// One typed capture stream drained by the supervisor.
-///
-/// Re-exported from `phoxal::artifact::simulation`.
-#[allow(unused_imports)]
-pub use phoxal::artifact::simulation::ScenarioCaptureEvidence;
-
-impl SimulationRunReport {
-    /// Whether the simulator exited successfully and cleanup completed.
-    #[must_use]
-    pub fn success(&self) -> bool {
-        let Self::V0 {
-            simulator_exit_code,
-            cleanup,
-            supervisor_ready,
-            provider_contract_verified,
-            ..
-        } = self;
-        *simulator_exit_code == Some(0)
-            && cleanup.error.is_none()
-            && cleanup.supervisor_exited
-            && !cleanup.supervisor_killed
-            && *supervisor_ready
-            && *provider_contract_verified
-    }
-}
-
-#[derive(Clone, Debug)]
-pub(crate) struct SimulatorArtifact {
-    pub(crate) summary: SimulatorArtifactSummary,
-}
 /// One command-scoped prepared simulation snapshot.
 ///
 /// The resolved participant graph, staged asset closure, selected simulator,
@@ -286,7 +192,7 @@ pub(crate) struct SimulatorArtifact {
 /// inputs normally by preparing a fresh snapshot.
 pub struct PreparedSimulation {
     pub(crate) cargo_options: CargoOptions,
-    pub(crate) prepared: crate::PreparedProject,
+    pub(crate) prepared: crate::project::PreparedProject,
     pub(crate) frozen: crate::project::bundle::FrozenSimulation,
     pub(crate) facts: SimulationModelFacts,
     // Drop removes the native probe assembly when the command snapshot ends.
@@ -303,15 +209,12 @@ pub fn prepare_simulation(
     cargo_options.validate()?;
     validate_request(request)?;
 
-    // Provisioning happens before Project::prepare. A missing application in
-    // locked or frozen mode therefore fails before the robot Cargo manifest or
-    // its owning Cargo.lock can be changed.
+    // The installed application is selected before Project::prepare. A missing
+    // or incompatible application therefore fails before the robot Cargo
+    // manifest or its owning Cargo.lock can be changed.
     let scene = canonical_scene(request.scene())?;
-    let provisioned = provision(request, cargo_options)?;
-    let SimulatorProvision {
-        artifact: simulator,
-    } = provisioned;
-    let prepared = project.prepare(cargo_options)?;
+    let simulator = select_installed_simulator(request)?;
+    let prepared = project.prepare(cargo_options, &super::NoPhases)?;
     // Freeze the complete closure once: every executable build, native
     // asset stage, supervisor acquisition, the guarded simulator selection, and
     // the scene copy land in one command-owned staging root that the probe
@@ -327,7 +230,7 @@ pub fn prepare_simulation(
 
 /// Prepares a case from robot resources frozen before the Cargo harness launch.
 pub(crate) fn prepare_simulation_from_robot(
-    prepared: &crate::PreparedProject,
+    prepared: &crate::project::PreparedProject,
     robot: &super::bundle::FrozenRobot,
     cargo_options: &CargoOptions,
     request: &SimulationRunOptions,
@@ -335,15 +238,13 @@ pub(crate) fn prepare_simulation_from_robot(
     cargo_options.validate()?;
     validate_request(request)?;
     let scene = canonical_scene(request.scene())?;
-    let SimulatorProvision {
-        artifact: simulator,
-    } = provision(request, cargo_options)?;
+    let simulator = select_installed_simulator(request)?;
     let frozen = super::bundle::freeze_scene_closure(robot, &scene, &simulator)?;
     probe_snapshot(prepared.clone(), frozen, cargo_options, request)
 }
 
 fn probe_snapshot(
-    prepared: crate::PreparedProject,
+    prepared: crate::project::PreparedProject,
     frozen: super::bundle::FrozenSimulation,
     cargo_options: &CargoOptions,
     request: &SimulationRunOptions,
@@ -370,7 +271,7 @@ fn probe_snapshot(
         probe_bundle.root(),
         request,
     )?;
-    if crate::json_requested(cargo_options) {
+    if cargo_options.diagnostics_json() {
         eprintln!(
             "cargo phoxal: simulation prepared from one native probe (model {}, quantum {} ns)",
             facts.model_identity, facts.quantum_ns
@@ -423,11 +324,12 @@ pub(crate) fn finalize_prepared(
     request: &SimulationRunOptions,
     scenario: Option<&Program>,
 ) -> Result<CompiledBundle, Error> {
-    let output = request.output.clone().unwrap_or_else(|| {
-        snapshot
+    let output = match &request.output {
+        Some(output) => output.clone(),
+        None => snapshot
             .prepared
-            .default_bundle_path(&snapshot.cargo_options)
-    });
+            .default_bundle_path(&snapshot.cargo_options)?,
+    };
     let bundle = crate::project::bundle::finalize_simulation_bundle(
         &snapshot.prepared,
         &snapshot.frozen,
@@ -435,7 +337,7 @@ pub(crate) fn finalize_prepared(
         Some(&snapshot.facts),
         scenario.map(|program| crate::project::bundle::SimulationRunInput { program }),
     )?;
-    if crate::json_requested(&snapshot.cargo_options) {
+    if snapshot.cargo_options.diagnostics_json() {
         eprintln!("cargo phoxal: finalizing the simulation bundle from the prepared snapshot");
     } else {
         eprintln!("Simulation: Runnable build prepared.");
@@ -499,26 +401,24 @@ fn canonical_scene(path: &Path) -> Result<PathBuf, Error> {
     })
 }
 
-/// A user-installed simulator application, selected without installing anything.
-pub(crate) struct SimulatorProvision {
-    pub(crate) artifact: SimulatorArtifact,
-}
-
-fn provision(
+/// Selects the installed simulator application for one launch.
+///
+/// The selection resolves the explicit executable, `PHOXAL_SIMULATOR`, or
+/// `PATH` precedence to one canonical regular file, validates its embedded
+/// application contract, and returns the directly needed summary record. It
+/// never installs anything and must run before source preparation so a
+/// missing or incompatible application fails before any manifest or lock
+/// can change.
+pub(crate) fn select_installed_simulator(
     request: &SimulationRunOptions,
-    _cargo_options: &CargoOptions,
-) -> Result<SimulatorProvision, Error> {
+) -> Result<SimulatorArtifactSummary, Error> {
     let executable = selected_simulator_executable(request.simulator_executable.as_deref())?;
-    Ok(SimulatorProvision {
-        artifact: SimulatorArtifact {
-            summary: SimulatorArtifactSummary {
-                package: request.simulator_package.clone(),
-                version: "installed".into(),
-                binary: request.simulator_binary.clone(),
-                source: "user-installed-executable".into(),
-                executable,
-            },
-        },
+    Ok(SimulatorArtifactSummary {
+        package: request.simulator_package.clone(),
+        version: "installed".into(),
+        binary: request.simulator_binary.clone(),
+        source: "user-installed-executable".into(),
+        executable,
     })
 }
 
@@ -537,7 +437,7 @@ pub(crate) fn selected_simulator_executable(explicit: Option<&Path>) -> Result<P
         })
         .ok_or_else(|| {
             simulation_error(
-                "phoxal-simulator is missing; install it with cargo install phoxal-simulator",
+                "phoxal-simulator is missing; install the complete application using https://github.com/phoxal/simulator#readme and select its executable with PHOXAL_SIMULATOR or PATH",
             )
         })?;
     if !path.try_exists().map_err(|source| Error::ArtifactFile {
@@ -545,7 +445,7 @@ pub(crate) fn selected_simulator_executable(explicit: Option<&Path>) -> Result<P
         source,
     })? {
         return Err(simulation_error(format!(
-            "selected phoxal-simulator is missing at {}; install it with cargo install phoxal-simulator or correct PHOXAL_SIMULATOR",
+            "selected phoxal-simulator is missing at {}; correct PHOXAL_SIMULATOR or reinstall the complete application using https://github.com/phoxal/simulator#readme",
             path.display()
         )));
     }
@@ -574,12 +474,12 @@ fn validate_simulator_application(path: &Path) -> Result<(), Error> {
 }
 
 fn probe(
-    simulator: &SimulatorArtifact,
+    simulator: &SimulatorArtifactSummary,
     scene: &Path,
     bundle: &Path,
-    _request: &SimulationRunOptions,
+    request: &SimulationRunOptions,
 ) -> Result<SimulationModelFacts, Error> {
-    let mut command = Command::new(&simulator.summary.executable);
+    let mut command = Command::new(&simulator.executable);
     command.args([
         "probe",
         &scene.display().to_string(),
@@ -587,14 +487,17 @@ fn probe(
         &bundle.display().to_string(),
         "--json",
     ]);
-    let output = command
-        .output()
-        .map_err(|source| Error::SimulationInvalid {
-            message: format!(
-                "cannot start simulator probe {}: {source}",
-                simulator.summary.executable.display()
-            ),
-        })?;
+    let output = crate::owned_process::probe_output(
+        &mut command,
+        request.execution_timeout,
+        request.cleanup_timeout,
+    )
+    .map_err(|source| Error::SimulationInvalid {
+        message: format!(
+            "simulator probe {}: {source}",
+            simulator.executable.display()
+        ),
+    })?;
     if !output.status.success() {
         return Err(Error::SimulationInvalid {
             message: format!(
@@ -621,7 +524,7 @@ fn build_run_specification(
     bundle: &CompiledBundle,
     scene: &Path,
     facts: &SimulationModelFacts,
-    simulator: &SimulatorArtifact,
+    simulator: &SimulatorArtifactSummary,
     request: &SimulationRunOptions,
     program: &Program,
 ) -> Result<SimulationRunSpecification, Error> {
@@ -713,9 +616,9 @@ fn build_run_specification(
             model_identity: facts.model_identity.clone(),
         },
         simulator: SimulationApplicationReference {
-            package: simulator.summary.package.clone(),
-            version: simulator.summary.version.clone(),
-            binary: simulator.summary.binary.clone(),
+            package: simulator.package.clone(),
+            version: simulator.version.clone(),
+            binary: simulator.binary.clone(),
         },
         program: SimulationProgram {
             bytes: program.program_bytes().to_vec(),
@@ -745,7 +648,7 @@ const fn capture_policy(policy: CapturePolicy) -> SimulationCapturePolicy {
 }
 
 fn launch(
-    simulator: &SimulatorArtifact,
+    simulator: &SimulatorArtifactSummary,
     bundle: &CompiledBundle,
     scene: &Path,
     facts: &SimulationModelFacts,
@@ -759,7 +662,7 @@ fn launch(
             path: std::env::temp_dir(),
             source,
         })?;
-    let mut command = Command::new(&simulator.summary.executable);
+    let mut command = Command::new(&simulator.executable);
     command
         .arg("run")
         .arg(scene)
@@ -795,6 +698,11 @@ fn launch(
     }
     let output =
         bounded_output(&mut command, request.execution_timeout).map_err(simulation_error)?;
+    read_run_report(&output)
+}
+
+/// Decodes the actual simulator output and checks its process exit identity.
+pub(super) fn read_run_report(output: &std::process::Output) -> Result<SimulationRunReport, Error> {
     let line = output
         .stdout
         .split(|byte| *byte == b'\n')
@@ -882,12 +790,6 @@ fn bounded_output(
         stderr: stderr_bytes,
     })
 }
-
-/// Native terminal evidence emitted by the simulator application.
-///
-/// Re-exported from `phoxal::artifact::simulation`. The framework module is
-/// the source of truth.
-pub use phoxal::artifact::simulation::SimulatorTerminalEvidence;
 
 #[cfg(test)]
 fn provider_contract_verified(stdout: &[u8], presentation: SimulationPresentation) -> bool {
@@ -1006,8 +908,9 @@ fn simulator_fixture(script: &std::path::Path, live_scene: Option<&std::path::Pa
     let executable = script.with_extension("fixture");
     let live_scene = live_scene.map(|path| path.to_str().unwrap());
     let code = format!(
-        "#[used]\n#[cfg_attr(target_os = \"macos\", unsafe(link_section = \"__DATA,__phoxal_app\"))]\n#[cfg_attr(target_os = \"linux\", unsafe(link_section = \".phoxal_app\"))]\nstatic RECORD: [u8; 512] = [{data}];\nconst LIVE_SCENE: Option<&str> = {live_scene:?};\n{}",
-        include_str!("../../tests/fixtures/process/native_probe.rs")
+        "#[used]\n#[cfg_attr(target_os = \"macos\", unsafe(link_section = \"__DATA,__phoxal_app\"))]\n#[cfg_attr(target_os = \"linux\", unsafe(link_section = \".phoxal_app\"))]\nstatic RECORD: [u8; 512] = [{data}];\nconst LIVE_SCENE: Option<&str> = {live_scene:?};\nconst FIXTURE_CONTROL: &str = {control:?};\n{}",
+        include_str!("../../tests/fixtures/process/native_probe.rs"),
+        control = executable.to_str().unwrap(),
     );
     std::fs::write(&source, code).unwrap();
     let output = std::process::Command::new("rustc")
@@ -1031,6 +934,172 @@ mod tests {
     use crate::project::bundle;
 
     #[test]
+    fn native_probe_public_fixture_and_valid_facts() {
+        let (guard, scene, simulator, wrapper) = stage_freeze_robot();
+        let executable = simulator_fixture(&simulator, None);
+        let request = SimulationRunOptions::new(
+            scene.clone(),
+            SimulationPresentation::Headless,
+            SimulationBound::Steps(4),
+        )
+        .unwrap();
+        let artifact = SimulatorArtifactSummary {
+            executable: executable.clone(),
+            ..select_installed_simulator(&request.clone().with_simulator_executable(&executable))
+                .unwrap()
+        };
+        let facts = probe(&artifact, &scene, guard.path(), &request).unwrap();
+        assert_eq!(facts.quantum_ns, 10_000_000);
+        assert!(!facts.model_identity.is_empty());
+        if let Some(evidence) = std::env::var_os("PHOXAL_PROBE_EVIDENCE_DIR") {
+            let evidence = PathBuf::from(evidence);
+            fs::create_dir_all(&evidence).unwrap();
+            fs::write(evidence.join("fixture.json"),serde_json::to_vec_pretty(&serde_json::json!({"root":guard.path(),"scene":scene,"simulator":executable,"cargo":wrapper})).unwrap()).unwrap();
+            let _ = guard.keep();
+        }
+    }
+
+    fn controlled_probe() -> (
+        tempfile::TempDir,
+        SimulatorArtifactSummary,
+        SimulationRunOptions,
+    ) {
+        let guard = tempfile::tempdir().unwrap();
+        let scene = guard.path().join("scene.xml");
+        fs::write(&scene, "<mujoco/>").unwrap();
+        let executable = simulator_fixture(&guard.path().join("simulator"), None);
+        let request = SimulationRunOptions::new(
+            scene,
+            SimulationPresentation::Headless,
+            SimulationBound::Steps(4),
+        )
+        .unwrap()
+        .with_simulator_executable(&executable);
+        let artifact = select_installed_simulator(&request).unwrap();
+        (guard, artifact, request)
+    }
+    fn recorded_probe_pids_absent(executable: &Path) {
+        let text = fs::read_to_string(executable.with_extension("pids")).unwrap();
+        assert!(!text.is_empty());
+        for pid in text.lines().map(|line| line.parse::<i32>().unwrap()) {
+            assert_eq!(
+                unsafe { libc::kill(pid, 0) },
+                -1,
+                "owned PID {pid} survived probe"
+            );
+            assert_eq!(
+                std::io::Error::last_os_error().raw_os_error(),
+                Some(libc::ESRCH)
+            );
+        }
+    }
+    #[test]
+    fn native_probe_rejects_malformed_incomplete_and_nonzero_facts() {
+        let (guard, artifact, request) = controlled_probe();
+        for (mode, message) in [
+            ("malformed", "no valid SimulationModelFacts"),
+            ("incomplete", "incomplete model identity or quantum"),
+            ("nonzero", "failed (17): probe refused fixture"),
+        ] {
+            fs::write(artifact.executable.with_extension("mode"), mode).unwrap();
+            let error = probe(&artifact, request.scene(), guard.path(), &request)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains(message), "{error}");
+            assert!(!artifact.executable.with_extension("run-started").exists());
+        }
+    }
+    #[test]
+    fn native_probe_deadline_cleans_supported_descendants() {
+        let (guard, artifact, mut request) = controlled_probe();
+        request.execution_timeout = Duration::from_millis(750);
+        request.cleanup_timeout = Duration::from_secs(1);
+        for mode in [
+            "stall",
+            "stall-resistant",
+            "stall-resistant-detached-no-exec",
+            "stall-resistant-detached-exec",
+            "stall-resistant-detached-drop-env",
+            "stall-resistant-detached-drop-fd",
+        ] {
+            let _ = fs::remove_file(artifact.executable.with_extension("pids"));
+            let _ = fs::remove_file(artifact.executable.with_extension("ready"));
+            fs::write(artifact.executable.with_extension("mode"), mode).unwrap();
+            let start = Instant::now();
+            // Concurrent probes first wait for process-wide signal ownership.
+            // The execution deadline starts at launch, not that admission wait.
+            let ready_path = artifact.executable.with_extension("ready");
+            let execution_start = std::thread::spawn(move || {
+                let until = Instant::now() + Duration::from_secs(20);
+                while !ready_path.exists() && Instant::now() < until {
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+                ready_path.exists().then(Instant::now)
+            });
+            let error = probe(&artifact, request.scene(), guard.path(), &request)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains("execution deadline of 750 ms expired"),
+                "{mode}: {error}"
+            );
+            assert!(
+                error.contains("probe stdout retained") && error.contains("probe stderr retained"),
+                "{error}"
+            );
+            assert!(
+                execution_start
+                    .join()
+                    .unwrap()
+                    .expect("probe readiness")
+                    .elapsed()
+                    < request.execution_timeout
+                        + request.cleanup_timeout
+                        + Duration::from_millis(500),
+                "{mode}: launch deadline/cleanup exceeded; total including signal admission {:?}: {error}",
+                start.elapsed()
+            );
+            assert!(
+                artifact.executable.with_extension("ready").exists(),
+                "{mode} never reached readiness"
+            );
+            recorded_probe_pids_absent(&artifact.executable);
+        }
+    }
+    #[test]
+    fn native_probe_success_cleans_fast_detached_helpers() {
+        let (guard, artifact, mut request) = controlled_probe();
+        request.cleanup_timeout = Duration::from_secs(1);
+        for mode in [
+            "valid-detached-resistant-no-exec",
+            "valid-detached-resistant-exec",
+            "valid-detached-resistant-drop-env",
+            "valid-detached-resistant-drop-fd",
+        ] {
+            let _ = fs::remove_file(artifact.executable.with_extension("pids"));
+            fs::write(artifact.executable.with_extension("mode"), mode).unwrap();
+            let facts = probe(&artifact, request.scene(), guard.path(), &request).unwrap();
+            assert_eq!(facts.quantum_ns, 10_000_000);
+            assert!(!facts.model_identity.is_empty());
+            recorded_probe_pids_absent(&artifact.executable);
+        }
+    }
+    #[test]
+    fn native_probe_output_limit_preserves_bounded_diagnostics() {
+        let (guard, artifact, mut request) = controlled_probe();
+        request.execution_timeout = Duration::from_secs(5);
+        request.cleanup_timeout = Duration::from_secs(1);
+        fs::write(artifact.executable.with_extension("mode"), "oversized").unwrap();
+        let error = probe(&artifact, request.scene(), guard.path(), &request)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("128 MiB channel limit"), "{error}");
+        assert!(error.contains("truncated"));
+        assert!(error.len() < 132 * 1024);
+        recorded_probe_pids_absent(&artifact.executable);
+    }
+
+    #[test]
     fn simulation_success_requires_orderly_supervisor_exit() {
         let base = serde_json::json!({
             "schema": "phoxal/simulation-run/v0",
@@ -1046,6 +1115,17 @@ mod tests {
         });
         let report: SimulationRunReport = serde_json::from_value(base.clone()).unwrap();
         assert!(report.success());
+        assert_eq!(serde_json::to_value(&report).unwrap(), base);
+        let SimulationRunReport::V0 { cleanup, .. } = &report;
+        assert_eq!(
+            cleanup,
+            &phoxal::artifact::simulation::SimulationCleanup {
+                supervisor_stop_requested: true,
+                supervisor_exited: true,
+                supervisor_killed: false,
+                error: None,
+            }
+        );
         for (field, value) in [
             ("supervisor_exited", serde_json::json!(false)),
             ("supervisor_killed", serde_json::json!(true)),
@@ -1059,6 +1139,44 @@ mod tests {
                 "cleanup field {field} must refuse success"
             );
         }
+        for field in ["scope", "supervisor_id", "run_id"] {
+            let mut failure = base.clone();
+            failure[field] = serde_json::Value::Null;
+            failure["simulator_exit_code"] = serde_json::json!(1);
+            failure["provider_contract_verified"] = serde_json::json!(false);
+            let report: SimulationRunReport = serde_json::from_value(failure.clone()).unwrap();
+            assert!(!report.success());
+            assert_eq!(serde_json::to_value(report).unwrap(), failure);
+        }
+        // Synthetic producer-shaped evidence qualifies the typed consumer,
+        // without claiming acceptance of the separately owned real producer.
+        let rich_terminal = serde_json::json!({
+            "schema": "phoxal/simulation-run/v0", "provider_contract_verified": true,
+            "outcome": "success", "completed_steps": 2, "requested_steps": 2,
+            "native_bindings": {"wheel": {"ports": ["actuator", "encoder"]}},
+            "provenance": {"engine": {"sha256": "engine-hash"}},
+            "presentation": {"mode": "headless"}, "model_identity": "model-hash"
+        });
+        let stdout = format!("{}\n", rich_terminal);
+        let mut rich = base.clone();
+        rich["terminal"] = rich_terminal;
+        rich["simulator_stdout"] = serde_json::json!(stdout);
+        let report: SimulationRunReport = serde_json::from_value(rich).unwrap();
+        assert!(report.success());
+        let SimulationRunReport::V0 {
+            simulator_stdout,
+            terminal,
+            ..
+        } = report;
+        assert_eq!(simulator_stdout, stdout);
+        assert!(matches!(
+            terminal,
+            Some(SimulatorTerminalEvidence::V0 {
+                completed_steps: 2,
+                requested_steps: 2,
+                ..
+            })
+        ));
         let mut nonzero = base;
         nonzero["simulator_exit_code"] = serde_json::json!(1);
         let report: SimulationRunReport = serde_json::from_value(nonzero).unwrap();
@@ -1415,7 +1533,7 @@ mod tests {
         let original_model = fs::read(root.join("model.xml")).expect("read original model");
         let original_part = fs::read(root.join("part.xml")).expect("read included resource");
         let prepared = project
-            .prepare(&options)
+            .prepare(&options, &crate::project::NoPhases)
             .expect("prepare before harness launch");
         let robot = crate::project::bundle::freeze_robot_closure(&prepared, &options)
             .expect("freeze robot before the Cargo test lock is held");
@@ -1446,7 +1564,7 @@ mod tests {
             ..
         } = &probe_manifest;
         let frozen_artifact_ids = {
-            let mut ids: Vec<String> = snapshot.frozen.inventory.keys().cloned().collect();
+            let mut ids: Vec<String> = snapshot.frozen.robot.inventory.keys().cloned().collect();
             ids.sort();
             ids
         };
@@ -1525,6 +1643,77 @@ mod tests {
         assert_eq!(
             after_prepare, after_finalize,
             "finalization runs no Cargo operation of its own"
+        );
+
+        // Per-case staging isolation: a second case captured from the same
+        // frozen robot after the live-source mutations stages the mutated
+        // scene independently, and neither its capture nor its publication
+        // touches the first case's frozen staging or published bundle.
+        let first_manifest_bytes =
+            fs::read(bundle.root().join("manifest.json")).expect("read first published manifest");
+        let live_scene_bytes = fs::read(&scene).expect("read mutated live scene");
+        let live_part_bytes = fs::read(scene.parent().expect("scene parent").join("part.xml"))
+            .expect("read mutated live include");
+        let second_case = prepare_simulation_from_robot(&prepared, &robot, &options, &request)
+            .expect("a second case captures from the same frozen robot");
+        assert_ne!(
+            second_case.frozen.scene, snapshot.frozen.scene,
+            "each case stages its own scene copy"
+        );
+        let second_output = root.join("target/frozen-bundle-second");
+        let second_bundle = bundle::finalize_simulation_bundle(
+            &second_case.prepared,
+            &second_case.frozen,
+            &second_output,
+            Some(&second_case.facts),
+            None,
+        )
+        .expect("the second case finalizes from its own staging");
+        let second_scene_relative = second_bundle.root().join(
+            second_case
+                .frozen
+                .scene
+                .strip_prefix(second_case.frozen.staging.path())
+                .expect("second case scene inside its staging"),
+        );
+        assert_eq!(
+            fs::read(&second_scene_relative).expect("second case published scene"),
+            live_scene_bytes,
+            "the second case freezes the current live scene bytes"
+        );
+        assert_eq!(
+            fs::read(
+                second_scene_relative
+                    .parent()
+                    .expect("scene root")
+                    .join("part.xml")
+            )
+            .expect("second case published include"),
+            live_part_bytes
+        );
+        assert_eq!(
+            fs::read(&frozen_scene).expect("first case scene unchanged"),
+            original_scene,
+            "the second case never touches the first case's staging"
+        );
+        assert!(
+            snapshot
+                .frozen
+                .staging
+                .path()
+                .join("bin/supervisor")
+                .is_file(),
+            "the first case's frozen staging stays complete after both publications"
+        );
+        assert_eq!(
+            fs::read(bundle.root().join("manifest.json")).expect("reread first published manifest"),
+            first_manifest_bytes,
+            "publishing the second case leaves the first publication intact"
+        );
+        assert_eq!(
+            invocation_count(&root.join("cargo-invocations.log")),
+            after_finalize,
+            "case capture and finalization add zero Cargo operations"
         );
 
         // The frozen scene copy and the staged robot model still carry the

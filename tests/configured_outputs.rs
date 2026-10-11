@@ -109,9 +109,9 @@ fn shared_executable_has_instance_bound_apis_and_stale_config_requires_prepare()
         &[
             "prepare",
             "--offline",
-            "-f",
+            "-r",
             "robot.yaml",
-            "-f",
+            "-r",
             "alternate.yaml",
         ],
     ));
@@ -122,9 +122,9 @@ fn shared_executable_has_instance_bound_apis_and_stale_config_requires_prepare()
         &[
             "check",
             "--offline",
-            "-f",
+            "-r",
             "robot.yaml",
-            "-f",
+            "-r",
             "alternate.yaml",
         ],
     ));
@@ -146,9 +146,9 @@ fn shared_executable_has_instance_bound_apis_and_stale_config_requires_prepare()
         &[
             "prepare",
             "--offline",
-            "-f",
+            "-r",
             "robot.yaml",
-            "-f",
+            "-r",
             "alternate.yaml",
         ],
     );
@@ -183,7 +183,7 @@ fn shared_executable_has_instance_bound_apis_and_stale_config_requires_prepare()
     assert_success(run(
         root,
         true,
-        &["check", "--offline", "-f", "robot.yaml", "-f", "brain.yaml"],
+        &["check", "--offline", "-r", "robot.yaml", "-r", "brain.yaml"],
     ));
     fs::write(
         root.join("brain.yaml"),
@@ -193,7 +193,7 @@ fn shared_executable_has_instance_bound_apis_and_stale_config_requires_prepare()
     let invalid = run(
         root,
         true,
-        &["check", "--offline", "-f", "robot.yaml", "-f", "brain.yaml"],
+        &["check", "--offline", "-r", "robot.yaml", "-r", "brain.yaml"],
     );
     assert!(!invalid.status.success());
     assert!(String::from_utf8_lossy(&invalid.stderr).contains("brain.config"));

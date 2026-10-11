@@ -110,11 +110,25 @@ fn stage_robot_with_supervisor(root: &Path, supervisor_path: &str) -> PathBuf {
     robot
 }
 
+#[allow(clippy::unwrap_used, reason = "publication-slot discovery assertions")]
 fn runnable_build(robot: &Path) -> PathBuf {
-    robot
+    // The publication slot keys the robot selection; locate the stable
+    // `build` root the real build published, in any profile or slot.
+    let profiles = robot
         .join("target/phoxal/selection-proof-robot")
-        .join(phoxal::artifact::application::HOST_EXECUTION_TARGET)
-        .join("release/build")
+        .join(phoxal::artifact::application::HOST_EXECUTION_TARGET);
+    for profile in fs::read_dir(&profiles)
+        .unwrap_or_else(|error| panic!("list profiles at {}: {error}", profiles.display()))
+        .flatten()
+    {
+        for slot in fs::read_dir(profile.path()).unwrap().flatten() {
+            let build = slot.path().join("build");
+            if build.is_symlink() {
+                return build;
+            }
+        }
+    }
+    panic!("no published build slot under {}", profiles.display());
 }
 
 /// Runs a build in the isolated home.

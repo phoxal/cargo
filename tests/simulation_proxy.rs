@@ -100,12 +100,12 @@ fn prepared_build_proxy_preserves_paths_standard_streams_and_exit_status() {
 }
 
 #[test]
-fn absent_executable_names_the_normal_install_command() {
+fn absent_executable_names_complete_application_selection_and_recovery() {
     let result = Command::new(env!("CARGO_BIN_EXE_cargo-phoxal"))
         .env("PHOXAL_SIMULATOR", "/missing/phoxal-simulator")
         .args(["simulation", "scene.xml", "--build", "build"])
         .output()
         .unwrap();
     assert_eq!(result.status.code(), Some(1));
-    assert!(String::from_utf8_lossy(&result.stderr).contains("cargo install phoxal-simulator"));
+    assert!(String::from_utf8_lossy(&result.stderr).contains("PHOXAL_SIMULATOR"));
 }

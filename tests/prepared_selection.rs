@@ -343,7 +343,7 @@ fn two_binaries_of_one_package_keep_distinct_prepared_contracts()
 
     // The composing brain generates both instance bindings, compiles, and
     // its own compiled contract validates against the real graph.
-    let check = invoke(&robot, &["check", "--offline"]);
+    let check = invoke(&robot, &["check", "--offline", "--message-format=json"]);
     assert!(
         check.status.success(),
         "check must validate the valid wiring:\n--- stdout ---\n{}\n--- stderr ---\n{}",
@@ -359,11 +359,41 @@ fn two_binaries_of_one_package_keep_distinct_prepared_contracts()
     // additional component vocabulary to the SDK's canonical types instead
     // of duplicating them into the robot API.
     let mut generated_packages = BTreeMap::new();
-    for entry in fs::read_dir(shared_target_dir().join("debug/build"))
-        .expect("the checked robot keeps its build directory")
-        .filter_map(|entry| Some(entry.ok()?.path().join("out/phoxal-api/merged")))
-        .filter(|out| out.is_dir())
-    {
+    let messages = cargo_metadata::Message::parse_stream(check.stdout.as_slice())
+        .collect::<Result<Vec<_>, _>>()?;
+    let root_source = robot.join("src/main.rs").canonicalize()?;
+    let root_package = messages
+        .iter()
+        .find_map(|message| match message {
+            cargo_metadata::Message::CompilerArtifact(artifact)
+                if artifact.target.is_bin()
+                    && artifact
+                        .target
+                        .src_path
+                        .as_std_path()
+                        .canonicalize()
+                        .ok()
+                        .as_ref()
+                        == Some(&root_source) =>
+            {
+                Some(&artifact.package_id)
+            }
+            _ => None,
+        })
+        .expect("Cargo reports the selected root binary");
+    let mut root_outputs = std::collections::BTreeSet::new();
+    for message in &messages {
+        if let cargo_metadata::Message::BuildScriptExecuted(script) = message
+            && &script.package_id == root_package
+        {
+            root_outputs.insert(script.out_dir.join("phoxal-api/merged").into_std_path_buf());
+        }
+    }
+    assert!(
+        !root_outputs.is_empty(),
+        "Cargo reports the checked robot's generated API output"
+    );
+    for entry in root_outputs {
         for file in fs::read_dir(&entry).expect("generated package files") {
             let path = file.expect("generated package file").path();
             let name = path
@@ -483,18 +513,11 @@ fn prepared_dir_for(local: &std::path::Path, suffix: &str) -> PathBuf {
 }
 
 /// Runs the compiled `cargo-phoxal` binary with an isolated Phoxal home.
-/// One stable dependency-build tree under the workspace's ignored
-/// `target/` directory, shared with `prepare_cycles`' suite: every nested
-/// fixture resolves the same workspace phoxal path dependency plus the
-/// same crates.io resolution, so the first fixture in a cold run pays the
-/// build once and every later fixture, suite, and run reuses it. No
-/// per-process directories are created, so repeated runs cannot
-/// accumulate retained trees; `cargo clean` reclaims the space; and
-/// cargo's target-dir file lock keeps concurrent fixture builds correct.
-/// Fixture sources still rebuild on their own edits, and the cold path
-/// itself stays proven by a clean checkout's first run. Nested builds
-/// carry no debugging value, so they run without incremental compilation
-/// and with line-tables-only debug info to keep the tree small.
+/// The configured compiler root lives under the workspace's ignored target
+/// tree, shared with prepare_cycles. Cargo-phoxal namespaces compiler output
+/// by selected source beneath this root, preserving warm reuse for the same
+/// fixture and keeping independent fixtures isolated. Nested builds disable
+/// incremental compilation and use line tables to keep retained caches small.
 fn shared_target_dir() -> std::path::PathBuf {
     std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("target/suites")

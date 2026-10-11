@@ -22,7 +22,6 @@ use phoxal::artifact::application::{
 };
 use phoxal::artifact::document::{GitSourceSelection, Source};
 use std::path::{Path, PathBuf};
-use std::process::Command;
 /// One validated supervisor executable selection.
 #[derive(Clone, Debug)]
 pub(crate) struct SupervisorSelection {
@@ -94,7 +93,7 @@ impl AuthoredSupervisor {
             self.binary.as_deref().unwrap_or("default")
         );
         let build =
-            serde_json::to_string(&crate::project::cargo::BuildSelection::for_source(options))
+            serde_json::to_string(&crate::project::cargo::BuildSelection::participant(options))
                 .map_err(|error| Error::InvalidOptions {
                     message: error.to_string(),
                 })?;
@@ -111,10 +110,6 @@ impl AuthoredSupervisor {
         home.join("applications/supervisor").join(slug)
     }
 }
-/// The deployment target triple from the effective selection.
-fn effective_target(options: &CargoOptions) -> String {
-    crate::project::cargo::effective_target(options)
-}
 /// Selects the supervisor executable for one bundle assembly.
 ///
 /// Local path selections build incrementally from the resolved source and
@@ -127,6 +122,7 @@ pub(crate) fn select(
     authored: &AuthoredSupervisor,
     options: &CargoOptions,
     requires_simulation: bool,
+    phases: &dyn super::PhaseReporter,
 ) -> Result<SupervisorSelection, Error> {
     let identity = authored.identity(root, options)?;
     let home = phoxal_home()?;
@@ -152,7 +148,8 @@ pub(crate) fn select(
             source,
         }
     })?;
-    let mut selection = select_guarded(root, authored, options, &store, requires_simulation)?;
+    let mut selection =
+        select_guarded(root, authored, options, &store, requires_simulation, phases)?;
     selection._guard = Some(std::sync::Arc::new(guard));
     Ok(selection)
 }
@@ -162,6 +159,7 @@ fn select_guarded(
     options: &CargoOptions,
     store: &Path,
     requires_simulation: bool,
+    phases: &dyn super::PhaseReporter,
 ) -> Result<SupervisorSelection, Error> {
     if let Source::Path(path) = &authored.source {
         return select_local(
@@ -171,6 +169,7 @@ fn select_guarded(
             options,
             store,
             requires_simulation,
+            phases,
         );
     }
     let binary_name = authored
@@ -179,7 +178,11 @@ fn select_guarded(
         .unwrap_or_else(|| package_name(authored));
     let executable = store.join("product/bin").join(&binary_name);
     if executable.is_file() {
-        validate_embedded_contract(&executable, &effective_target(options), requires_simulation)?;
+        validate_embedded_contract(
+            &executable,
+            &crate::project::cargo::effective_target(options),
+            requires_simulation,
+        )?;
         return Ok(SupervisorSelection {
             executable,
             provenance: read_provenance(&store.join("product"))?,
@@ -195,7 +198,7 @@ fn select_guarded(
             ),
         });
     }
-    acquire_locked(root, authored, options, store, requires_simulation)
+    acquire_locked(root, authored, options, store, requires_simulation, phases)
 }
 /// Builds a local path selection incrementally, always inspecting the
 /// current embedded contract.
@@ -211,6 +214,7 @@ fn select_local(
     options: &CargoOptions,
     store: &Path,
     requires_simulation: bool,
+    phases: &dyn super::PhaseReporter,
 ) -> Result<SupervisorSelection, Error> {
     let resolved = root
         .join(path)
@@ -220,45 +224,61 @@ fn select_local(
             source,
         })?;
     let package = local_package_name(&resolved)?;
-    let binary_name = authored.binary.clone().unwrap_or(package);
+    let binary_name = authored.binary.clone().unwrap_or_else(|| package.clone());
+    let resolved_manifest = resolved.join("Cargo.toml");
     let cargo = options.cargo_program();
-    let mut command = Command::new(&cargo);
-    command
-        .current_dir(root)
-        .args(["build", "--manifest-path"])
-        .arg(resolved.join("Cargo.toml"))
-        .args(["--bin", &binary_name, "--message-format", "json"]);
-    crate::project::cargo::BuildSelection::for_source(options).apply(&mut command);
-    command.args(options.lock.flags());
-    if options.offline {
-        command.arg("--offline");
-    }
-    let output = command.output().map_err(|source| Error::SupervisorLaunch {
-        message: format!("cannot run {}: {source}", cargo.display()),
-    })?;
+    phases.phase("building the supervisor");
+    let mut command = crate::project::cargo::local_package_build(
+        root,
+        &resolved_manifest,
+        &package,
+        &binary_name,
+        "json",
+        options,
+    )?;
+    let output =
+        crate::owned_process::output(&mut command).map_err(|source| Error::SupervisorLaunch {
+            message: format!("cannot run {}: {source}", cargo.display()),
+        })?;
+    crate::project::cargo::forward_compiler_stream(&output, options);
     if !output.status.success() {
         return Err(Error::SupervisorLaunch {
-            message: format!(
-                "building the authored local supervisor selection failed:\n{}",
-                String::from_utf8_lossy(&output.stderr)
+            message: supervisor_failure_message(
+                "building the authored local supervisor selection failed",
+                &output,
+                options,
             ),
         });
     }
-    let built = cargo_metadata::Message::parse_stream(output.stdout.as_slice())
-        .filter_map(Result::ok)
-        .find_map(|message| match message {
-            cargo_metadata::Message::CompilerArtifact(artifact)
-                if artifact.target.name == binary_name =>
-            {
-                artifact.executable.map(|path| path.into_std_path_buf())
+    let built = {
+        let messages = crate::project::cargo::parse_message_stream(&output.stdout)
+            .map_err(|message| Error::SupervisorLaunch { message })?;
+        // The exact resolved manifest constrains the selection to the
+        // authored local package; same-name binaries of other packages in
+        // the stream are irrelevant artifacts.
+        let selector = crate::project::cargo::ExecutableSelector {
+            package_id: None,
+            manifest_path: Some(&resolved_manifest),
+            binary: &binary_name,
+            bin_only: true,
+        };
+        match crate::project::cargo::select_executable(&messages, &selector) {
+            crate::project::cargo::SelectedExecutable::Found(built) => built,
+            crate::project::cargo::SelectedExecutable::Missing => {
+                return Err(Error::SupervisorLaunch {
+                    message: format!(
+                        "Cargo reported no executable for supervisor binary `{binary_name}`"
+                    ),
+                });
             }
-            _ => None,
-        })
-        .ok_or_else(|| Error::SupervisorLaunch {
-            message: format!("Cargo reported no executable for supervisor binary `{binary_name}`"),
-        })?;
+        }
+    };
     ensure_regular_executable(&built)?;
-    validate_embedded_contract(&built, &effective_target(options), requires_simulation)?;
+    validate_embedded_contract(
+        &built,
+        &crate::project::cargo::effective_target(options),
+        requires_simulation,
+    )?;
     let staging = tempfile::Builder::new()
         .prefix(".phoxal-supervisor-build-")
         .tempdir_in(store.parent().unwrap_or_else(|| Path::new(".")))
@@ -290,6 +310,7 @@ fn acquire_locked(
     options: &CargoOptions,
     store: &Path,
     requires_simulation: bool,
+    phases: &dyn super::PhaseReporter,
 ) -> Result<SupervisorSelection, Error> {
     let binary_name = authored
         .binary
@@ -297,7 +318,11 @@ fn acquire_locked(
         .unwrap_or_else(|| package_name(authored));
     let executable = store.join("product/bin").join(&binary_name);
     if executable.is_file() {
-        validate_embedded_contract(&executable, &effective_target(options), requires_simulation)?;
+        validate_embedded_contract(
+            &executable,
+            &crate::project::cargo::effective_target(options),
+            requires_simulation,
+        )?;
         return Ok(SupervisorSelection {
             executable,
             provenance: read_provenance(&store.join("product"))?,
@@ -311,6 +336,7 @@ fn acquire_locked(
             path: store.to_owned(),
             source,
         })?;
+    phases.phase("building the supervisor");
     let cargo = options.cargo_program();
     let mut command = crate::project::cargo::source_install_command(
         root,
@@ -319,20 +345,27 @@ fn acquire_locked(
         staging.path(),
         options,
     );
-    command.env("CARGO_TARGET_DIR", store.join("build"));
-    let output = command.output().map_err(|source| Error::SupervisorLaunch {
-        message: format!("cannot run {}: {source}", cargo.display()),
-    })?;
+    crate::project::cargo::installation_cache(&mut command, &store.join("build"));
+    let output =
+        crate::owned_process::output(&mut command).map_err(|source| Error::SupervisorLaunch {
+            message: format!("cannot run {}: {source}", cargo.display()),
+        })?;
+    crate::project::cargo::forward_compiler_stream(&output, options);
     if !output.status.success() {
         return Err(Error::SupervisorLaunch {
-            message: format!(
-                "acquiring the authored supervisor selection failed:\n{}",
-                String::from_utf8_lossy(&output.stderr)
+            message: supervisor_failure_message(
+                "acquiring the authored supervisor selection failed",
+                &output,
+                options,
             ),
         });
     }
     let candidate = staging.path().join("bin").join(&binary_name);
-    validate_embedded_contract(&candidate, &effective_target(options), requires_simulation)?;
+    validate_embedded_contract(
+        &candidate,
+        &crate::project::cargo::effective_target(options),
+        requires_simulation,
+    )?;
     if let Source::Git(git) = &authored.source {
         let (source_root, _, _) = crate::project::participant::captured_source(
             &output.stdout,
@@ -357,6 +390,22 @@ fn acquire_locked(
         _guard: None,
     })
 }
+/// One supervisor compilation failure message.
+///
+/// When the JSON compiler channels were already delivered on their real
+/// streams, the project error carries the operation and context only;
+/// human mode keeps the complete captured compiler stderr.
+fn supervisor_failure_message(
+    context: &str,
+    output: &std::process::Output,
+    options: &crate::project::CargoOptions,
+) -> String {
+    if options.diagnostics_json() {
+        return context.to_owned();
+    }
+    format!("{context}:\n{}", String::from_utf8_lossy(&output.stderr))
+}
+
 /// Publishes a validated application and its provenance together under the store lock.
 fn publish_candidate(store: &Path, staging: tempfile::TempDir) -> Result<(), Error> {
     let product = store.join("product");

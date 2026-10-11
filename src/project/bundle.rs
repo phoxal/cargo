@@ -10,13 +10,12 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File};
-use std::io::{self, Write};
+use std::io::Write;
 use std::path::{Component, Path, PathBuf};
-use std::sync::{Mutex, OnceLock};
 
-use fs4::{FileExt, TryLockError};
 use serde::Serialize;
 
+pub(crate) use super::publish::slot_path;
 use crate::project::artifact::{self, ArtifactSummary};
 use crate::project::cargo;
 use crate::project::selection::PackageSource;
@@ -65,6 +64,17 @@ const MANIFEST_FILE: &str = "manifest.json";
 #[derive(Debug, Clone)]
 pub struct CompiledBundle {
     root: PathBuf,
+    /// How this publication interacted with the slot: a new generation, or
+    /// a verified identical current one.
+    publication: super::publish::PublicationOutcome,
+}
+
+impl CompiledBundle {
+    /// The typed publication outcome of this assembly.
+    #[must_use]
+    pub fn publication(&self) -> &super::publish::PublicationOutcome {
+        &self.publication
+    }
 }
 
 impl CompiledBundle {
@@ -72,11 +82,6 @@ impl CompiledBundle {
     #[must_use]
     pub fn root(&self) -> &Path {
         &self.root
-    }
-
-    /// Atomically publish this runnable directory as a portable ZIP.
-    pub fn archive(&self, output: &Path) -> Result<(), Error> {
-        super::archive::publish(&self.root, output)
     }
 
     /// Absolute path of one bundled executable.
@@ -103,10 +108,22 @@ struct StagedResource {
     bytes: Vec<u8>,
 }
 
+/// One built executable with everything its assembly needs.
+#[derive(Debug, Clone)]
+pub(crate) struct SelectedArtifact {
+    /// The Cargo-selected target this executable realizes.
+    pub(crate) selection: SelectedTarget,
+    /// The built executable path.
+    pub(crate) executable: PathBuf,
+    /// The compiled contract extracted from the executable.
+    pub(crate) contract: artifact::ArtifactContract,
+    /// The bundle-local identity of the complete selection.
+    pub(crate) artifact_id: String,
+}
+
 /// Built executables with their compiled contracts, keyed by package and
 /// target identity so repeated instances of one selection share one build.
-pub(crate) type SelectedArtifacts =
-    BTreeMap<(String, String), (SelectedTarget, PathBuf, artifact::ArtifactContract, String)>;
+pub(crate) type SelectedArtifacts = BTreeMap<(String, String), SelectedArtifact>;
 
 /// Builds and inspects every selected executable once.
 pub(crate) fn collect_selected_artifacts(
@@ -147,7 +164,15 @@ pub(crate) fn collect_selected_artifacts(
             }
         })?;
         let artifact_id = selection_artifact_id(prepared, target, options)?;
-        artifacts.insert(key, (target.clone(), executable, contract, artifact_id));
+        artifacts.insert(
+            key,
+            SelectedArtifact {
+                selection: target.clone(),
+                executable,
+                contract,
+                artifact_id,
+            },
+        );
     }
     Ok(artifacts)
 }
@@ -163,23 +188,23 @@ pub(crate) fn stage_artifact_inventory(
     staged_root: &Path,
 ) -> Result<BTreeMap<String, BundleArtifactRecord>, Error> {
     let mut inventory: BTreeMap<String, BundleArtifactRecord> = BTreeMap::new();
-    for (target, executable, contract, artifact_id) in artifacts.values() {
-        let relative = format!("{BIN_DIR}/{artifact_id}");
-        if !inventory.contains_key(artifact_id) {
-            copy_executable(executable, &staged_root.join(&relative))?;
+    for artifact in artifacts.values() {
+        let relative = format!("{BIN_DIR}/{}", artifact.artifact_id);
+        if !inventory.contains_key(&artifact.artifact_id) {
+            copy_executable(&artifact.executable, &staged_root.join(&relative))?;
         }
         inventory.insert(
-            artifact_id.clone(),
+            artifact.artifact_id.clone(),
             BundleArtifactRecord {
-                id: artifact_id.clone(),
+                id: artifact.artifact_id.clone(),
                 path: relative,
                 provenance: Some(BundleArtifactProvenance {
-                    package: target.package.clone(),
-                    version: package_version(prepared, &target.package_id)?,
-                    source: public_package_id(prepared, &target.package_id),
+                    package: artifact.selection.package.clone(),
+                    version: package_version(prepared, &artifact.selection.package_id)?,
+                    source: public_package_id(prepared, &artifact.selection.package_id),
                 }),
-                runtime: contract.summary().runtime,
-                descriptors: contract.summary().descriptors,
+                runtime: artifact.contract.summary().runtime,
+                descriptors: artifact.contract.summary().descriptors,
             },
         );
     }
@@ -202,10 +227,10 @@ pub(crate) fn selection_artifact_id(
         target.target,
         serde_json::to_string(
             &if target.package_id == prepared.cargo_sources().brain.package_id {
-                super::cargo::BuildSelection::capture(options)
+                super::cargo::BuildSelection::root(options)
             } else {
-                super::cargo::BuildSelection::for_source(options)
-            }
+                super::cargo::BuildSelection::participant(options)
+            },
         )
         .map_err(|error| Error::InvalidOptions {
             message: error.to_string()
@@ -219,18 +244,16 @@ pub(crate) fn selection_artifact_id(
     Ok(format!("{}-{suffix}", safe_bundle_name(&target.target)?))
 }
 
-/// One command-owned frozen simulation closure.
+/// One captured robot closure: the complete immutable inputs a bundle
+/// finalization needs, derived once from the selected artifacts.
 ///
-/// Everything finalization needs is staged and owned here exactly once:
-/// executables, native assets, the scene closure, the supervisor and
-/// simulator selections, and the compiled contracts validation needs.
-/// Finalization performs no Cargo build, acquisition, probe, or live source
-/// read, so a source or scene change between preparation and finalization
-/// cannot mix inputs.
-pub(crate) struct FrozenSimulation {
-    /// The command-owned staging root holding `bin/` and staged assets.
-    pub(crate) staging: tempfile::TempDir,
-    /// Selection-based artifact inventory staged under `staging`.
+/// The record carries staged inventory records, compiled contracts, the
+/// staged robot model closure, component model sources, the deployment
+/// target, and the selection-derived artifact identities. It never owns a
+/// staging directory; each command-owned capture composes it with one.
+#[derive(Debug, Clone)]
+pub(crate) struct CapturedRobot {
+    /// Selection-based artifact inventory.
     pub(crate) inventory: BTreeMap<String, BundleArtifactRecord>,
     /// Contracts by package/target key.
     pub(crate) contracts: BTreeMap<(String, String), artifact::ArtifactContract>,
@@ -240,47 +263,90 @@ pub(crate) struct FrozenSimulation {
     pub(crate) model: Option<BundleModelAssets>,
     /// Staged component model sources.
     pub(crate) component_sources: BTreeMap<String, String>,
-    /// The frozen scene copy under `staging`.
-    pub(crate) scene: PathBuf,
     /// The deployment target the executables were built for.
     pub(crate) target: String,
     /// Bundle-local artifact IDs by package/target selection key.
     pub(crate) artifact_ids: BTreeMap<(String, String), String>,
-    /// The pinned simulator application selection.
-    ///
-    /// The installed executable remains caller-owned and its contents are trusted.
-    pub(crate) simulator: super::simulation::SimulatorArtifact,
 }
 
-impl FrozenSimulation {
-    /// Verifies the pinned simulator application selection still resolves.
-    pub(crate) fn verify_simulator(&self) -> Result<(), Error> {
-        ensure_regular_executable(&self.simulator.summary.executable, "simulator")?;
-        Ok(())
+impl CapturedRobot {
+    /// Derives the captured state from the selected artifacts and staged
+    /// native assets, resolving output families against each instance's
+    /// authored configuration exactly once.
+    fn from_artifacts(
+        prepared: &PreparedProject,
+        artifacts: &SelectedArtifacts,
+        inventory: BTreeMap<String, BundleArtifactRecord>,
+        model: Option<BundleModelAssets>,
+        component_sources: BTreeMap<String, String>,
+        target: String,
+    ) -> Result<Self, Error> {
+        let simulation_contracts = instance_contracts(prepared, artifacts)?;
+        let contracts = artifacts
+            .iter()
+            .map(|(key, artifact)| (key.clone(), artifact.contract.clone()))
+            .collect::<BTreeMap<_, _>>();
+        let artifact_ids = artifacts
+            .iter()
+            .map(|(key, artifact)| (key.clone(), artifact.artifact_id.clone()))
+            .collect::<BTreeMap<_, _>>();
+        Ok(Self {
+            inventory,
+            contracts,
+            simulation_contracts,
+            model,
+            component_sources,
+            target,
+            artifact_ids,
+        })
     }
 }
 
-/// Freezes one complete simulation closure for later finalization.
+/// One command-owned robot capture: the captured robot closure composed
+/// with its exclusive staging root.
 ///
-/// This is the only place a simulation assembly builds executables, stages
-/// native assets, acquires the supervisor, or reads the scene.
+/// Everything finalization needs is staged and owned here exactly once:
+/// executables, native assets, the supervisor selection, and the compiled
+/// contracts validation needs. Finalization performs no Cargo build,
+/// acquisition, probe, or live source read, so a source or scene change
+/// between preparation and finalization cannot mix inputs.
 /// Robot executables, compiled contracts and assets frozen before a Cargo test harness starts.
 /// This capture uses no native application and keeps listing/compile-only tests native-free.
 pub(crate) struct FrozenRobot {
     /// The command-owned staging root holding `bin/` and staged assets.
     pub(crate) staging: tempfile::TempDir,
-    /// Selection-based artifact inventory staged under `staging`.
-    pub(crate) inventory: BTreeMap<String, BundleArtifactRecord>,
-    /// Contracts by package/target key.
-    pub(crate) contracts: BTreeMap<(String, String), artifact::ArtifactContract>,
-    /// Compiled contract summaries keyed by launch instance.
-    pub(crate) simulation_contracts: BTreeMap<String, ArtifactSummary>,
-    /// The staged robot model closure, when native assets are included.
-    pub(crate) model: Option<BundleModelAssets>,
-    /// Staged component model sources.
-    pub(crate) component_sources: BTreeMap<String, String>,
-    pub(crate) target: String,
-    pub(crate) artifact_ids: BTreeMap<(String, String), String>,
+    /// The captured robot closure staged under `staging`.
+    pub(crate) captured: CapturedRobot,
+}
+
+/// One case-specific simulation capture: the robot capture composed with a
+/// per-case staging root, the frozen scene copy, and the pinned simulator
+/// selection.
+///
+/// Each case stages its own copy of the robot closure beside its scene, so
+/// cases never mutate each other's staging. Finalization consumes only the
+/// captured bytes and contracts without a new Cargo invocation, source
+/// read, acquisition, or probe.
+pub(crate) struct FrozenSimulation {
+    /// The case-owned staging root holding the copied robot closure and the
+    /// staged scene.
+    pub(crate) staging: tempfile::TempDir,
+    /// The captured robot closure this case finalizes.
+    pub(crate) robot: CapturedRobot,
+    /// The frozen scene copy under `staging`.
+    pub(crate) scene: PathBuf,
+    /// The pinned simulator application selection.
+    ///
+    /// The installed executable remains caller-owned and its contents are trusted.
+    pub(crate) simulator: phoxal::artifact::installation::SimulatorArtifactSummary,
+}
+
+impl FrozenSimulation {
+    /// Verifies the pinned simulator application selection still resolves.
+    pub(crate) fn verify_simulator(&self) -> Result<(), Error> {
+        ensure_regular_executable(&self.simulator.executable, "simulator")?;
+        Ok(())
+    }
 }
 
 pub(crate) fn freeze_robot_closure(
@@ -304,45 +370,12 @@ pub(crate) fn freeze_robot_closure(
     let staged_model = stage_model(prepared, staged_root)?;
     let component_sources = stage_component_models(prepared, staged_root)?;
 
-    let simulation_contracts = prepared
-        .assembly_targets()
-        .into_iter()
-        .filter_map(|(instance, target)| {
-            artifacts
-                .get(&(target.package_id.clone(), target.target.clone()))
-                .map(|(_, _, contract, _)| contract.clone())
-                .map(|contract| {
-                    let mut summary = contract.summary();
-                    let RuntimeRecord::V0 { outputs, .. } = &summary.runtime;
-                    if outputs.iter().any(|output| output.family.is_some()) {
-                        let config = instance_config(prepared, &instance);
-                        summary.runtime = summary
-                            .runtime
-                            .resolve_outputs(config.value().ok_or_else(|| {
-                                simulation_error("output family requires configuration")
-                            })?)
-                            .map_err(simulation_error)?;
-                    }
-                    Ok((instance, summary))
-                })
-        })
-        .collect::<Result<BTreeMap<_, _>, Error>>()?;
-    let contracts = artifacts
-        .iter()
-        .map(|(key, (_, _, contract, _))| (key.clone(), contract.clone()))
-        .collect::<BTreeMap<_, _>>();
-
-    let artifact_ids = artifacts
-        .iter()
-        .map(|((package_id, target), (_, _, _, artifact_id))| {
-            ((package_id.clone(), target.clone()), artifact_id.clone())
-        })
-        .collect::<BTreeMap<_, _>>();
     let supervisor_selection = super::supervisor::select(
         prepared.cargo_workdir(),
         &super::supervisor::AuthoredSupervisor::capture(prepared.document())?,
         options,
         true,
+        &super::NoPhases,
     )?;
     let supervisor_relative = format!("{BIN_DIR}/supervisor");
     copy_executable(
@@ -351,23 +384,22 @@ pub(crate) fn freeze_robot_closure(
     )?;
 
     let target = super::cargo::effective_target(options);
-    Ok(FrozenRobot {
-        staging,
+    let captured = CapturedRobot::from_artifacts(
+        prepared,
+        &artifacts,
         inventory,
-        contracts,
-        simulation_contracts,
-        model: staged_model.as_ref().map(|model| model.closure.clone()),
+        staged_model.as_ref().map(|model| model.closure.clone()),
         component_sources,
         target,
-        artifact_ids,
-    })
+    )?;
+    Ok(FrozenRobot { staging, captured })
 }
 
 pub(crate) fn freeze_simulation_closure(
     prepared: &PreparedProject,
     options: &CargoOptions,
     scene: &Path,
-    simulator: &super::simulation::SimulatorArtifact,
+    simulator: &phoxal::artifact::installation::SimulatorArtifactSummary,
 ) -> Result<FrozenSimulation, Error> {
     let robot = freeze_robot_closure(prepared, options)?;
     freeze_scene_closure(&robot, scene, simulator)
@@ -378,7 +410,7 @@ pub(crate) fn freeze_simulation_closure(
 pub(crate) fn freeze_scene_closure(
     robot: &FrozenRobot,
     scene: &Path,
-    simulator: &super::simulation::SimulatorArtifact,
+    simulator: &phoxal::artifact::installation::SimulatorArtifactSummary,
 ) -> Result<FrozenSimulation, Error> {
     let staging = tempfile::Builder::new()
         .prefix(".phoxal-case-")
@@ -418,7 +450,7 @@ pub(crate) fn freeze_scene_closure(
             ))
         })?
         .to_owned();
-    let staged = std::process::Command::new(&simulator.summary.executable)
+    let staged = std::process::Command::new(&simulator.executable)
         .arg("stage-scene")
         .arg("--scene")
         .arg(scene)
@@ -446,16 +478,41 @@ pub(crate) fn freeze_scene_closure(
     let frozen_scene = scene_root.join(&closure.entry);
     Ok(FrozenSimulation {
         staging,
-        inventory: robot.inventory.clone(),
-        contracts: robot.contracts.clone(),
-        simulation_contracts: robot.simulation_contracts.clone(),
-        model: robot.model.clone(),
-        component_sources: robot.component_sources.clone(),
+        robot: robot.captured.clone(),
         scene: frozen_scene,
-        target: robot.target.clone(),
-        artifact_ids: robot.artifact_ids.clone(),
         simulator: simulator.clone(),
     })
+}
+
+/// Compiled contract summaries keyed by launch instance, with output
+/// families resolved against each instance's authored configuration.
+fn instance_contracts(
+    prepared: &PreparedProject,
+    artifacts: &SelectedArtifacts,
+) -> Result<BTreeMap<String, ArtifactSummary>, Error> {
+    prepared
+        .assembly_targets()
+        .into_iter()
+        .filter_map(|(instance, target)| {
+            artifacts
+                .get(&(target.package_id.clone(), target.target.clone()))
+                .map(|artifact| artifact.contract.clone())
+                .map(|contract| {
+                    let mut summary = contract.summary();
+                    let RuntimeRecord::V0 { outputs, .. } = &summary.runtime;
+                    if outputs.iter().any(|output| output.family.is_some()) {
+                        let config = instance_config(prepared, &instance);
+                        summary.runtime = summary
+                            .runtime
+                            .resolve_outputs(config.value().ok_or_else(|| {
+                                simulation_error("output family requires configuration")
+                            })?)
+                            .map_err(simulation_error)?;
+                    }
+                    Ok((instance, summary))
+                })
+        })
+        .collect()
 }
 
 /// Computes one scene's complete resource closure.
@@ -499,20 +556,26 @@ pub(crate) fn finalize_simulation_bundle(
         path: parent.to_owned(),
         source,
     })?;
-    let _publication_lock = acquire_bundle_publication_lock(output)?;
+    let _publication_lock = if super::watch::owns_output(output) {
+        None
+    } else {
+        Some(crate::project::publish::acquire_publication_lock(output)?)
+    };
     let staged_root = frozen.staging.path();
 
     let mut instances: Vec<BundleInstance> = Vec::new();
     for (instance, target) in prepared.assembly_targets() {
         let key = (target.package_id.clone(), target.target.clone());
-        let artifact_id = frozen
-            .artifact_ids
-            .get(&key)
-            .ok_or_else(|| Error::ArtifactCapture {
-                package: target.package.clone(),
-                target: target.target.clone(),
-                message: "the frozen closure lost a selected executable".to_owned(),
-            })?;
+        let artifact_id =
+            frozen
+                .robot
+                .artifact_ids
+                .get(&key)
+                .ok_or_else(|| Error::ArtifactCapture {
+                    package: target.package.clone(),
+                    target: target.target.clone(),
+                    message: "the frozen closure lost a selected executable".to_owned(),
+                })?;
         instances.push(BundleInstance {
             id: instance.clone(),
             role: match prepared.executable_role(&instance).as_str() {
@@ -528,11 +591,12 @@ pub(crate) fn finalize_simulation_bundle(
 
     let document = prepared.document().clone();
     if let Some(scenario) = simulation_run.as_ref() {
-        validate_scenario_inputs(scenario.program, &frozen.simulation_contracts)?;
+        validate_scenario_inputs(scenario.program, &frozen.robot.simulation_contracts)?;
     }
-    validation::validate_configurations(prepared, &frozen.contracts)?;
+    validation::validate_configurations(prepared, &frozen.robot.contracts)?;
     crate::project::artifact::validate_descriptor_closure_consistency(
         frozen
+            .robot
             .contracts
             .iter()
             .map(|((_, instance), contract)| (instance.as_str(), contract)),
@@ -541,7 +605,7 @@ pub(crate) fn finalize_simulation_bundle(
         path: prepared.cargo_manifest_path().to_owned(),
         message: error.to_string(),
     })?;
-    validation::validate_connections_for_document(prepared, &frozen.contracts, &document)?;
+    validation::validate_connections_for_document(prepared, &frozen.robot.contracts, &document)?;
 
     let mut components = prepared
         .cargo_sources()
@@ -565,21 +629,23 @@ pub(crate) fn finalize_simulation_bundle(
     // Native facts validate the prepared closure; the common manifest remains
     // usable for hardware and receives command-owned native selection at run time.
     let _simulation = facts
-        .map(|facts| build_simulation_definition(prepared, facts, &frozen.simulation_contracts))
+        .map(|facts| {
+            build_simulation_definition(prepared, facts, &frozen.robot.simulation_contracts)
+        })
         .transpose()?;
     let RobotDocument::V0 { robot, .. } = prepared.document();
     let manifest = BundleManifest::V0 {
         robot_id: robot.id.clone(),
-        target: frozen.target.clone(),
+        target: frozen.robot.target.clone(),
         supervisor: BundleSupervisor {
             path: supervisor_relative,
         },
-        artifacts: frozen.inventory.values().cloned().collect(),
+        artifacts: frozen.robot.inventory.values().cloned().collect(),
         instances,
         connections,
         components,
-        component_sources: frozen.component_sources.clone(),
-        model: frozen.model.clone(),
+        component_sources: frozen.robot.component_sources.clone(),
+        model: frozen.robot.model.clone(),
     };
     phoxal::artifact::bundle::AdmittedBundle::validate(manifest.clone()).map_err(|message| {
         Error::BundleInvalid {
@@ -599,10 +665,11 @@ pub(crate) fn finalize_simulation_bundle(
             source,
         })?;
     copy_closure_tree(staged_root, publish_staging.path())?;
-    publish_directory(publish_staging.path(), output)?;
+    let outcome = super::publish::publish(publish_staging.path(), output, &super::NoPhases)?;
     drop(publish_staging);
     Ok(CompiledBundle {
-        root: output.to_owned(),
+        root: selected_generation(&outcome),
+        publication: outcome,
     })
 }
 
@@ -650,6 +717,7 @@ pub(crate) fn assemble_with_inputs(
     include_native_assets: bool,
     simulation_facts: Option<&SimulationModelFacts>,
     simulation_run: Option<SimulationRunInput<'_>>,
+    phases: &dyn super::PhaseReporter,
 ) -> Result<CompiledBundle, Error> {
     options.validate()?;
     let output = output.as_ref();
@@ -658,7 +726,11 @@ pub(crate) fn assemble_with_inputs(
         path: parent.to_owned(),
         source,
     })?;
-    let _publication_lock = acquire_bundle_publication_lock(output)?;
+    let _publication_lock = if super::watch::owns_output(output) {
+        None
+    } else {
+        Some(crate::project::publish::acquire_publication_lock(output)?)
+    };
 
     let staging = tempfile::Builder::new()
         .prefix(".phoxal-bundle-")
@@ -672,6 +744,7 @@ pub(crate) fn assemble_with_inputs(
         path: staged_root.join(BIN_DIR),
         source,
     })?;
+    phases.phase("staging model resources");
     let (staged_model, component_sources) = if include_native_assets {
         (
             stage_model(prepared, staged_root)?,
@@ -681,42 +754,29 @@ pub(crate) fn assemble_with_inputs(
         (None, BTreeMap::new())
     };
 
+    // The collection builds the selected executables (brain plus selected
+    // participants) through Cargo, warm or cold; zero-participant robots
+    // still run their brain and supervisor builds through this seam.
+    phases.phase("building selected executables");
     let artifacts = collect_selected_artifacts(prepared, options)?;
+    phases.phase("assembling the runnable directory");
 
-    let simulation_contracts = prepared
-        .assembly_targets()
-        .into_iter()
-        .filter_map(|(instance, target)| {
-            artifacts
-                .get(&(target.package_id.clone(), target.target.clone()))
-                .map(|(_, _, contract, _)| contract.clone())
-                .map(|contract| {
-                    let mut summary = contract.summary();
-                    let RuntimeRecord::V0 { outputs, .. } = &summary.runtime;
-                    if outputs.iter().any(|output| output.family.is_some()) {
-                        let config = instance_config(prepared, &instance);
-                        summary.runtime = summary
-                            .runtime
-                            .resolve_outputs(config.value().ok_or_else(|| {
-                                simulation_error("output family requires configuration")
-                            })?)
-                            .map_err(simulation_error)?;
-                    }
-                    Ok((instance, summary))
-                })
-        })
-        .collect::<Result<BTreeMap<_, _>, Error>>()?;
+    let simulation_contracts = instance_contracts(prepared, &artifacts)?;
     let inventory = stage_artifact_inventory(prepared, &artifacts, staged_root)?;
     let artifact_records = inventory.into_values().collect::<Vec<_>>();
 
     let mut instances: Vec<BundleInstance> = Vec::new();
     for (instance, target) in prepared.assembly_targets() {
         let key = (target.package_id.clone(), target.target.clone());
-        let (_, _, _, artifact_id) = artifacts.get(&key).ok_or_else(|| Error::ArtifactCapture {
-            package: target.package.clone(),
-            target: target.target.clone(),
-            message: "Cargo did not produce a selected executable".to_owned(),
-        })?;
+        let artifact_id = artifacts
+            .get(&key)
+            .ok_or_else(|| Error::ArtifactCapture {
+                package: target.package.clone(),
+                target: target.target.clone(),
+                message: "Cargo did not produce a selected executable".to_owned(),
+            })?
+            .artifact_id
+            .clone();
         instances.push(BundleInstance {
             id: instance.clone(),
             role: match prepared.executable_role(&instance).as_str() {
@@ -733,16 +793,21 @@ pub(crate) fn assemble_with_inputs(
     // The supervisor is tool-acquired data selected by the authored
     // document, validated before bundling, and never a robot Cargo
     // dependency or a participant child.
+    phases.phase("selecting the supervisor");
     let supervisor_selection = super::supervisor::select(
         prepared.cargo_workdir(),
         &super::supervisor::AuthoredSupervisor::capture(prepared.document())?,
         options,
         simulation_facts.is_some(),
+        phases,
     )?;
+    // Selection (or its owning build) ends; validation, copying, and the
+    // manifest resume assembly.
+    phases.phase("assembling the runnable directory");
 
     let contract_map = artifacts
         .iter()
-        .map(|(key, (_, _, contract, _))| (key.clone(), contract.clone()))
+        .map(|(key, artifact)| (key.clone(), artifact.contract.clone()))
         .collect::<BTreeMap<_, _>>();
     let document = prepared.document().clone();
     if let Some(scenario) = simulation_run.as_ref() {
@@ -811,11 +876,26 @@ pub(crate) fn assemble_with_inputs(
     })?;
     write_json(&staged_root.join(MANIFEST_FILE), &manifest)?;
 
-    let staged = staging.keep();
-    publish_directory(&staged, output)?;
+    // The staging tree stays command-owned: a successful publication
+    // renames it into the generations storage, while any error path drops
+    // it through the guard instead of abandoning it beside the output.
+    let outcome = super::publish::publish(staging.path(), output, phases)?;
+    drop(staging);
     Ok(CompiledBundle {
-        root: output.to_owned(),
+        root: selected_generation(&outcome),
+        publication: outcome,
     })
+}
+
+/// The root readers use: the immutable generation selected by publication.
+///
+/// The bundle record resolves the stable root once, so later publications
+/// cannot mix generations under one running reader.
+fn selected_generation(outcome: &super::publish::PublicationOutcome) -> PathBuf {
+    match outcome {
+        super::publish::PublicationOutcome::Published { generation, .. }
+        | super::publish::PublicationOutcome::Unchanged { generation, .. } => generation.clone(),
+    }
 }
 
 /// One instance's resolved configuration from the authored document.
@@ -1839,197 +1919,6 @@ fn output_parent(output: &Path) -> &Path {
         .unwrap_or_else(|| Path::new("."))
 }
 
-fn publish_directory(staged: &Path, output: &Path) -> Result<(), Error> {
-    if output.exists() {
-        if !output.is_dir() {
-            return Err(Error::BundlePublish {
-                path: output.to_owned(),
-                source: io::Error::new(
-                    io::ErrorKind::AlreadyExists,
-                    "bundle output exists and is not a directory",
-                ),
-            });
-        }
-        if output.is_dir() && directories_equal(staged, output)? {
-            fs::remove_dir_all(staged).map_err(|source| Error::BundleCleanup {
-                path: staged.to_owned(),
-                source,
-            })?;
-            return Ok(());
-        }
-        let old_parent = tempfile::Builder::new()
-            .prefix(".phoxal-previous-")
-            .tempdir_in(output_parent(output))
-            .map_err(|source| Error::BundleDirectory {
-                path: output.to_owned(),
-                source,
-            })?;
-        let old = old_parent.path().join("bundle");
-        fs::rename(output, &old).map_err(|source| Error::BundlePublish {
-            path: output.to_owned(),
-            source,
-        })?;
-        if let Err(source) = fs::rename(staged, output) {
-            let _ = fs::rename(&old, output);
-            return Err(Error::BundlePublish {
-                path: output.to_owned(),
-                source,
-            });
-        }
-        fs::remove_dir_all(&old).map_err(|source| Error::BundleCleanup { path: old, source })?;
-        return Ok(());
-    }
-    fs::rename(staged, output).map_err(|source| Error::BundlePublish {
-        path: output.to_owned(),
-        source,
-    })
-}
-
-struct BundlePublicationLock {
-    file: File,
-    key: PathBuf,
-}
-
-static ACTIVE_BUNDLE_PUBLICATION_LOCKS: OnceLock<Mutex<BTreeSet<PathBuf>>> = OnceLock::new();
-
-impl Drop for BundlePublicationLock {
-    fn drop(&mut self) {
-        let _ = FileExt::unlock(&self.file);
-        if let Some(active) = ACTIVE_BUNDLE_PUBLICATION_LOCKS.get()
-            && let Ok(mut active) = active.lock()
-        {
-            active.remove(&self.key);
-        }
-    }
-}
-
-fn acquire_bundle_publication_lock(output: &Path) -> Result<BundlePublicationLock, Error> {
-    let parent = output_parent(output);
-    let canonical_parent = parent
-        .canonicalize()
-        .map_err(|source| Error::BundleDirectory {
-            path: parent.to_owned(),
-            source,
-        })?;
-    let output_name = output.file_name().ok_or_else(|| Error::ArtifactInvalid {
-        path: output.to_owned(),
-        message: "bundle output must name a directory below an existing parent".to_owned(),
-    })?;
-    let lock_directory = canonical_parent.join(".phoxal-bundle-locks");
-    fs::create_dir_all(&lock_directory).map_err(|source| Error::BundleDirectory {
-        path: lock_directory.clone(),
-        source,
-    })?;
-    let lock_path = lock_directory.join(format!("{}.lock", output_name.to_string_lossy()));
-    let active = ACTIVE_BUNDLE_PUBLICATION_LOCKS.get_or_init(|| Mutex::new(BTreeSet::new()));
-    let mut active = active.lock().map_err(|_| Error::BundleLock {
-        path: lock_path.clone(),
-        source: io::Error::other("bundle publication lock registry is poisoned"),
-    })?;
-    if active.contains(&lock_path) {
-        return Err(Error::BundleBusy {
-            path: output.to_owned(),
-        });
-    }
-    let lock = fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(&lock_path)
-        .map_err(|source| Error::BundleLock {
-            path: lock_path.clone(),
-            source,
-        })?;
-    match FileExt::try_lock(&lock) {
-        Ok(()) => {
-            active.insert(lock_path.clone());
-            Ok(BundlePublicationLock {
-                file: lock,
-                key: lock_path,
-            })
-        }
-        Err(TryLockError::WouldBlock) => Err(Error::BundleBusy {
-            path: output.to_owned(),
-        }),
-        Err(TryLockError::Error(source)) => Err(Error::BundleLock {
-            path: lock_path,
-            source,
-        }),
-    }
-}
-
-fn directories_equal(left: &Path, right: &Path) -> Result<bool, Error> {
-    let left_entries = directory_entries(left)?;
-    let right_entries = directory_entries(right)?;
-    if left_entries != right_entries {
-        return Ok(false);
-    }
-    for relative in left_entries {
-        let left_path = left.join(&relative);
-        let right_path = right.join(&relative);
-        let left_metadata =
-            fs::symlink_metadata(&left_path).map_err(|source| Error::ArtifactFile {
-                path: left_path.clone(),
-                source,
-            })?;
-        let right_metadata =
-            fs::symlink_metadata(&right_path).map_err(|source| Error::ArtifactFile {
-                path: right_path.clone(),
-                source,
-            })?;
-        if left_metadata.is_dir() != right_metadata.is_dir() {
-            return Ok(false);
-        }
-        if left_metadata.is_file()
-            && fs::read(&left_path).map_err(|source| Error::ArtifactFile {
-                path: left_path.clone(),
-                source,
-            })? != fs::read(&right_path).map_err(|source| Error::ArtifactFile {
-                path: right_path.clone(),
-                source,
-            })?
-        {
-            return Ok(false);
-        }
-    }
-    Ok(true)
-}
-
-fn directory_entries(root: &Path) -> Result<BTreeSet<PathBuf>, Error> {
-    let mut pending = vec![PathBuf::new()];
-    let mut entries = BTreeSet::new();
-    while let Some(relative) = pending.pop() {
-        let directory = root.join(&relative);
-        for entry in fs::read_dir(&directory).map_err(|source| Error::BundleDirectory {
-            path: directory.clone(),
-            source,
-        })? {
-            let entry = entry.map_err(|source| Error::BundleDirectory {
-                path: directory.clone(),
-                source,
-            })?;
-            let child = relative.join(entry.file_name());
-            let metadata =
-                fs::symlink_metadata(entry.path()).map_err(|source| Error::ArtifactFile {
-                    path: entry.path(),
-                    source,
-                })?;
-            if metadata.file_type().is_symlink() || !(metadata.is_file() || metadata.is_dir()) {
-                return Err(Error::ArtifactInvalid {
-                    path: entry.path(),
-                    message: "bundle contains an unsupported filesystem entry".to_owned(),
-                });
-            }
-            entries.insert(child.clone());
-            if metadata.is_dir() {
-                pending.push(child);
-            }
-        }
-    }
-    Ok(entries)
-}
-
 fn safe_bundle_name(value: &str) -> Result<String, Error> {
     if value.is_empty()
         || value == "."
@@ -2225,12 +2114,14 @@ mod tests {
     fn bundle_publication_is_serialized_per_output() {
         let directory = tempfile::tempdir().expect("temporary directory");
         let output = directory.path().join("bundle");
-        let held = acquire_bundle_publication_lock(&output).expect("first publication lock");
+        let held = crate::project::publish::acquire_publication_lock(&output)
+            .expect("first publication lock");
         assert!(matches!(
-            acquire_bundle_publication_lock(&output),
+            crate::project::publish::acquire_publication_lock(&output),
             Err(Error::BundleBusy { path }) if path == output
         ));
         drop(held);
-        acquire_bundle_publication_lock(&output).expect("released publication lock");
+        crate::project::publish::acquire_publication_lock(&output)
+            .expect("released publication lock");
     }
 }

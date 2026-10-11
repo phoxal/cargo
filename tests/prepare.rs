@@ -158,6 +158,17 @@ fn local_participant_prepares_from_its_compiled_artifact() -> Result<(), Box<dyn
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
+    // The real owning phases are named while the compiled artifact is
+    // produced: the participant resolution and its contract compilation.
+    let transcript = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        transcript.contains("Prepare: resolving selected sources."),
+        "resolution phase named: {transcript}"
+    );
+    assert!(
+        transcript.contains("Prepare: compiling selected contracts."),
+        "contract compilation phase named: {transcript}"
+    );
     let endpoints =
         fs::read_to_string(find_prepared(&robot, "path-provider")?.join("contract.json"))?;
     assert!(

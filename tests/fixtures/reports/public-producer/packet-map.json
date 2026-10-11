@@ -1,0 +1,135 @@
+[
+  {
+    "case": "success",
+    "path": "success.stdout",
+    "sha256": "6239a1dd887fd7a272c59fad4ece41a1c080f262c74e8081ff0c55e6254558a7",
+    "producer_executable": "/Users/jbernavaprah/RustroverProjects/phoxal/organization/tmp/simulator-final-public-producer-release/producer-executable",
+    "producer_executable_sha256": "2a9cd51241eb20078ea9b0c37c37de298ba71cfbc604b710436cff18751d32fc",
+    "report_exit": 0,
+    "scope": "local",
+    "supervisor_id": "local",
+    "run_id": "local-simulation",
+    "cleanup": {
+      "supervisor_stop_requested": true,
+      "supervisor_exited": true,
+      "supervisor_killed": false,
+      "error": null
+    },
+    "terminal_rich": true,
+    "completed_steps": 10
+  },
+  {
+    "case": "unsuccessful-duration",
+    "path": "failure.stdout",
+    "sha256": "9b812107dd99cbd92511faf18933cddb97500c9a9ec7eee2cfa9c3e0c6253d0a",
+    "producer_executable": "/Users/jbernavaprah/RustroverProjects/phoxal/organization/tmp/simulator-final-public-producer-release/producer-executable",
+    "producer_executable_sha256": "2a9cd51241eb20078ea9b0c37c37de298ba71cfbc604b710436cff18751d32fc",
+    "report_exit": 1,
+    "scope": "local",
+    "supervisor_id": "local",
+    "run_id": "local-simulation",
+    "cleanup": {
+      "supervisor_stop_requested": true,
+      "supervisor_exited": true,
+      "supervisor_killed": false,
+      "error": null
+    },
+    "terminal_rich": false,
+    "completed_steps": null
+  },
+  {
+    "case": "null-scope",
+    "path": "null-scope.raw.json",
+    "sha256": "8c1447e54a4319beab68ce943716f7d2124bb9cfc46e12bceff867acbf88aed1",
+    "producer_executable": "/Users/jbernavaprah/RustroverProjects/phoxal/simulator/target/debug/deps/native_qualification-fe2e033f03ff1fae",
+    "producer_executable_sha256": "498a9c5aea1d1837d0c1bffc39b7716c36e106bdd438d61b975ba268f1f9bd07",
+    "report_exit": 1,
+    "scope": null,
+    "supervisor_id": "local",
+    "run_id": "local-simulation",
+    "cleanup": {
+      "supervisor_stop_requested": true,
+      "supervisor_exited": true,
+      "supervisor_killed": false,
+      "error": null
+    },
+    "terminal_rich": false,
+    "completed_steps": null
+  },
+  {
+    "case": "null-supervisor_id",
+    "path": "null-supervisor_id.raw.json",
+    "sha256": "95a21f35a71a06bf6264d404fb57f4eaad87d6a2e57af0ec9a8b0d0d29b3713e",
+    "producer_executable": "/Users/jbernavaprah/RustroverProjects/phoxal/simulator/target/debug/deps/native_qualification-fe2e033f03ff1fae",
+    "producer_executable_sha256": "498a9c5aea1d1837d0c1bffc39b7716c36e106bdd438d61b975ba268f1f9bd07",
+    "report_exit": 1,
+    "scope": "local",
+    "supervisor_id": null,
+    "run_id": "local-simulation",
+    "cleanup": {
+      "supervisor_stop_requested": true,
+      "supervisor_exited": true,
+      "supervisor_killed": false,
+      "error": null
+    },
+    "terminal_rich": false,
+    "completed_steps": null
+  },
+  {
+    "case": "null-run_id",
+    "path": "null-run_id.raw.json",
+    "sha256": "76306cfd77d4ec13069eea18412675e6b30298c69108868411c898081471edde",
+    "producer_executable": "/Users/jbernavaprah/RustroverProjects/phoxal/simulator/target/debug/deps/native_qualification-fe2e033f03ff1fae",
+    "producer_executable_sha256": "498a9c5aea1d1837d0c1bffc39b7716c36e106bdd438d61b975ba268f1f9bd07",
+    "report_exit": 1,
+    "scope": "local",
+    "supervisor_id": "local",
+    "run_id": null,
+    "cleanup": {
+      "supervisor_stop_requested": true,
+      "supervisor_exited": true,
+      "supervisor_killed": false,
+      "error": null
+    },
+    "terminal_rich": false,
+    "completed_steps": null
+  },
+  {
+    "case": "forward_stop",
+    "path": "forward_stop-final-packet/producer.stdout",
+    "sha256": "3980b63bd665e7f48286a38b27e70e4cbaa84511e51d1da17a1731ed9fd88ccb",
+    "producer_executable": "/Users/jbernavaprah/RustroverProjects/phoxal/simulator/target/debug/phoxal-simulator",
+    "producer_executable_sha256": "2a9cd51241eb20078ea9b0c37c37de298ba71cfbc604b710436cff18751d32fc",
+    "report_exit": 0,
+    "scope": "scenarios",
+    "supervisor_id": "run-host",
+    "run_id": "forward-stop",
+    "cleanup": {
+      "supervisor_stop_requested": true,
+      "supervisor_exited": true,
+      "supervisor_killed": false,
+      "error": null
+    },
+    "terminal_rich": true,
+    "completed_steps": 292
+  },
+  {
+    "case": "turn_stop",
+    "path": "turn_stop-final-packet/producer.stdout",
+    "sha256": "2561cee8c001aaf2d5997bbc39320990b8789053bbd14bf3415e79c11e672dfe",
+    "producer_executable": "/Users/jbernavaprah/RustroverProjects/phoxal/simulator/target/debug/phoxal-simulator",
+    "producer_executable_sha256": "2a9cd51241eb20078ea9b0c37c37de298ba71cfbc604b710436cff18751d32fc",
+    "report_exit": 0,
+    "scope": "scenarios",
+    "supervisor_id": "run-host",
+    "run_id": "turn-stop",
+    "cleanup": {
+      "supervisor_stop_requested": true,
+      "supervisor_exited": true,
+      "supervisor_killed": false,
+      "error": null
+    },
+    "terminal_rich": true,
+    "completed_steps": 762
+  }
+]

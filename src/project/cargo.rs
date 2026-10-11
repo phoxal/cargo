@@ -5,38 +5,31 @@ use std::path::Path;
 use std::process::{Command, ExitStatus};
 /// The deployment target one command builds for.
 ///
-/// An explicit `--target` argument or option wins; otherwise the command
-/// targets the assembling host's concrete triple, never an ambiguous
-/// `host` marker.
+/// An explicit `--target` selection wins; otherwise the command targets
+/// the assembling host's concrete triple, never an ambiguous `host`
+/// marker. Selection-relevant raw argument tails were already folded into
+/// the structured selection once at the invocation boundary.
 pub(crate) fn effective_target(options: &CargoOptions) -> String {
-    cargo_arg_value(&options.cargo_args, "--target")
-        .or_else(|| options.target.clone())
+    options
+        .target
+        .clone()
         .unwrap_or_else(phoxal::artifact::bundle::host_execution_target)
 }
-/// Reads one `--target <value>` style argument from a raw Cargo argument
-/// list.
-fn cargo_arg_value(arguments: &[std::ffi::OsString], name: &str) -> Option<String> {
-    let arguments = arguments
-        .iter()
-        .map(|argument| argument.to_string_lossy().into_owned())
-        .collect::<Vec<_>>();
-    let equals = format!("{name}=");
-    let mut value = None;
-    let mut index = 0;
-    while index < arguments.len() {
-        if arguments[index] == name && index + 1 < arguments.len() {
-            value = Some(arguments[index + 1].clone());
-            index += 2;
-            continue;
-        }
-        if let Some(rest) = arguments[index].strip_prefix(&equals) {
-            value = Some(rest.to_owned());
-        }
-        index += 1;
-    }
-    value
+/// The Cargo profile one command builds with.
+///
+/// An explicit `--profile` selection wins; `--release` selects Cargo's
+/// `release` profile; the default is Cargo's development profile.
+pub(crate) fn effective_profile(options: &CargoOptions) -> String {
+    options
+        .profile
+        .clone()
+        .unwrap_or_else(|| if options.release { "release" } else { "dev" }.to_owned())
 }
 /// The normalized build selection, shared by acquisition and bundle grouping.
+///
+/// Selection inputs are parsed once at the invocation boundary; this record
+/// reads only resolved fields, so installation-store and artifact identities
+/// never reparse a raw Cargo argument tail.
 #[derive(Debug, serde::Serialize)]
 pub(crate) struct BuildSelection {
     target: String,
@@ -46,57 +39,31 @@ pub(crate) struct BuildSelection {
     no_default_features: bool,
 }
 impl BuildSelection {
-    pub(crate) fn capture(options: &CargoOptions) -> Self {
-        let profile = cargo_arg_value(&options.cargo_args, "--profile")
-            .or_else(|| options.profile.clone())
-            .unwrap_or_else(|| {
-                if options.release || options.cargo_args.iter().any(|v| v == "--release") {
-                    "release".into()
-                } else {
-                    "dev".into()
-                }
-            });
+    /// The root robot graph's selection.
+    ///
+    /// Root feature flags apply to the brain, not independently selected
+    /// applications.
+    pub(crate) fn root(options: &CargoOptions) -> Self {
         let mut features = options.features.clone();
-        let mut args = options.cargo_args.iter();
-        while let Some(arg) = args.next() {
-            let arg = arg.to_string_lossy();
-            let value = if arg == "--features" {
-                args.next().map(|v| v.to_string_lossy())
-            } else {
-                arg.strip_prefix("--features=")
-                    .map(std::borrow::Cow::Borrowed)
-            };
-            if let Some(value) = value {
-                features.extend(
-                    value
-                        .split([',', ' '])
-                        .filter(|v| !v.is_empty())
-                        .map(str::to_owned),
-                );
-            }
-        }
         features.sort();
         features.dedup();
         Self {
             target: effective_target(options),
-            profile,
+            profile: effective_profile(options),
             features,
-            all_features: options.all_features
-                || options.cargo_args.iter().any(|v| v == "--all-features"),
-            no_default_features: options.no_default_features
-                || options
-                    .cargo_args
-                    .iter()
-                    .any(|v| v == "--no-default-features"),
+            all_features: options.all_features,
+            no_default_features: options.no_default_features,
         }
     }
-    /// Root feature flags apply to the brain, not independently selected applications.
-    pub(crate) fn for_source(options: &CargoOptions) -> Self {
-        let mut selection = Self::capture(options);
-        selection.features.clear();
-        selection.all_features = false;
-        selection.no_default_features = false;
-        selection
+    /// The selection for independently built participants and applications:
+    /// the same target and profile without root feature state.
+    pub(crate) fn participant(options: &CargoOptions) -> Self {
+        Self {
+            features: Vec::new(),
+            all_features: false,
+            no_default_features: false,
+            ..Self::root(options)
+        }
     }
     pub(crate) fn apply(&self, command: &mut Command) {
         command.args(["--target", &self.target, "--profile", &self.profile]);
@@ -112,6 +79,10 @@ impl BuildSelection {
     }
 }
 /// Constructs the shared registry/Git acquisition command for executable owners.
+///
+/// Pinned installations own a locked acquisition graph and selection cache,
+/// separate from local source-development overlays. Do not apply one-off
+/// local `configs` to this context or its captured package metadata.
 pub(crate) fn source_install_command(
     root: &Path,
     source: &phoxal::artifact::document::Source,
@@ -126,7 +97,7 @@ pub(crate) fn source_install_command(
         .args(["install", "--locked", "--message-format", "json", "--root"])
         .arg(installation)
         .args(["--bin", binary]);
-    BuildSelection::for_source(options).apply(&mut command);
+    BuildSelection::participant(options).apply(&mut command);
     if options.offline || options.lock == LockMode::Frozen {
         command.arg("--offline");
     }
@@ -139,6 +110,140 @@ pub(crate) fn source_install_command(
         }
     }
     command
+}
+/// Constructs one local package build command for an independently selected
+/// participant, driver, or application package.
+///
+/// The build runs in the caller's effective invocation directory, which is
+/// where Cargo discovers `.cargo` configuration and toolchain files; the
+/// participant and driver builds use the manifest's directory, while the
+/// supervisor application builds from the robot root. The command carries
+/// the participant build selection (effective target and profile, no root
+/// features) and the resolved lock and offline policy, and selects exactly
+/// one package and binary, so the compiler-artifact stream admits one
+/// executable.
+///
+/// Cargo identifies a compilation unit by package name, version, target,
+/// profile, and settings, and compares path sources only through recorded
+/// file modification times. Two independently selected local packages with
+/// the same name and version can therefore satisfy one fingerprint in a
+/// shared target directory and publish the other source's executable as
+/// fresh. Each selected source builds below its own subdirectory of the
+/// resolved target directory: distinct sources never share one unit, while
+/// the same source keeps Cargo's ordinary incremental reuse.
+pub(crate) fn local_package_build(
+    invocation_directory: &Path,
+    manifest_path: &Path,
+    package: &str,
+    binary: &str,
+    message_format: &str,
+    options: &CargoOptions,
+) -> Result<Command, Error> {
+    let directories =
+        selected_source_compiler_directories(manifest_path, invocation_directory, options)?;
+    let mut command = Command::new(options.cargo_program());
+    command
+        .current_dir(invocation_directory)
+        .args(["build", "--manifest-path"])
+        .arg(manifest_path);
+    for config in &options.configs {
+        command.arg("--config").arg(config);
+    }
+    directories.apply(&mut command);
+    BuildSelection::participant(options).apply(&mut command);
+    for flag in options.lock.flags() {
+        command.arg(flag);
+    }
+    if options.offline {
+        command.arg("--offline");
+    }
+    command.args(["--package", package, "--bin", binary]);
+    command.args(["--message-format", message_format]);
+    Ok(command)
+}
+
+/// The per-selected-source compiler directories below Cargo's resolved
+/// final-output and intermediate-cache roots.
+///
+/// The selected source's canonical manifest path keys the subdirectory, so
+/// equal selections share one warm Cargo unit and distinct selections never
+/// collide, whatever target directory the caller shares. The directory is
+/// passed as compiler-only overrides, preserving the ordinary
+/// Cargo environment used by SDK prepared-input discovery. Nothing is created
+/// here: Cargo builds into the directory it is given.
+fn selected_source_compiler_directories(
+    manifest_path: &Path,
+    invocation_directory: &Path,
+    options: &CargoOptions,
+) -> Result<CompilerDirectories, Error> {
+    use sha2::{Digest as _, Sha256};
+    let resolved = compiler_directory_metadata(manifest_path, invocation_directory, options)?;
+    let canonical = manifest_path
+        .canonicalize()
+        .map_err(|source| Error::ArtifactFile {
+            path: manifest_path.to_owned(),
+            source,
+        })?;
+    let digest = Sha256::digest(canonical.as_os_str().as_encoded_bytes());
+    let namespace = |base: cargo_metadata::camino::Utf8PathBuf| {
+        base.into_std_path_buf()
+            .join("phoxal")
+            .join(".selected")
+            .join(format!("{digest:x}"))
+    };
+    Ok(CompilerDirectories {
+        target: namespace(resolved.target_directory),
+        build: resolved.build_directory.map(namespace),
+    })
+}
+
+struct CompilerDirectories {
+    target: std::path::PathBuf,
+    build: Option<std::path::PathBuf>,
+}
+impl CompilerDirectories {
+    fn apply(&self, command: &mut Command) {
+        command.arg("--target-dir").arg(&self.target);
+        // Cargo itself reports whether separate intermediate storage exists.
+        // Older Cargo keeps intermediates in --target-dir and receives no new
+        // option. The owner override follows caller overlays, so they cannot
+        // merge distinct selected sources back into one compiler cache.
+        if let Some(build) = &self.build {
+            command
+                .arg("--config")
+                .arg(path_config("build.build-dir", build));
+        }
+    }
+}
+fn path_config(key: &str, path: &Path) -> String {
+    format!(
+        "{key}={}",
+        toml::Value::String(path.to_string_lossy().into_owned())
+    )
+}
+/// Pinned installs already own a complete selection cache, separate from
+/// source-development overlays. Keep both Cargo cache locations inside it.
+pub(crate) fn installation_cache(command: &mut Command, directory: &Path) {
+    command
+        .env("CARGO_TARGET_DIR", directory)
+        .env("CARGO_BUILD_BUILD_DIR", directory);
+}
+
+/// Splits one raw `--features` value the way Cargo does: on commas and
+/// spaces, ignoring empty pieces.
+fn split_feature_names(value: &str) -> impl Iterator<Item = String> + '_ {
+    value
+        .split([',', ' '])
+        .filter(|piece| !piece.is_empty())
+        .map(str::to_owned)
+}
+/// Reads the attached value of one short Cargo flag spelling, such as
+/// `-Fvision` or `-F=vision`.
+fn short_attached(argument: &str, flag: &str) -> Option<String> {
+    argument
+        .strip_prefix(flag)
+        .filter(|_| argument.len() > flag.len())
+        .map(|value| value.strip_prefix('=').unwrap_or(value).to_owned())
 }
 /// Cargo's lockfile policy for project preparation and commands.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -172,6 +277,10 @@ pub struct CargoOptions {
     /// the options keeps metadata, checks, builds, tests, and updates on the
     /// same Cargo installation.
     pub cargo_path: Option<std::path::PathBuf>,
+    /// One-off compiler output root; prepared inputs keep ordinary configuration.
+    pub compiler_target_dir: Option<std::path::PathBuf>,
+    /// One-off Cargo configuration overrides, in caller order.
+    pub configs: Vec<OsString>,
     /// Lockfile policy.
     pub lock: LockMode,
     /// Forbid registry and Git network access without requiring `--frozen`.
@@ -188,6 +297,8 @@ pub struct CargoOptions {
     pub no_default_features: bool,
     /// Build with Cargo's release profile.
     pub release: bool,
+    /// Compile test executables without running them (`--no-run`).
+    pub no_run: bool,
     /// Cargo compiler output format.
     pub message_format: Option<String>,
     /// Additional Cargo arguments before a test delimiter.
@@ -201,6 +312,8 @@ impl Default for CargoOptions {
     fn default() -> Self {
         Self {
             cargo_path: None,
+            compiler_target_dir: None,
+            configs: Vec::new(),
             lock: LockMode::Unlocked,
             offline: false,
             target: None,
@@ -209,6 +322,7 @@ impl Default for CargoOptions {
             all_features: false,
             no_default_features: false,
             release: false,
+            no_run: false,
             message_format: None,
             cargo_args: Vec::new(),
             test_args: Vec::new(),
@@ -332,12 +446,112 @@ impl CargoOptions {
         }
         Ok(())
     }
+    /// Folds the selection- and policy-relevant flags of a raw Cargo
+    /// argument tail into their structured fields, once, at the invocation
+    /// boundary.
+    ///
+    /// Downstream selection, command construction, lock and offline policy,
+    /// diagnostics policy, and identity recording read only the resolved
+    /// fields. A raw `--target`, `--profile`, or `--message-format` wins over
+    /// an explicit structured selection, matching Cargo's last-flag rule for
+    /// the forwarded tail. Boolean flags
+    /// combine, and the strongest requested lockfile policy wins, so a raw
+    /// tail can tighten but never relax the structured policy. Feature
+    /// values split on commas and spaces and ignore empty pieces, exactly as
+    /// Cargo does, including the `-F` short spelling. Every other argument
+    /// stays in the tail in caller order.
+    pub(crate) fn normalize(&mut self) {
+        let mut arguments = std::mem::take(&mut self.cargo_args).into_iter();
+        let mut retained = Vec::new();
+        let mut target = None;
+        let mut profile = None;
+        let mut features = Vec::<String>::new();
+        let mut locked = false;
+        let mut frozen = false;
+        let mut message_format = None;
+        while let Some(argument) = arguments.next() {
+            let text = argument.to_string_lossy().into_owned();
+            let inline = |name: &str| text.strip_prefix(&format!("{name}=")).map(str::to_owned);
+            if let Some(value) = inline("--target") {
+                target = Some(value);
+            } else if let Some(value) = inline("--target-dir") {
+                self.compiler_target_dir = Some(value.into());
+            } else if let Some(value) = inline("--config") {
+                self.configs.push(value.into());
+            } else if text == "--target-dir"
+                && let Some(value) = arguments.next()
+            {
+                self.compiler_target_dir = Some(value.into());
+            } else if text == "--config"
+                && let Some(value) = arguments.next()
+            {
+                self.configs.push(value);
+            } else if let Some(value) = inline("--profile") {
+                profile = Some(value);
+            } else if let Some(value) = inline("--features") {
+                features.extend(split_feature_names(&value));
+            } else if let Some(value) = inline("--message-format") {
+                message_format = Some(value);
+            } else if let Some(value) = short_attached(&text, "-F") {
+                features.extend(split_feature_names(&value));
+            } else if text == "--target"
+                && let Some(value) = arguments.next()
+            {
+                target = Some(value.to_string_lossy().into_owned());
+            } else if text == "--profile"
+                && let Some(value) = arguments.next()
+            {
+                profile = Some(value.to_string_lossy().into_owned());
+            } else if (text == "--features" || text == "-F")
+                && let Some(value) = arguments.next()
+            {
+                features.extend(split_feature_names(&value.to_string_lossy()));
+            } else if text == "--message-format"
+                && let Some(value) = arguments.next()
+            {
+                message_format = Some(value.to_string_lossy().into_owned());
+            } else if text == "--release" || text == "-r" {
+                self.release = true;
+            } else if text == "--no-run" {
+                self.no_run = true;
+            } else if text == "--all-features" {
+                self.all_features = true;
+            } else if text == "--no-default-features" {
+                self.no_default_features = true;
+            } else if text == "--locked" {
+                locked = true;
+            } else if text == "--frozen" {
+                frozen = true;
+            } else if text == "--offline" {
+                self.offline = true;
+            } else {
+                retained.push(argument);
+            }
+        }
+        self.cargo_args = retained;
+        self.target = target.or_else(|| self.target.take());
+        self.profile = profile.or_else(|| self.profile.take());
+        self.features.extend(features);
+        self.message_format = message_format.or_else(|| self.message_format.take());
+        // The strongest requested lockfile policy wins, so a raw tail can
+        // tighten but never silently relax the structured selection.
+        self.lock = if frozen || self.lock == LockMode::Frozen {
+            LockMode::Frozen
+        } else if locked || self.lock == LockMode::Locked {
+            LockMode::Locked
+        } else {
+            LockMode::Unlocked
+        };
+    }
     pub(crate) fn append_common(
         &self,
         command: &mut Command,
         include_message_format: bool,
         include_selection: bool,
     ) {
+        for config in &self.configs {
+            command.arg("--config").arg(config);
+        }
         for flag in self.lock.flags() {
             command.arg(flag);
         }
@@ -370,11 +584,27 @@ impl CargoOptions {
         }
         command.args(&self.cargo_args);
     }
+    /// Whether compiler output and Phoxal diagnostics use JSON.
+    ///
+    /// The policy derives from the resolved message format only; no caller
+    /// reparses a raw Cargo tail.
+    pub(crate) fn diagnostics_json(&self) -> bool {
+        self.message_format
+            .as_deref()
+            .is_some_and(|format| format.starts_with("json"))
+    }
     pub(crate) fn cargo_program(&self) -> std::path::PathBuf {
         self.cargo_path
             .clone()
             .or_else(|| std::env::var_os("CARGO").map(std::path::PathBuf::from))
             .unwrap_or_else(|| std::path::PathBuf::from("cargo"))
+    }
+    /// Cargo metadata must resolve the same configuration overlays as local
+    /// compilation, in caller order so Cargo owns their merge precedence.
+    fn metadata_config_args(&self) -> impl Iterator<Item = String> + '_ {
+        self.configs
+            .iter()
+            .flat_map(|config| ["--config".to_owned(), config.to_string_lossy().into_owned()])
     }
 }
 /// The supported source-development Cargo operations.
@@ -441,15 +671,173 @@ pub(crate) fn load_metadata_at(
     if let Some(target) = &options.target {
         extra.extend(["--filter-platform".to_owned(), target.clone()]);
     }
+    extra.extend(options.metadata_config_args());
     command.other_options(extra);
-    command.exec().map_err(|source| Error::CargoMetadata {
+    metadata_output(&command).map_err(|source| Error::CargoMetadata {
         manifest: manifest.to_owned(),
         source,
     })
 }
+/// Executes the existing metadata command through watch-owned cancellation.
+pub(crate) fn metadata_output(
+    command: &MetadataCommand,
+) -> Result<Metadata, cargo_metadata::Error> {
+    let output = crate::owned_process::output(&mut command.cargo_command())?;
+    if !output.status.success() {
+        crate::owned_process::retain_cancelled(&[], &output.stderr);
+        return Err(cargo_metadata::Error::CargoMetadata {
+            stderr: String::from_utf8(output.stderr)?,
+        });
+    }
+    let stdout = std::str::from_utf8(&output.stdout)?;
+    let json = stdout
+        .lines()
+        .find(|line| line.starts_with('{'))
+        .ok_or(cargo_metadata::Error::NoJson)?;
+    MetadataCommand::parse(json)
+}
+
+/// Resolves the effective toolchain identity for one invocation.
+///
+/// The selected Cargo executable reports its own version line; a missing or
+/// unexecutable selection fails here, before any path is claimed. The
+/// identity keys publication slots so distinct effective toolchains never
+/// share one slot, and a future watch can pin it for restart detection.
+pub(crate) fn effective_toolchain(
+    options: &CargoOptions,
+    working_directory: &Path,
+) -> Result<String, Error> {
+    options.validate()?;
+    let cargo = version_line(working_directory, &options.cargo_program())?;
+    let rustc = version_line(
+        working_directory,
+        &effective_rustc(options, working_directory),
+    )?;
+    Ok(format!("{cargo}\n{rustc}"))
+}
+
+/// One executable's first `--version` line, resolved in the same working
+/// directory the Cargo owner uses for metadata and builds, so directory
+/// toolchain overrides apply exactly as they do to real compilation.
+fn version_line(working_directory: &Path, program: &Path) -> Result<String, Error> {
+    let output = crate::owned_process::output(
+        Command::new(program)
+            .arg("--version")
+            .current_dir(working_directory),
+    )
+    .map_err(|source| Error::CargoSpawn {
+        operation: "resolve the toolchain".to_owned(),
+        source,
+    })?;
+    if !output.status.success() {
+        return Err(Error::CargoCommand {
+            operation: "resolve the toolchain".to_owned(),
+            status: output.status.to_string(),
+            stdout: String::from_utf8_lossy(&output.stdout).trim().to_owned(),
+            stderr: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+        });
+    }
+    let version = String::from_utf8_lossy(&output.stdout);
+    let version = version.lines().next().unwrap_or_default().trim();
+    if version.is_empty() {
+        return Err(Error::CargoCommand {
+            operation: "resolve the toolchain".to_owned(),
+            status: "no version line".to_owned(),
+            stdout: String::new(),
+            stderr: String::new(),
+        });
+    }
+    Ok(version.to_owned())
+}
+
+/// The Rust compiler Cargo itself would use: the supported `RUSTC` and
+/// `CARGO_BUILD_RUSTC` selections over the `build.rustc` configuration, or
+/// the compiler beside the selected Cargo (a toolchain layout), or the
+/// `rustc` on `PATH`.
+///
+/// Configuration resolution belongs to Cargo's own maintained resolver
+/// ([`cargo_config2`]): the hierarchical merge walking up from the working
+/// directory with the Cargo-home base layer, the documented environment
+/// overlay precedence, the legacy extensionless configuration file winning
+/// over `config.toml`, and program-path handling where bare executable
+/// names resolve through `PATH` while relative paths anchor to their
+/// defining configuration file. Nothing compiles and no configuration is
+/// rewritten.
+fn effective_rustc(options: &CargoOptions, working_directory: &Path) -> std::path::PathBuf {
+    let configured = cargo_config2::Config::load_with_cwd(working_directory)
+        .ok()
+        .and_then(|config| config.build.rustc);
+    if let Some(rustc) = configured {
+        return rustc;
+    }
+    // No explicit selection: the compiler beside the selected Cargo
+    // (a toolchain layout), or the `rustc` on `PATH`.
+    if let Some(directory) = options.cargo_program().parent()
+        && directory.join("rustc").is_file()
+    {
+        return directory.join("rustc");
+    }
+    std::path::PathBuf::from("rustc")
+}
+
+/// Resolves Cargo's target directory without dependency acquisition,
+/// compilation, or artifact creation.
+///
+/// Resolution runs in the robot root with the invocation's lock and offline
+/// policy: the same deliberate invocation context actual builds use,
+/// because relative configured and environment target directories resolve
+/// against the process directory, not the manifest.
+pub(crate) fn resolve_target_directory(
+    manifest: &Path,
+    current_dir: &Path,
+    options: &CargoOptions,
+) -> Result<std::path::PathBuf, Error> {
+    Ok(compiler_directory_metadata(manifest, current_dir, options)?
+        .target_directory
+        .into_std_path_buf())
+}
+/// Cargo resolves the complete directory configuration, including templates
+/// and ordered overlays. No second configuration hierarchy is interpreted.
+pub(crate) fn compiler_directory_metadata(
+    manifest: &Path,
+    current_dir: &Path,
+    options: &CargoOptions,
+) -> Result<Metadata, Error> {
+    options.validate()?;
+    let mut command = MetadataCommand::new();
+    command
+        .cargo_path(options.cargo_program())
+        .manifest_path(manifest)
+        .current_dir(current_dir)
+        .no_deps();
+    let mut extra = options
+        .lock
+        .flags()
+        .iter()
+        .map(|flag| (*flag).to_owned())
+        .collect::<Vec<_>>();
+    if options.offline {
+        extra.push("--offline".to_owned());
+    }
+    extra.extend(options.metadata_config_args());
+    if let Some(directory) = &options.compiler_target_dir {
+        // Metadata has no --target-dir flag. Cargo's dedicated target-dir
+        // environment override has the same precedence over configuration.
+        // Set it on metadata only, so default intermediate storage follows
+        // the compiler flag without changing SDK prepared-input discovery.
+        command.env("CARGO_TARGET_DIR", current_dir.join(directory));
+    }
+    command.other_options(extra);
+    let metadata = metadata_output(&command).map_err(|source| Error::CargoMetadata {
+        manifest: manifest.to_owned(),
+        source,
+    })?;
+    Ok(metadata)
+}
+
 /// Runs the selected target set from the prepared project's root graph.
 pub(crate) fn run(
-    prepared: &crate::PreparedProject,
+    prepared: &crate::project::PreparedProject,
     operation: CargoOperation,
     options: &CargoOptions,
 ) -> Result<Vec<CargoOutput>, Error> {
@@ -457,7 +845,7 @@ pub(crate) fn run(
 }
 /// Run Cargo with immutable environment entries inherited by test binaries.
 pub(crate) fn run_with_env(
-    prepared: &crate::PreparedProject,
+    prepared: &crate::project::PreparedProject,
     operation: CargoOperation,
     options: &CargoOptions,
     environment: &[(OsString, OsString)],
@@ -467,8 +855,11 @@ pub(crate) fn run_with_env(
     match operation {
         CargoOperation::Test => {
             let root = prepared.cargo_root_package();
-            let mut command = command_for(prepared, operation, options, true, true);
+            let mut command = command_for(prepared, operation, options, true, true)?;
             command.envs(environment.iter().cloned());
+            if options.no_run {
+                command.arg("--no-run");
+            }
             if options.selection.is_empty() {
                 command.args(["--package", root.id.to_string().as_str()]);
             }
@@ -478,49 +869,60 @@ pub(crate) fn run_with_env(
             ]);
             command.args(["--"]);
             command.args(&options.test_args);
-            outputs.push(run_command(command, operation)?);
+            outputs.push(run_command(command, operation, options)?);
         }
         CargoOperation::Check | CargoOperation::Build => {
             if !options.selection.is_empty() {
-                let mut command = command_for(prepared, operation, options, true, true);
+                let mut command = command_for(prepared, operation, options, true, true)?;
                 command.envs(environment.iter().cloned());
                 command.args([
                     "--manifest-path",
                     &prepared.cargo_manifest_path().display().to_string(),
                 ]);
-                outputs.push(run_command(command, operation)?);
+                outputs.push(run_command(command, operation, options)?);
                 return Ok(outputs);
             }
-            let mut command = command_for(prepared, operation, options, true, false);
+            let mut command = command_for(prepared, operation, options, true, false)?;
             command.envs(environment.iter().cloned());
             command.args([
                 "--manifest-path",
                 &prepared.cargo_manifest_path().display().to_string(),
             ]);
-            append_target_selection(&mut command, prepared, &prepared.cargo_sources().brain);
-            outputs.push(run_command(command, operation)?);
+            append_target_selection(
+                &mut command,
+                prepared,
+                &prepared.cargo_sources().brain,
+                &options.features,
+            );
+            outputs.push(run_command(command, operation, options)?);
         }
     }
     Ok(outputs)
 }
 fn command_for(
-    prepared: &crate::PreparedProject,
+    prepared: &crate::project::PreparedProject,
     operation: CargoOperation,
     options: &CargoOptions,
     include_message_format: bool,
     include_selection: bool,
-) -> Command {
+) -> Result<Command, Error> {
     let mut command = Command::new(options.cargo_program());
     command.current_dir(prepared.cargo_workdir());
     command.arg(operation.as_str());
     options.append_common(&mut command, include_message_format, include_selection);
-    command
+    selected_source_compiler_directories(
+        prepared.cargo_manifest_path(),
+        prepared.cargo_workdir(),
+        options,
+    )?
+    .apply(&mut command);
+    Ok(command)
 }
 /// Builds one selected executable while retaining Cargo's machine-readable
 /// artifact records for bundle assembly.
 pub(crate) fn build_target(
-    prepared: &crate::PreparedProject,
-    target: &crate::SelectedTarget,
+    prepared: &crate::project::PreparedProject,
+    target: &crate::project::SelectedTarget,
     options: &CargoOptions,
 ) -> Result<CargoOutput, Error> {
     options.validate()?;
@@ -543,27 +945,22 @@ pub(crate) fn build_target(
             target: target.target.clone(),
             message: "local participant manifest has no parent".to_owned(),
         })?;
-        let mut command = Command::new(options.cargo_program());
-        command
-            .current_dir(workdir)
-            .args(["build", "--manifest-path"]);
-        command.arg(manifest);
-        let mut local_options = options.clone();
-        local_options.features.clear();
-        local_options.all_features = false;
-        local_options.no_default_features = false;
-        local_options.cargo_args.clear();
-        local_options.append_common(&mut command, false, false);
-        command.args(["--package", &target.package, "--bin", &target.target]);
-        command.args(["--message-format", "json-render-diagnostics"]);
-        return run_command(command, CargoOperation::Build);
+        let command = local_package_build(
+            workdir,
+            manifest,
+            &target.package,
+            &target.target,
+            "json-render-diagnostics",
+            options,
+        )?;
+        return run_command(command, CargoOperation::Build, options);
     }
-    let mut command = command_for(prepared, CargoOperation::Build, options, false, false);
+    let mut command = command_for(prepared, CargoOperation::Build, options, false, false)?;
     command.args([
         "--manifest-path",
         &prepared.cargo_manifest_path().display().to_string(),
     ]);
-    append_target_selection(&mut command, prepared, target);
+    append_target_selection(&mut command, prepared, target, &options.features);
     command.args([
         "--message-format",
         options
@@ -572,12 +969,13 @@ pub(crate) fn build_target(
             .filter(|format| format.starts_with("json"))
             .unwrap_or("json-render-diagnostics"),
     ]);
-    run_command(command, CargoOperation::Build)
+    run_command(command, CargoOperation::Build, options)
 }
 fn append_target_selection(
     command: &mut Command,
-    prepared: &crate::PreparedProject,
-    target: &crate::SelectedTarget,
+    prepared: &crate::project::PreparedProject,
+    target: &crate::project::SelectedTarget,
+    root_features: &[String],
 ) {
     if target.package_id != prepared.cargo_root_package().id.to_string() {
         command.args([
@@ -588,7 +986,7 @@ fn append_target_selection(
     command.args(["--package", target.package_id.as_str()]);
     command.args(["--bin", target.target.as_str()]);
     if !target.required_features.is_empty() {
-        let mut features = collect_existing_features(command);
+        let mut features = root_features.to_vec();
         for feature in &target.required_features {
             if !features.iter().any(|existing| existing == feature) {
                 features.push(feature.clone());
@@ -597,94 +995,180 @@ fn append_target_selection(
         command.args(["--features", &features.join(",")]);
     }
 }
-/// Pull every comma-separated feature already present on `command` so the
-/// auto-merge in `append_target_selection` does not duplicate an explicit
-/// caller list.
-fn collect_existing_features(command: &Command) -> Vec<String> {
-    let arguments: Vec<std::ffi::OsString> = command
-        .get_args()
-        .map(|argument| argument.to_os_string())
-        .collect();
-    let mut features = Vec::new();
-    let mut index = 0;
-    while let Some(argument) = arguments.get(index) {
-        let value = argument.to_string_lossy();
-        if value == "--features" {
-            if let Some(next) = arguments.get(index + 1) {
-                for piece in next.to_string_lossy().split(',') {
-                    let trimmed = piece.trim();
-                    if !trimmed.is_empty() && !features.iter().any(|f| f == trimmed) {
-                        features.push(trimmed.to_owned());
-                    }
-                }
-                index += 2;
-                continue;
-            }
-        } else if let Some(rest) = value.strip_prefix("--features=") {
-            for piece in rest.split(',') {
-                let trimmed = piece.trim();
-                if !trimmed.is_empty() && !features.iter().any(|f| f == trimmed) {
-                    features.push(trimmed.to_owned());
-                }
-            }
-        }
-        index += 1;
+/// The exact executable one consumer selects from Cargo's JSON stream.
+#[derive(Debug)]
+pub(crate) enum SelectedExecutable {
+    /// The selected executable path; the last matching artifact wins so a
+    /// rebuild's fresh record supersedes earlier ones.
+    Found(std::path::PathBuf),
+    /// The stream ended without a matching executable artifact.
+    Missing,
+}
+/// One exact compiler-artifact selection.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ExecutableSelector<'a> {
+    /// The exact Cargo package identity, when the consumer knows it.
+    pub(crate) package_id: Option<&'a str>,
+    /// The exact package manifest path, constraining a selection whose
+    /// package identity is not otherwise known, such as one local package
+    /// built through its resolved manifest.
+    pub(crate) manifest_path: Option<&'a Path>,
+    /// The Cargo target name, a binary or example spelling.
+    pub(crate) binary: &'a str,
+    /// Restrict matching to `kind = ["bin"]` targets.
+    pub(crate) bin_only: bool,
+}
+impl ExecutableSelector<'_> {
+    fn matches(&self, artifact: &cargo_metadata::Artifact) -> bool {
+        artifact.target.name == self.binary
+            && (!self.bin_only || artifact.target.is_bin())
+            && self
+                .package_id
+                .is_none_or(|expected| artifact.package_id.to_string() == expected)
+            && self
+                .manifest_path
+                .is_none_or(|expected| artifact.manifest_path.as_std_path() == expected)
     }
-    features
+}
+/// Parses Cargo's entire stdout JSON message stream before any consumer
+/// uses it.
+///
+/// Every non-empty line must parse as one Cargo message. A malformed or
+/// non-protocol line fails the whole stream, so a valid prefix can never
+/// hide a protocol violation after the record a consumer selected.
+/// Diagnostics rendering stays separate and keeps its lenient raw-line
+/// forwarding policy.
+pub(crate) fn parse_message_stream(stdout: &[u8]) -> Result<Vec<Message>, String> {
+    stdout
+        .split(|byte| *byte == b'\n')
+        .filter(|line| !line.is_empty())
+        .map(|line| {
+            serde_json::from_slice::<Message>(line)
+                .map_err(|error| format!("invalid Cargo JSON message: {error}"))
+        })
+        .collect()
+}
+/// Selects one exact executable from an already-validated message stream.
+///
+/// Artifacts for other packages or targets are irrelevant and ignored. A
+/// matching artifact without an executable contributes nothing; the stream
+/// as a whole must still produce the selected executable, and the last
+/// match wins so a rebuild's fresh record supersedes earlier ones.
+pub(crate) fn select_executable(
+    messages: &[Message],
+    selector: &ExecutableSelector<'_>,
+) -> SelectedExecutable {
+    let mut executable = None;
+    for message in messages {
+        if let Message::CompilerArtifact(artifact) = message
+            && selector.matches(artifact)
+            && let Some(path) = artifact.executable.clone()
+        {
+            executable = Some(path.into_std_path_buf());
+        }
+    }
+    match executable {
+        Some(executable) => SelectedExecutable::Found(executable),
+        None => SelectedExecutable::Missing,
+    }
 }
 /// Extracts one selected executable from Cargo's JSON compiler-artifact stream.
 pub(crate) fn artifact_path(
     stdout: &[u8],
-    target: &crate::SelectedTarget,
+    target: &crate::project::SelectedTarget,
 ) -> Result<std::path::PathBuf, Error> {
     if let Some(executable) = &target.executable {
         return Ok(executable.clone());
     }
-    let mut executable = None;
-    for line in stdout.split(|byte| *byte == b'\n') {
-        if line.is_empty() {
-            continue;
-        }
-        let message =
-            serde_json::from_slice::<Message>(line).map_err(|error| Error::ArtifactCapture {
-                package: target.package.clone(),
-                target: target.target.clone(),
-                message: format!("invalid Cargo JSON message: {error}"),
-            })?;
-        if let Message::CompilerArtifact(artifact) = message
-            && artifact.package_id.to_string() == target.package_id
-            && artifact.target.name == target.target
-            && artifact.target.is_bin()
-        {
-            executable = artifact.executable.map(|path| path.into_std_path_buf());
-        }
-    }
-    executable.ok_or_else(|| Error::ArtifactCapture {
+    let messages = parse_message_stream(stdout).map_err(|message| Error::ArtifactCapture {
         package: target.package.clone(),
         target: target.target.clone(),
-        message: "no compiler-artifact executable matched the selected package".to_owned(),
-    })
+        message,
+    })?;
+    let selector = ExecutableSelector {
+        package_id: Some(&target.package_id),
+        manifest_path: None,
+        binary: &target.target,
+        bin_only: true,
+    };
+    match select_executable(&messages, &selector) {
+        SelectedExecutable::Found(executable) => Ok(executable),
+        SelectedExecutable::Missing => Err(Error::ArtifactCapture {
+            package: target.package.clone(),
+            target: target.target.clone(),
+            message: "no compiler-artifact executable matched the selected package".to_owned(),
+        }),
+    }
 }
 pub(crate) fn run_command(
     mut command: Command,
     operation: CargoOperation,
+    options: &CargoOptions,
 ) -> Result<CargoOutput, Error> {
-    let output = command.output().map_err(|source| Error::CargoSpawn {
-        operation: operation.as_str().to_owned(),
-        source,
-    })?;
-    if !output.status.success() {
-        return Err(Error::CargoCommand {
+    let output =
+        crate::owned_process::output(&mut command).map_err(|source| Error::CargoSpawn {
             operation: operation.as_str().to_owned(),
-            status: status_string(output.status),
-            stdout: String::from_utf8_lossy(&output.stdout).trim().to_owned(),
-            stderr: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
-        });
+            source,
+        })?;
+    forward_compiler_stream(&output, options);
+    if !output.status.success() {
+        return Err(cargo_command_failure(
+            operation.as_str(),
+            status_string(output.status),
+            &output,
+            options,
+        ));
     }
     Ok(CargoOutput {
         stdout: output.stdout,
         stderr: output.stderr,
     })
+}
+
+/// One Cargo command failure.
+///
+/// When the JSON compiler channels were already delivered on their real
+/// streams, the project error carries only the operation, status, and
+/// context; embedding the channels again would duplicate every compiler
+/// record inside the structured diagnostic. Human mode keeps the complete
+/// captured output, including Rust test failure evidence.
+pub(crate) fn cargo_command_failure(
+    operation: &str,
+    status: String,
+    output: &std::process::Output,
+    options: &CargoOptions,
+) -> Error {
+    let delivered = options.diagnostics_json();
+    Error::CargoCommand {
+        operation: operation.to_owned(),
+        status,
+        stdout: if delivered {
+            String::new()
+        } else {
+            String::from_utf8_lossy(&output.stdout).trim().to_owned()
+        },
+        stderr: if delivered {
+            String::new()
+        } else {
+            String::from_utf8_lossy(&output.stderr).trim().to_owned()
+        },
+    }
+}
+
+/// Forwards one captured compilation's compiler records to their channels
+/// exactly once, on success and failure.
+///
+/// In JSON diagnostics mode the compiler's own records belong on stdout
+/// with the compiler's stderr on stderr; project diagnostics, status, and
+/// progress stay on stderr. Other modes stream nothing here so the human
+/// owners keep their existing ordering.
+pub(crate) fn forward_compiler_stream(output: &std::process::Output, options: &CargoOptions) {
+    if !options.diagnostics_json() {
+        crate::owned_process::retain_cancelled(&output.stdout, &output.stderr);
+        return;
+    }
+    crate::output::bytes(&output.stdout, false);
+    crate::output::bytes(&output.stderr, true);
 }
 fn status_string(status: ExitStatus) -> String {
     status
@@ -695,23 +1179,510 @@ fn status_string(status: ExitStatus) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn normalized(mut options: CargoOptions) -> CargoOptions {
+        options.normalize();
+        options
+    }
+
+    fn raw(arguments: &[&str]) -> Vec<OsString> {
+        arguments.iter().map(OsString::from).collect()
+    }
+
     #[test]
-    fn collect_existing_features_reads_space_and_equals_forms() {
-        let mut command = Command::new("cargo");
-        command.args(["--features", "scenario,imu"]);
-        command.args(["--features=vision"]);
-        let features = collect_existing_features(&command);
+    fn compiler_output_overrides_normalize_without_changing_the_environment() {
+        let options = normalized(CargoOptions {
+            cargo_args: raw(&[
+                "--target-dir=first",
+                "--config",
+                "build.rustflags=['--cfg','selected']",
+                "--target-dir",
+                "output with spaces",
+                "--config=build.incremental=true",
+            ]),
+            ..CargoOptions::default()
+        });
         assert_eq!(
-            features,
-            vec!["scenario".to_owned(), "imu".to_owned(), "vision".to_owned()]
+            options.compiler_target_dir,
+            Some("output with spaces".into())
+        );
+        assert_eq!(
+            options.configs,
+            raw(&[
+                "build.rustflags=['--cfg','selected']",
+                "build.incremental=true",
+            ])
+        );
+        assert!(options.cargo_args.is_empty());
+        assert_eq!(normalized(options.clone()), options);
+        let mut command = Command::new("cargo");
+        options.append_common(&mut command, false, false);
+        assert!(command.get_envs().next().is_none());
+        assert_eq!(
+            command.get_args().collect::<Vec<_>>(),
+            raw(&[
+                "--config",
+                "build.rustflags=['--cfg','selected']",
+                "--config",
+                "build.incremental=true",
+            ])
         );
     }
+
     #[test]
-    fn collect_existing_features_dedupes_overlapping_entries() {
-        let mut command = Command::new("cargo");
-        command.args(["--features", "scenario,imu"]);
-        command.args(["--features=scenario"]);
-        let features = collect_existing_features(&command);
-        assert_eq!(features, vec!["scenario".to_owned(), "imu".to_owned()]);
+    fn normalize_folds_lock_offline_and_short_aliases() {
+        let options = normalized(CargoOptions {
+            cargo_args: raw(&[
+                "--frozen",
+                "--locked",
+                "--offline",
+                "-r",
+                "-Fvision",
+                "-F",
+                "imu",
+                "-F=balance",
+            ]),
+            ..CargoOptions::default()
+        });
+        assert_eq!(options.lock, LockMode::Frozen, "frozen outranks locked");
+        assert!(options.offline);
+        assert!(options.release);
+        assert_eq!(
+            options.features,
+            ["vision", "imu", "balance"]
+                .iter()
+                .map(|feature| feature.to_string())
+                .collect::<Vec<_>>()
+        );
+        assert!(options.cargo_args.is_empty());
+
+        let options = normalized(CargoOptions {
+            lock: LockMode::Unlocked,
+            cargo_args: raw(&["--locked"]),
+            ..CargoOptions::default()
+        });
+        assert_eq!(options.lock, LockMode::Locked);
+        // A raw tail can tighten but never relax a structured policy.
+        let options = normalized(CargoOptions {
+            lock: LockMode::Frozen,
+            cargo_args: raw(&["--locked"]),
+            ..CargoOptions::default()
+        });
+        assert_eq!(options.lock, LockMode::Frozen);
+        let options = normalized(CargoOptions {
+            lock: LockMode::Locked,
+            cargo_args: raw(&["--frozen"]),
+            ..CargoOptions::default()
+        });
+        assert_eq!(options.lock, LockMode::Frozen);
+        let options = normalized(CargoOptions {
+            offline: true,
+            cargo_args: raw(&["--offline"]),
+            ..CargoOptions::default()
+        });
+        assert!(options.offline);
+    }
+
+    #[test]
+    fn normalize_folds_every_selection_flag_form_once() {
+        let options = normalized(CargoOptions {
+            cargo_args: raw(&[
+                "--target=x86_64-unknown-linux-gnu",
+                "--profile",
+                "custom",
+                "--features",
+                "vision, imu",
+                "--features=balance",
+                "--release",
+                "--all-features",
+                "--no-default-features",
+                "--jobs",
+                "4",
+            ]),
+            ..CargoOptions::default()
+        });
+        assert_eq!(options.target.as_deref(), Some("x86_64-unknown-linux-gnu"));
+        assert_eq!(options.profile.as_deref(), Some("custom"));
+        assert!(options.release && options.all_features && options.no_default_features);
+        assert_eq!(
+            options.features,
+            ["vision", "imu", "balance"]
+                .iter()
+                .map(|feature| feature.to_string())
+                .collect::<Vec<_>>()
+        );
+        // Unrelated tail arguments survive in caller order for forwarding.
+        assert_eq!(options.cargo_args, raw(&["--jobs", "4"]));
+        // A second normalization is a no-op: fields are already resolved.
+        let again = normalized(options.clone());
+        assert_eq!(again, options);
+    }
+
+    #[test]
+    fn normalize_ignores_empty_feature_pieces_and_valueless_tails() {
+        let options = normalized(CargoOptions {
+            cargo_args: raw(&["--features", "", "--features=,,", "--target"]),
+            ..CargoOptions::default()
+        });
+        assert!(options.features.is_empty());
+        // A valueless trailing flag is forwarded for Cargo to reject.
+        assert_eq!(options.cargo_args, raw(&["--target"]));
+    }
+
+    #[test]
+    fn normalize_lets_a_raw_selection_win_and_keeps_structured_features() {
+        let options = normalized(CargoOptions {
+            target: Some("aarch64-apple-darwin".to_owned()),
+            profile: Some("dev".to_owned()),
+            features: vec!["scenario".to_owned()],
+            cargo_args: raw(&["--profile=release"]),
+            ..CargoOptions::default()
+        });
+        assert_eq!(options.target.as_deref(), Some("aarch64-apple-darwin"));
+        assert_eq!(options.profile.as_deref(), Some("release"));
+        assert_eq!(options.features, ["scenario".to_owned()]);
+    }
+
+    #[test]
+    fn build_selection_resolves_profiles_and_sorted_features() {
+        let options = CargoOptions {
+            release: true,
+            features: vec!["vision".to_owned(), "imu".to_owned(), "vision".to_owned()],
+            ..CargoOptions::default()
+        };
+        let selection = BuildSelection::root(&options);
+        assert_eq!(selection.profile, "release");
+        assert_eq!(selection.features, ["imu", "vision"]);
+        let dev = BuildSelection::root(&CargoOptions::default());
+        assert_eq!(dev.profile, "dev");
+    }
+
+    #[test]
+    fn participant_selection_keeps_target_and_profile_without_root_features() {
+        let options = CargoOptions {
+            target: Some("x86_64-unknown-linux-gnu".to_owned()),
+            release: true,
+            features: vec!["vision".to_owned()],
+            all_features: true,
+            no_default_features: true,
+            ..CargoOptions::default()
+        };
+        let selection = BuildSelection::participant(&options);
+        assert_eq!(selection.target, "x86_64-unknown-linux-gnu");
+        assert_eq!(selection.profile, "release");
+        assert!(selection.features.is_empty());
+        assert!(!selection.all_features && !selection.no_default_features);
+    }
+
+    #[test]
+    fn effective_target_defaults_to_the_host_triple() {
+        assert_eq!(
+            effective_target(&CargoOptions::default()),
+            phoxal::artifact::bundle::host_execution_target()
+        );
+    }
+
+    fn artifact_line(
+        package_id: &str,
+        binary: &str,
+        executable: Option<&str>,
+        manifest_path: Option<&str>,
+    ) -> String {
+        let executable = match executable {
+            Some(path) => format!("{path:?}"),
+            None => "null".to_owned(),
+        };
+        let manifest_path = match manifest_path {
+            Some(path) => format!(",\"manifest_path\":\"{path}\""),
+            None => String::new(),
+        };
+        format!(
+            "{{\"reason\":\"compiler-artifact\",\"package_id\":\"{package_id}\"{manifest_path},\
+             \"target\":{{\"kind\":[\"bin\"],\"crate_types\":[\"bin\"],\"name\":\"{binary}\",\
+             \"src_path\":\"/robot/src/main.rs\",\"edition\":\"2024\",\"doc\":false,\
+             \"doctest\":false,\"test\":false}},\"profile\":{{\"opt_level\":\"0\",\
+             \"debug_assertions\":true,\"overflow_checks\":true,\"test\":false}},\
+             \"features\":[],\"filenames\":[],\"executable\":{executable},\"fresh\":false}}"
+        )
+    }
+
+    fn parsed(stdout: &str) -> Vec<Message> {
+        parse_message_stream(stdout.as_bytes())
+            .unwrap_or_else(|message| panic!("strict stream: {message}"))
+    }
+
+    #[test]
+    fn select_executable_matches_the_exact_package_and_binary() {
+        let messages = parsed(&format!(
+            "{}\n{}\n{}",
+            artifact_line(
+                "path+file:///robot#0.1.0",
+                "other",
+                Some("/robot/other"),
+                None
+            ),
+            artifact_line("path+file:///dep#0.2.0", "brain", Some("/dep/brain"), None),
+            artifact_line(
+                "path+file:///robot#0.1.0",
+                "brain",
+                Some("/robot/brain"),
+                None
+            ),
+        ));
+        let found = select_executable(
+            &messages,
+            &ExecutableSelector {
+                package_id: Some("path+file:///robot#0.1.0"),
+                manifest_path: None,
+                binary: "brain",
+                bin_only: true,
+            },
+        );
+        assert!(matches!(
+            found,
+            SelectedExecutable::Found(path) if path == std::path::Path::new("/robot/brain")
+        ));
+    }
+
+    #[test]
+    fn message_stream_rejects_malformed_suffixes_after_valid_records() {
+        let valid_prefix = artifact_line(
+            "path+file:///robot#0.1.0",
+            "brain",
+            Some("/robot/brain"),
+            None,
+        );
+        for malformed_suffix in ["Compiling robot\n", "{not json}\n"] {
+            let error =
+                parse_message_stream(format!("{valid_prefix}\n{malformed_suffix}").as_bytes())
+                    .expect_err("a valid prefix must not hide a trailing protocol violation");
+            assert!(error.contains("invalid Cargo JSON message"));
+        }
+        assert!(
+            parse_message_stream(b"\n")
+                .expect("empty stream")
+                .is_empty()
+        );
+        assert!(parse_message_stream(valid_prefix.as_bytes()).is_ok());
+    }
+
+    #[test]
+    fn select_executable_takes_the_last_valid_match() {
+        let messages = parsed(&format!(
+            "{}\n{}",
+            artifact_line(
+                "path+file:///robot#0.1.0",
+                "brain",
+                Some("/robot/brain"),
+                None
+            ),
+            artifact_line(
+                "path+file:///robot#0.1.0",
+                "brain",
+                Some("/robot/brain-rebuilt"),
+                None,
+            ),
+        ));
+        let found = select_executable(
+            &messages,
+            &ExecutableSelector {
+                package_id: Some("path+file:///robot#0.1.0"),
+                manifest_path: None,
+                binary: "brain",
+                bin_only: true,
+            },
+        );
+        assert!(matches!(
+            found,
+            SelectedExecutable::Found(path) if path == std::path::Path::new("/robot/brain-rebuilt")
+        ));
+    }
+
+    #[test]
+    fn select_executable_reports_missing_executables() {
+        let selector = ExecutableSelector {
+            package_id: Some("path+file:///robot#0.1.0"),
+            manifest_path: None,
+            binary: "brain",
+            bin_only: true,
+        };
+        let missing = select_executable(&parsed("\n"), &selector);
+        assert!(matches!(missing, SelectedExecutable::Missing));
+        let no_executable = artifact_line("path+file:///robot#0.1.0", "brain", None, None);
+        // A matching artifact without an executable is not a selection.
+        let missing = select_executable(&parsed(&no_executable), &selector);
+        assert!(matches!(missing, SelectedExecutable::Missing));
+    }
+
+    #[test]
+    fn select_executable_constrains_one_exact_manifest() {
+        let foreign = artifact_line(
+            "path+file:///dep#0.2.0",
+            "brain",
+            Some("/dep/brain"),
+            Some("/supervisor-workspace/dep/Cargo.toml"),
+        );
+        let intended = artifact_line(
+            "path+file:///robot#0.1.0",
+            "brain",
+            Some("/robot/brain"),
+            Some("/resolved/Cargo.toml"),
+        );
+        // The unrelated same-name executable arrives after the intended
+        // artifact; the manifest constraint must still reject it.
+        let messages = parsed(&format!("{intended}\n{foreign}"));
+        let selector = ExecutableSelector {
+            package_id: None,
+            manifest_path: Some(std::path::Path::new("/resolved/Cargo.toml")),
+            binary: "brain",
+            bin_only: true,
+        };
+        let found = select_executable(&messages, &selector);
+        assert!(matches!(
+            found,
+            SelectedExecutable::Found(path) if path == std::path::Path::new("/robot/brain")
+        ));
+        // Without the constraint the same stream would admit the foreign
+        // executable as the last name-only match.
+        let unconstrained = ExecutableSelector {
+            package_id: None,
+            manifest_path: None,
+            binary: "brain",
+            bin_only: true,
+        };
+        assert!(matches!(
+            select_executable(&messages, &unconstrained),
+            SelectedExecutable::Found(path) if path == std::path::Path::new("/dep/brain")
+        ));
+    }
+
+    #[test]
+    fn select_executable_admits_examples_without_a_package_identity() {
+        let example = artifact_line(
+            "path+file:///robot#0.1.0",
+            "scenario",
+            Some("/robot/scenario"),
+            None,
+        )
+        .replace("\"kind\":[\"bin\"]", "\"kind\":[\"example\"]");
+        let selector = ExecutableSelector {
+            package_id: None,
+            manifest_path: None,
+            binary: "scenario",
+            bin_only: false,
+        };
+        let found = select_executable(&parsed(&example), &selector);
+        assert!(matches!(
+            found,
+            SelectedExecutable::Found(path) if path == std::path::Path::new("/robot/scenario")
+        ));
+        // bin_only selectors refuse the same example target.
+        let bin_only = ExecutableSelector {
+            package_id: None,
+            manifest_path: None,
+            binary: "scenario",
+            bin_only: true,
+        };
+        assert!(matches!(
+            select_executable(&parsed(&example), &bin_only),
+            SelectedExecutable::Missing
+        ));
+    }
+
+    #[test]
+    fn local_package_build_preserves_the_caller_invocation_context() {
+        let options = CargoOptions {
+            release: true,
+            offline: true,
+            lock: LockMode::Locked,
+            features: vec!["root-only".to_owned()],
+            ..CargoOptions::default()
+        };
+        let staged = tempfile::tempdir().expect("staged supervisor");
+        let root = staged.path().join("robot with spaces");
+        let manifest = root.join("supervisor/Cargo.toml");
+        std::fs::create_dir_all(manifest.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(manifest.parent().unwrap().join("src")).unwrap();
+        std::fs::write(
+            manifest.parent().unwrap().join("src/main.rs"),
+            "fn main() {}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            &manifest,
+            "[package]\nname = \"phoxal-supervisor\"\nversion = \"0.0.0-dev.8\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        let command = local_package_build(
+            &root,
+            &manifest,
+            "phoxal-supervisor",
+            "phoxal-supervisor",
+            "json",
+            &options,
+        )
+        .expect("command");
+        // The invocation directory is the caller's effective context, where
+        // Cargo discovers .cargo configuration and toolchain files.
+        assert_eq!(
+            root.as_os_str(),
+            command
+                .get_current_dir()
+                .expect("invocation directory")
+                .as_os_str()
+        );
+        // The selected source builds below its own subdirectory of the
+        // resolved target directory, keyed by the canonical source root.
+        {
+            use sha2::{Digest as _, Sha256};
+            let source_root = manifest.canonicalize().unwrap();
+            let expected = resolve_target_directory(&manifest, &root, &options)
+                .expect("resolved target directory")
+                .join("phoxal")
+                .join(".selected")
+                .join(format!(
+                    "{:x}",
+                    Sha256::digest(source_root.as_os_str().as_encoded_bytes())
+                ));
+            let configured = command
+                .get_args()
+                .collect::<Vec<_>>()
+                .windows(2)
+                .find(|arguments| arguments[0] == "--target-dir")
+                .map(|arguments| arguments[1])
+                .map(std::ffi::OsStr::to_owned)
+                .expect("selected build directory configured");
+            assert_eq!(
+                std::path::PathBuf::from(&configured)
+                    .canonicalize()
+                    .ok()
+                    .as_deref(),
+                None::<&std::path::Path>,
+                "the directory is not created by command construction"
+            );
+            assert_eq!(
+                configured,
+                expected.into_os_string(),
+                "selected sources build in their own per-source directory"
+            );
+        }
+        let arguments = command
+            .get_args()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        let directories = selected_source_compiler_directories(&manifest, &root, &options).unwrap();
+        let intermediate = directories.build.as_ref().map_or_else(String::new, |path| {
+            format!(
+                "\u{1f}--config\u{1f}{}",
+                path_config("build.build-dir", path)
+            )
+        });
+        let expected = format!(
+            "build\u{1f}--manifest-path\u{1f}{}\u{1f}--target-dir\u{1f}{}{intermediate}\u{1f}--target\u{1f}{}\u{1f}--profile\u{1f}release\u{1f}--locked\u{1f}--offline\u{1f}--package\u{1f}phoxal-supervisor\u{1f}--bin\u{1f}phoxal-supervisor\u{1f}--message-format\u{1f}json",
+            manifest.display(),
+            directories.target.display(),
+            phoxal::artifact::bundle::host_execution_target()
+        );
+        assert_eq!(arguments.join("\u{1f}"), expected);
     }
 }
