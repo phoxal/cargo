@@ -1026,6 +1026,16 @@ mod tests {
             let _ = fs::remove_file(artifact.executable.with_extension("ready"));
             fs::write(artifact.executable.with_extension("mode"), mode).unwrap();
             let start = Instant::now();
+            // Concurrent probes first wait for process-wide signal ownership.
+            // The execution deadline starts at launch, not that admission wait.
+            let ready_path = artifact.executable.with_extension("ready");
+            let execution_start = std::thread::spawn(move || {
+                let until = Instant::now() + Duration::from_secs(20);
+                while !ready_path.exists() && Instant::now() < until {
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+                ready_path.exists().then(Instant::now)
+            });
             let error = probe(&artifact, request.scene(), guard.path(), &request)
                 .unwrap_err()
                 .to_string();
@@ -1038,10 +1048,16 @@ mod tests {
                 "{error}"
             );
             assert!(
-                start.elapsed()
+                execution_start
+                    .join()
+                    .unwrap()
+                    .expect("probe readiness")
+                    .elapsed()
                     < request.execution_timeout
                         + request.cleanup_timeout
-                        + Duration::from_millis(500)
+                        + Duration::from_millis(500),
+                "{mode}: launch deadline/cleanup exceeded; total including signal admission {:?}: {error}",
+                start.elapsed()
             );
             assert!(
                 artifact.executable.with_extension("ready").exists(),

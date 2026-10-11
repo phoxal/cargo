@@ -221,7 +221,7 @@ impl Capability {
         let metadata = file.metadata()?;
         let flags = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFD) };
         if flags < 0
-            || unsafe { libc::fcntl(file.as_raw_fd(), libc::F_SETFD, flags & !libc::FD_CLOEXEC) }
+            || unsafe { libc::fcntl(file.as_raw_fd(), libc::F_SETFD, flags | libc::FD_CLOEXEC) }
                 != 0
         {
             return Err(io::Error::last_os_error());
@@ -296,7 +296,9 @@ fn marker_file(pid: i32, capability: &Capability) -> io::Result<bool> {
             return false;
         }
         let info = unsafe { info.assume_init() };
-        u64::from(info.vnode.vi_stat.vst_dev) == c.device && info.vnode.vi_stat.vst_ino == c.inode
+        info.file.status & 2 == 0
+            && u64::from(info.vnode.vi_stat.vst_dev) == c.device
+            && info.vnode.vi_stat.vst_ino == c.inode
     }
     if matches(pid, capability._file.as_raw_fd(), capability) {
         return Ok(true);
@@ -347,10 +349,38 @@ fn marker_file(pid: i32, capability: &Capability) -> io::Result<bool> {
         Ok(fds) => fds,
         Err(e) => return vanished(e),
     };
-    Ok(fds.filter_map(Result::ok).any(|fd| {
-        std::fs::metadata(fd.path())
-            .is_ok_and(|m| m.dev() == capability.device && m.ino() == capability.inode)
-    }))
+    for fd in fds.filter_map(Result::ok) {
+        let same_file = || {
+            std::fs::metadata(fd.path())
+                .is_ok_and(|m| m.dev() == capability.device && m.ino() == capability.inode)
+        };
+        if !same_file() {
+            continue;
+        }
+        let info = match std::fs::read_to_string(format!(
+            "/proc/{pid}/fdinfo/{}",
+            fd.file_name().to_string_lossy()
+        )) {
+            Ok(info) => info,
+            Err(error) if matches!(error.raw_os_error(), Some(libc::ESRCH | libc::ENOENT)) => {
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
+        let flags = info
+            .lines()
+            .find_map(|line| {
+                line.strip_prefix("flags:\t")
+                    .and_then(|flags| u64::from_str_radix(flags.trim(), 8).ok())
+            })
+            .ok_or_else(|| {
+                io::Error::other("cannot verify capability descriptor close-on-exec flags")
+            })?;
+        if flags & libc::O_CLOEXEC as u64 == 0 && same_file() {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 fn vanished(error: io::Error) -> io::Result<bool> {
     if matches!(
@@ -744,6 +774,20 @@ fn capture(
         .map(|(pid, p)| (pid, p.birth))
         .collect();
     command.env(OWNERSHIP_ENV, &capability.token);
+    // Parent descriptors always remain CLOEXEC. Only this explicitly owned
+    // child clears the flag, before exec. Keep the descriptor alive in the
+    // callback so reusing a Command cannot refer to a closed/reused FD.
+    let inherited = capability._file.try_clone()?;
+    unsafe {
+        command.pre_exec(move || {
+            let fd = inherited.as_raw_fd();
+            let flags = libc::fcntl(fd, libc::F_GETFD);
+            if flags < 0 || libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
     let child = command.spawn()?;
     let started = Instant::now();
     let group = child.id() as i32;
@@ -1032,8 +1076,9 @@ mod tests {
                 .unwrap();
                 assert!(
                     ready,
-                    "{mode}/{signal}: {}",
-                    std::fs::read_to_string(root.join("stdout")).unwrap()
+                    "{mode}/{signal}: stdout={} stderr={}",
+                    std::fs::read_to_string(root.join("stdout")).unwrap(),
+                    std::fs::read_to_string(root.join("stderr")).unwrap()
                 );
                 assert!(!rescue, "host ignored signal after probe: {mode}/{signal}");
                 if mode == "default" {
@@ -1045,6 +1090,105 @@ mod tests {
                 assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::ESRCH));
             }
         }
+    }
+
+    #[test]
+    fn explicitly_inherited_capability_is_observed_without_parent_flag_changes() {
+        let capability = super::Capability::new().unwrap();
+        let fd = capability._file.as_raw_fd();
+        let mut command = Command::new("sleep");
+        command.arg("10").env_remove(super::OWNERSHIP_ENV);
+        unsafe {
+            command.pre_exec(move || {
+                let flags = libc::fcntl(fd, libc::F_GETFD);
+                if flags < 0 || libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) != 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let mut child = command.spawn().unwrap();
+        let matched = capability.matches(child.id() as i32).unwrap();
+        let parent_flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert_ne!(parent_flags & libc::FD_CLOEXEC, 0);
+        assert!(
+            matched,
+            "owned inherited file alone must remain discoverable"
+        );
+    }
+
+    #[test]
+    fn concurrent_capture_cleanup_leaves_unowned_sibling_alive() {
+        let root = tempfile::tempdir().unwrap();
+        let ready = root.path().join("ready");
+        let path = ready.clone();
+        let owned = std::thread::spawn(move || {
+            let mut command = Command::new("sh");
+            command
+                .args(["-c", "printf ready > \"$1\"; sleep 10", "fixture"])
+                .arg(path);
+            super::capture(
+                &mut command,
+                &std::sync::atomic::AtomicBool::new(false),
+                Some(Duration::from_millis(500)),
+                Duration::from_secs(2),
+                false,
+            )
+            .unwrap()
+        });
+        let until = Instant::now() + Duration::from_secs(3);
+        while !ready.exists() && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(ready.exists());
+        let mut sibling = Command::new("sleep").arg("10").spawn().unwrap();
+        let (_, stop) = owned.join().unwrap();
+        let survived = sibling.try_wait().unwrap().is_none();
+        if survived {
+            sibling.kill().unwrap();
+        }
+        sibling.wait().unwrap();
+        assert!(matches!(stop, Some(super::Stop::Deadline)));
+        assert!(survived, "owned cleanup signalled an unowned sibling");
+    }
+
+    #[test]
+    fn capability_does_not_adopt_an_unowned_sibling_before_or_after_exec() {
+        let capability = super::Capability::new().unwrap();
+        let mut pipe = [0; 2];
+        assert_eq!(unsafe { libc::pipe(pipe.as_mut_ptr()) }, 0);
+        let writer = pipe[1];
+        let spawn = std::thread::spawn(move || {
+            let mut command = Command::new("sleep");
+            command.arg("2");
+            unsafe {
+                command.pre_exec(move || {
+                    let pid = libc::getpid();
+                    libc::write(writer, (&pid as *const i32).cast(), 4);
+                    libc::usleep(500_000);
+                    Ok(())
+                });
+            }
+            command.spawn().unwrap()
+        });
+        let mut pid: i32 = 0;
+        assert_eq!(
+            unsafe { libc::read(pipe[0], (&mut pid as *mut i32).cast(), 4) },
+            4
+        );
+        let before_exec = capability.matches(pid).unwrap();
+        let mut child = spawn.join().unwrap();
+        let after_exec = capability.matches(child.id() as i32).unwrap();
+        child.kill().unwrap();
+        child.wait().unwrap();
+        unsafe {
+            libc::close(pipe[0]);
+            libc::close(pipe[1]);
+        }
+        assert!(!before_exec, "unowned child adopted in its pre-exec window");
+        assert!(!after_exec, "unowned executable inherited capability");
     }
 
     #[test]
